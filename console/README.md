@@ -38,14 +38,23 @@ pnpm test:e2e       # Playwright — needs the stack up (see above)
 ## App detail screen
 
 Per app: live **Preview / endpoint** (worker-only apps show endpoint `none`,
-which is valid), agent **task** submit + streamed logs, **start/stop**,
-**Config & Secrets** (sensitive values are write-only — set once, never shown),
+which is valid), agent chat, **start/stop**, **Config & Secrets** (sensitive
+values are write-only — set once, never shown),
 **Snapshots** (capture, plus confirm-gated restore/fork), an **Activity**
 timeline (durable app events, newest-first), and a **Processes** panel
 (name/kind/running/pid/restarts with per-process recent logs).
 
-New App offers a **runtime preset** picker (React/Vite, Next.js, Node/Express,
-FastAPI, Worker), data-driven from `GET /v1/presets`; the chosen preset is stored
+When **GitHub Copilot** is selected, the chat is a durable conversation rather
+than the one-shot task UI used by other agents. It renders streaming replies,
+queued messages, native questions, plan approvals, cancellation, and a
+new-conversation control once idle. `/plan`, `/interactive`, and `/autopilot`
+select the corresponding turn mode; the selector stays in sync with those
+commands. The transcript and interaction cards survive a page reload or a
+sandbox sleep, and the console reconnects to the redacted SSE stream from its
+durable event cursor.
+
+New App offers a **runtime preset** picker (React/Vite, Next.js, AdonisJS,
+Node/Express, FastAPI, Worker), data-driven from `GET /v1/presets`; the chosen preset is stored
 on the app and applied to its sandbox.
 
 ## Scope (MVP)

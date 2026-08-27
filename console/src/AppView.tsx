@@ -4,6 +4,7 @@ import { c, font, mono, Card, H, Btn, Pill, StatusPill, statusTone, Input, tab }
 import { DeployModal } from './DeployModal'
 import { IS_DEMO } from './demo'
 import { slugKey, splitInline } from './brain'
+import { CopilotConversation } from './CopilotConversation'
 
 // Code-split the CodeMirror editor: it's the app's heaviest dependency and only
 // needed on the Files tab, so it loads on demand rather than in the main bundle.
@@ -607,8 +608,15 @@ function RuntimeCard({ appId, onApplyRuntime, canApply }: { appId: string; onApp
   )
 }
 
-function AgentChat({ sb, onError, toast, refresh }: { sb: Sandbox | null; onError: (m: string) => void; toast: (m: string) => void; refresh: () => void }) {
+export function AgentChat({ sb, onError, toast, refresh }: { sb: Sandbox | null; onError: (m: string) => void; toast: (m: string) => void; refresh: () => void }) {
   const [agent, setAgent] = useState('opencode')
+  if (agent === 'github-copilot') {
+    return <CopilotConversation sb={sb} agent={agent} setAgent={setAgent} onError={onError} toast={toast} refresh={refresh} />
+  }
+  return <LegacyAgentChat sb={sb} agent={agent} setAgent={setAgent} onError={onError} toast={toast} refresh={refresh} />
+}
+
+function LegacyAgentChat({ sb, agent, setAgent, onError, toast, refresh }: { sb: Sandbox | null; agent: string; setAgent: (agent: string) => void; onError: (m: string) => void; toast: (m: string) => void; refresh: () => void }) {
   const [model, setModel] = useState('')
   const [cont, setCont] = useState(true) // continue the last agent session by default
   const [text, setText] = useState('')
@@ -720,14 +728,18 @@ function AgentChat({ sb, onError, toast, refresh }: { sb: Sandbox | null; onErro
             Continue
           </label>
           <select value={agent} onChange={(e) => { setAgent(e.target.value); setModel('') }} data-testid="task-agent" style={selStyle}>
-            <option value="claude-code">Claude Code</option><option value="opencode">OpenCode</option>
+            <option value="claude-code">Claude Code</option><option value="opencode">OpenCode</option><option value="github-copilot">GitHub Copilot</option>
             {/* Codex hidden from the run picker until it's behind the auth proxy — the adapter is wired but subscription auth can't be secured yet. */}
           </select>
-          <select value={model} onChange={(e) => setModel(e.target.value)} data-testid="task-model" style={selStyle}>
-            <option value="">Default model</option>
-            {agent === 'claude-code' && <><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></>}
-            {agent === 'opencode' && <><option value="opencode/glm-5">GLM-5</option><option value="opencode/kimi-k2.6">Kimi K2.6</option><option value="opencode/deepseek-v4-pro">DeepSeek V4 Pro</option><option value="opencode/MiniMax-M3">MiniMax M3</option><option value="opencode/MiniMax-M2.7">MiniMax M2.7</option></>}
-          </select>
+          {agent === 'github-copilot' ? (
+            <Input mono value={model} onChange={(e) => setModel(e.target.value)} placeholder="SDK model id (optional)" style={{ ...selStyle, width: 155 }} data-testid="task-model" />
+          ) : (
+            <select value={model} onChange={(e) => setModel(e.target.value)} data-testid="task-model" style={selStyle}>
+              <option value="">Default model</option>
+              {agent === 'claude-code' && <><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></>}
+              {agent === 'opencode' && <><option value="opencode/glm-5">GLM-5</option><option value="opencode/kimi-k2.6">Kimi K2.6</option><option value="opencode/deepseek-v4-pro">DeepSeek V4 Pro</option><option value="opencode/MiniMax-M3">MiniMax M3</option><option value="opencode/MiniMax-M2.7">MiniMax M2.7</option></>}
+            </select>
+          )}
         </div>
       </div>
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>

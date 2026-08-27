@@ -38,6 +38,7 @@ func TestDetectFrameworks(t *testing.T) {
 		{"nextjs", mapFiles{"package.json": pkg(`"next":"14"`), "next.config.mjs": "x"}, "nextjs", "nextjs", true},
 		{"react-vite", mapFiles{"package.json": pkg(`"vite":"5","react":"18","react-dom":"18"`)}, "react-vite", "react-vite", true},
 		{"node-express", mapFiles{"package.json": pkg(`"express":"4"`), "server.js": "x"}, "node-express", "node-express", true},
+		{"adonisjs", mapFiles{"package.json": pkg(`"@adonisjs/core":"7"`), "adonisrc.ts": "x"}, "adonisjs", "adonisjs", true},
 		{"fastapi", mapFiles{"requirements.txt": "fastapi==0.110\nuvicorn"}, "fastapi", "fastapi", true},
 		{"worker", mapFiles{"worker.sh": "while true; do :; done"}, "worker", "worker", true},
 		// astro is DETECT-ONLY: suggested, but not runnable and not a default.

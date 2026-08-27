@@ -91,12 +91,14 @@ func TestBuildPassesRuntimeAndDNSForGvisor(t *testing.T) {
 func TestBuildForwardsRuntimedEnv(t *testing.T) {
 	s := Build(row(), Env{
 		Image: "img", RuntimePreset: "node-express",
-		AgentProxyURL: "http://sandboxd:9100", OpencodeZenPath: "zen",
+		AgentProxyURL: "http://sandboxd:9100", CopilotBridgeURL: "http://sandboxd:9200",
+		OpencodeZenPath: "zen",
 	})
 	joined := strings.Join(s.Env, "\n")
 	for _, want := range []string{
 		"RUNTIMED_RUNTIME_PRESET=node-express",
 		"RUNTIMED_ANTHROPIC_PROXY=http://sandboxd:9100",
+		"RUNTIMED_COPILOT_BRIDGE_URL=http://sandboxd:9200",
 		"SANDBOXD_OPENCODE_ZEN_PATH=zen",
 	} {
 		if !strings.Contains(joined, want) {

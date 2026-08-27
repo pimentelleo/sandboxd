@@ -1,228 +1,257 @@
-# Agent auth &amp; context
+# Agent auth & context
 
-How sandboxd gives a sandbox's coding agent its credentials — and its
-environment context — **without** putting secrets in the workspace, snapshots,
-container env, logs, events, or task results.
+How sandboxd gives a sandbox's coding agent credentials and environment context
+without putting secrets in the workspace, snapshots, container env, logs,
+events, or task results.
 
-Two agents ship today behind one adapter interface: **opencode** and
-**claude-code** are runnable (they have `runtimed` task adapters). **codex** is
-runnable by the backend too but is **parked** — disabled/hidden in the UI until
-its ChatGPT-subscription auth can be secured (see below). Every provider carries its **own**
-credentials, connected by the owner and stored opaquely; a provider's material
-is only ever used for that provider.
+sandboxd supports sandbox-resident **OpenCode** and **Claude Code** adapters,
+plus hosted **GitHub Copilot** through the official
+[`copilot-sdk`](https://github.com/github/copilot-sdk). Copilot's runtime and
+GitHub fine-grained personal access token remain in the control plane; they are never installed,
+mounted, or env-injected into a sandbox. **Codex** has a backend adapter but is
+parked in the UI until its subscription authentication can be secured.
 
 ## Connecting a provider
 
 `GET /v1/agents` lists providers with `installed_state`, `status`, `method`,
-`supports_oauth`, `supports_api_key`, and `runnable`. Connect a provider three
-ways (connecting **replaces** the provider's stored material atomically, so a
-provider holds exactly one at a time):
+`supports_oauth`, `supports_api_key`, `supports_pat`, `runnable`, and `hosted`.
 
 | Method | Endpoint | Notes |
 | --- | --- | --- |
-| **API key** | `POST /v1/agents/{provider}/api-key` `{"api_key":"…"}` | Stored opaquely; injected as the provider's one key env var at task time. |
-| **Import** | `POST /v1/agents/{provider}/import` `{"credentials":"…"}` | Paste the bundle your local `<cli> login` produced. Written verbatim, never parsed. |
-| **Guided OAuth** (claude-code) | `POST /v1/agents/claude-code/oauth/start` → open URL → `…/oauth/finish` `{"code":"<code#state>"}` | A real `claude setup-token` **PKCE** flow, driven server-side. |
+| **API key** | `POST /v1/agents/{provider}/api-key` `{"api_key":"..."}` | Stored opaquely and used proxy-side by default. |
+| **Import** | `POST /v1/agents/{provider}/import` `{"credentials":"..."}` | Paste the bundle your local `<cli> login` produced. Written verbatim, never parsed. |
+| **Guided OAuth** (Claude Code) | `POST /v1/agents/claude-code/oauth/start` then `.../oauth/finish` `{"code":"<code#state>"}` | A `claude setup-token` PKCE flow driven server-side. |
+| **Fine-grained PAT** (GitHub Copilot) | `POST /v1/agents/github-copilot/pat` `{"token":"github_pat_..."}` | The control plane validates and encrypts the write-only token; it is never returned to the browser or sandbox. |
 
-`POST /v1/agents/{provider}/disconnect` wipes the material. Stored
-credentials are encrypted/opaque, never returned, echoed, logged, or emitted in
-events; the console inputs are write-only. Auth changes take effect on the next
-sandbox (re)create.
+`POST /v1/agents/{provider}/disconnect` removes the provider credential.
+Sandbox-resident credentials are opaque; GitHub Copilot credentials are AES-GCM
+encrypted with sandboxd's secrets key. Neither form is returned, echoed, logged,
+or emitted in events; console inputs are write-only.
 
-## How the credential reaches the agent — two models
+## Credential delivery and hosted execution
 
-### Every agent → credential-injecting proxy (the real credential never enters the sandbox)
+### Sandbox-resident agents: credential-injecting proxy
 
 When the auth proxy is enabled (`SANDBOXD_AGENT_PROXY_URL`, default
-`http://sandboxd:9100`), **all** runnable agents reach their model provider
-through a **reverse proxy control-plane-side** (`internal/authproxy`) that holds
-the real credentials. No credential — API key or OAuth token — is mounted or
-env-injected into the sandbox; the agent gets only a base URL and a **dummy**
-key, and the proxy swaps in the real `Authorization` / `X-Api-Key` header on the
+`http://sandboxd:9100`), sandbox-resident agents reach their model provider
+through a reverse proxy in the control plane (`internal/authproxy`) that holds
+the real credentials. No credential - API key or OAuth token - is mounted or
+env-injected into the sandbox; the agent gets only a base URL and a dummy key,
+and the proxy swaps in the real `Authorization` or `X-Api-Key` header on the
 wire. A task can neither read, exfiltrate, nor clobber the credential.
 
-Sandbox base URLs are `<proxy>/<agent>/<upstream>/…`; the proxy resolves the
+Sandbox base URLs are `<proxy>/<agent>/<upstream>/...`; the proxy resolves the
 agent's stored credential for that upstream and injects it. Upstreams:
 `anthropic`, `openai`, `zen` (OpenCode Zen pay-as-you-go), `zengo` (OpenCode Zen
-"go" subscription), and the MiniMax direct endpoints `minimax`,
-`minimax-cn` (China), `minimax-anthropic`, `minimax-anthropic-cn` (China).
+"go" subscription), and the MiniMax direct endpoints `minimax`, `minimax-cn`,
+`minimax-anthropic`, and `minimax-anthropic-cn`.
 
-- **claude-code** — `ANTHROPIC_BASE_URL` = `<proxy>/claude-code/anthropic`,
-  `ANTHROPIC_API_KEY` = `sandboxd-proxy-injected`. Works for both an API key and
-  a Claude **subscription** (OAuth bearer + `anthropic-beta` are injected proxy-side).
-- **opencode** — routed via an `OPENCODE_CONFIG` file that runtimed writes, which
-  sends opencode's requests to the proxy with the dummy key. Which OpenCode Zen
-  endpoint it uses is set by `SANDBOXD_OPENCODE_ZEN_PATH` — see
-  [OpenCode Zen: subscription vs pay-as-you-go](#opencode-zen-subscription-vs-pay-as-you-go)
-  below. (Implementation note: opencode's Zen provider ignores base-URL env vars
-  and its Bun runtime rejects a bare hostname, so we can't just set a `*_BASE_URL`;
-  the config file defines a custom `@ai-sdk/openai-compatible` provider pointed at
-  the proxy's resolved **IP**, and the task's model is rewritten to `proxy/<id>`.)
-- **codex** — parked: its ChatGPT-subscription backend is a WebSocket that can't be
-  proxied yet, so codex is hidden from the run picker.
-
-- **MiniMax** — a credential-only provider: connect a MiniMax API key in
-  Settings → AI Agents (`POST /v1/agents/minimax/api-key`). MiniMax is not a
-  task agent (no CLI, not in the run picker); its key is injected by the proxy
-  for the MiniMax direct upstreams. The OpenCode opencode model dropdown exposes
-  `MiniMax-M3` and `MiniMax-M2.7`; selecting one routes the task to the MiniMax
-  OpenAI-compatible endpoint with the connected key (the China region is
-  selected with `SANDBOXD_MINIMAX_REGION=cn_zh`, default `global_en`).
+- **Claude Code** uses `ANTHROPIC_BASE_URL =
+  <proxy>/claude-code/anthropic` and `ANTHROPIC_API_KEY =
+  sandboxd-proxy-injected`. It supports API keys and Claude subscriptions.
+- **OpenCode** uses an `OPENCODE_CONFIG` file that runtimed writes. The config
+  defines a custom OpenAI-compatible provider at the proxy's resolved IP, since
+  the Zen provider ignores base-URL env vars and its Bun runtime rejects a bare
+  hostname. The task model is rewritten to `proxy/<id>`.
+- **Codex** is parked because its ChatGPT-subscription backend is a WebSocket
+  that cannot yet be proxied.
+- **MiniMax** is credential-only, not a task agent. Its connected API key is
+  injected by the proxy for MiniMax direct upstreams. The OpenCode model picker
+  exposes `MiniMax-M3` and `MiniMax-M2.7`; set
+  `SANDBOXD_MINIMAX_REGION=cn_zh` to use the China endpoint.
 
   | Region | OpenAI-compatible | Anthropic-compatible |
-  |--------|-------------------|----------------------|
-  | `global_en` *(default)* | `https://api.minimax.io/v1` | `https://api.minimax.io/anthropic` |
+  | --- | --- | --- |
+  | `global_en` (default) | `https://api.minimax.io/v1` | `https://api.minimax.io/anthropic` |
   | `cn_zh` | `https://api.minimaxi.com/v1` | `https://api.minimaxi.com/anthropic` |
 
-  MiniMax model metadata (retained for operator reference): **MiniMax-M3** —
-  1,000,000-token context, image and video input, adaptive or disabled thinking,
-  pricing $0.60 / $2.40 / $0.12 per million input / output / cache-read tokens.
-  **MiniMax-M2.7** — 204,800-token context, text input, always-on thinking,
-  pricing $0.30 / $1.20 / $0.06 per million input / output / cache-read tokens.
-  MiniMax endpoints authorize with `Authorization: Bearer <key>`.
+The real credential never appears in the sandbox filesystem or env. Verify with
+`mount | grep agent-auth` (no mount) and `ls /run/agent-auth` (absent) while the
+proxy is enabled.
 
-**The real credential never appears in the sandbox filesystem or env** — verify
-with `mount | grep agent-auth` (none) and `ls /run/agent-auth` (absent).
+### GitHub Copilot: official SDK hosted in the control plane
+
+GitHub Copilot uses the official SDK in `internal/copilot`, rather than a
+Copilot CLI or credential inside the sandbox. The SDK's bundled runtime is
+included only in the control-plane image.
+
+Create a fine-grained GitHub personal access token for the account that will
+run Copilot tasks. Grant it the **Copilot Requests** permission. The account
+must have an active Copilot entitlement. Classic PATs (`ghp_...`) are rejected;
+the SDK supports fine-grained tokens (`github_pat_...`) only.
+
+Connect it through the console's **Settings -> Agents** field, or through the
+write-only API endpoint:
+
+```bash
+API=http://127.0.0.1:9090
+read -rsp 'GitHub fine-grained PAT: ' COPILOT_PAT; echo
+curl -s -XPOST "$API/v1/agents/github-copilot/pat" \
+ -H 'content-type: application/json' -d "{\"token\":\"$COPILOT_PAT\"}"
+unset COPILOT_PAT
+```
+
+The connection confirms the GitHub identity, then stores the token encrypted
+with sandboxd's secrets key. It is not refreshed: when it expires or is revoked,
+connect a replacement token. Existing Device Flow state from pre-PAT versions is
+discarded on startup, requiring a fresh fine-grained token.
+
+The legacy one-shot `POST /v1/sandboxes/{id}/tasks` Copilot path creates a
+random, one-use capability bound to that sandbox and task and valid for two
+minutes. `runtimed` exchanges it only with the private
+`SANDBOXD_COPILOT_BRIDGE_URL`; the bridge is not published on a host port.
+
+The console's GitHub Copilot path instead uses
+`/v1/sandboxes/{id}/conversation`. It is a durable, per-sandbox conversation:
+messages are queued FIFO, native questions and plan approvals are persisted
+before display, and the console reconnects through a redacted SSE cursor. The
+SDK session is keyed by opaque conversation ID in the control plane. A sandbox
+may sleep while a question or plan is pending; it wakes before an accepted
+response resumes workspace tools. A control-plane restart attempts to release
+the prepared runtimed task record before recording an unrecoverable in-flight
+provider call as interrupted and admitting subsequent work.
+
+Both paths give the SDK only five custom tools: `list_files`, `read_file`,
+`search_files`, `write_file`, and `run_command`. Each tool is executed through
+a bounded `docker exec` as user `sandbox`, with workdir
+`/home/sandbox/workspace/app`, no TTY, validated paths and arguments, a
+deadline, and output caps. The SDK has config discovery, file hooks, host Git
+operations, session store, and skills disabled.
+
+For a conversation turn, `/plan` is read-only until the user explicitly
+approves the provider's plan action. `/interactive` permits normal workspace
+tools. `/autopilot` chooses a bounded least-surprising assumption for questions
+and approves an unexpected plan exit as autopilot. Resetting an idle
+conversation archives its transcript and starts a fresh one. Purging or
+disconnecting removes retained session mappings and outstanding capabilities.
+Connecting a different GitHub account also cancels prior active tasks before it
+accepts the new credential.
 
 ### OpenCode Zen: subscription vs pay-as-you-go
 
-OpenCode Zen has **two gateways**, and the same key behaves differently on each.
-`SANDBOXD_OPENCODE_ZEN_PATH` picks which one opencode uses:
+OpenCode Zen has two gateways, and the same key behaves differently on each.
+`SANDBOXD_OPENCODE_ZEN_PATH` selects the path OpenCode uses:
 
 | Value | Endpoint | Billing | Models |
-|-------|----------|---------|--------|
-| `zen` *(default)* | `opencode.ai/zen/v1` | Pay-as-you-go — needs a positive wallet balance | Full catalog: `claude-*`, `gpt-*`, `gemini-*`, plus the open models |
-| `zengo` | `opencode.ai/zen/go/v1` | Included in the OpenCode **"go" subscription** — no balance needed | Open models only: GLM, Kimi, MiniMax, DeepSeek, Qwen, MiMo… |
+| --- | --- | --- | --- |
+| `zen` (default) | `opencode.ai/zen/v1` | Pay-as-you-go; needs a positive wallet balance | Full catalog: `claude-*`, `gpt-*`, `gemini-*`, plus open models |
+| `zengo` | `opencode.ai/zen/go/v1` | Included in the OpenCode "go" subscription | Open models only: GLM, Kimi, MiniMax, DeepSeek, Qwen, MiMo, and others |
 
-**Which one do I want?**
+Use `zengo` with the "go" subscription. Use `zen` when a paid Zen wallet should
+provide Claude, GPT, or Gemini. `Insufficient balance` means `zen` has no
+balance; `Model ... is not supported` means the selected model is not available
+on the chosen path.
 
-- On the **"go" subscription** → set `zengo`. Your included models run without a
-  balance. (This deployment is on the go plan, so `.env` sets `SANDBOXD_OPENCODE_ZEN_PATH=zengo`.)
-- **Pre-paid a Zen wallet** and want Claude/GPT/Gemini through opencode → leave it
-  `zen` (the default).
+### OpenCode free tier: no key required
 
-**Symptom of the wrong setting:** an opencode task fails with **`Insufficient
-balance`** → you're on `zen` (pay-as-you-go) with an empty wallet; switch to
-`zengo` (or top up). A task that fails with **`Model … is not supported`** → the
-picked model isn't in that path's catalog (e.g. a `claude-*` model on `zengo`).
+OpenCode works out of the box with no connected credential. Zen serves free
+models with IDs ending in `-free`, such as `big-pickle`,
+`deepseek-v4-flash-free`, and `mimo-v2.5-free`. With no OpenCode credential, the
+proxy drops the sandbox's dummy key, injects nothing, and always uses the `zen`
+endpoint even when the deployment configures `zengo`. The control plane defaults
+to a free model on a fresh install.
 
-The console's opencode model dropdown should list models from whichever path you
-set — go-subscription models (GLM/Kimi/…) for `zengo`.
+A connected OpenCode key always wins and enables its paid catalog. This free
+path is OpenCode-only. Other sandbox-resident agents require a connection;
+GitHub Copilot is separately admitted by its hosted provider.
 
-### OpenCode free tier — works with no key (zero friction)
+### Per-agent default model
 
-**opencode is usable out of the box with nothing connected.** Zen serves a set of
-free models (ids ending `-free`, e.g. `big-pickle`, `deepseek-v4-flash-free`,
-`mimo-v2.5-free`) that need **no API key**. When opencode has no connected
-credential, the proxy forwards its requests to Zen **keyless** — it drops the
-sandbox's dummy key and injects nothing — and always to the **`zen`** endpoint
-where the free models live (even if the deployment pins `zengo`, whose
-go-subscription catalog has no free models). The control plane defaults the
-task's model to a free one so a fresh install can build immediately.
+Set a default model in **Settings -> AI Agents -> Default model** or through
+`PATCH /v1/settings` `agents.default_models`. A task's model precedence is:
 
-> Zen's API **requires a named model** — there is no keyless "auto" model, and
-> only the `-free` models work without a key. That's why a free model must be
-> named; it's not something opencode can pick on its own through the proxy.
+1. The task's own `model`.
+2. The per-agent default.
+3. The OpenCode free-tier default when OpenCode has no key.
+4. The runtimed or agent default.
 
-- **No key** → free tier. The default free model is `big-pickle`; override with
-  `SANDBOXD_OPENCODE_FREE_MODEL`.
-- **Key connected** (Settings → AI Agents) → the proxy injects it and opencode
-  gets the full paid catalog, exactly as before. A connected key always wins.
+### Fallback: no proxy
 
-This is **opencode-only** — it's the one provider with a keyless free tier. Every
-other agent (claude-code, codex) still returns a clear "connect it" error when
-unconnected. See `internal/authproxy/proxy.go` (`credFor`) and
-`internal/api/v1_tasks.go` (model precedence).
-
-### Per-agent default model (optional)
-
-Set a default model per agent in **Settings → AI Agents → Default model** (or via
-`PATCH /v1/settings` `agents.default_models`). You supply the agent's real model
-id (e.g. opencode `glm-5`, claude `sonnet`); it's used when a task doesn't specify
-one. Stored durably, applied live. Model precedence for a task:
-
-1. the task's own `model` (per request), then
-2. the per-agent default (this setting), then
-3. opencode's free-tier default (only when opencode has no key), then
-4. runtimed's env/agent default (`SANDBOXD_OPENCODE_MODEL` / the CLI's own).
-
-### Fallback: no proxy → mounted auth dir
-
-If the proxy is disabled, the connected provider's opaque auth dir
-(`<DataDir>/agent-auth/<provider>/`, outside any workspace) is bind-mounted
-read-only at `/run/agent-auth/<provider>` and runtimed points the agent's `HOME`
-there; an API-key connect instead injects the provider's one key var. This is the
-legacy path — with the proxy on (the default), nothing is mounted or injected.
+If the proxy is disabled, a connected sandbox-resident provider's opaque auth
+directory (`<DataDir>/agent-auth/<provider>/`, outside any workspace) is
+bind-mounted read-only at `/run/agent-auth/<provider>` and runtimed points the
+agent's `HOME` there. An API-key connection instead injects the provider's one
+key var. This is the legacy path; GitHub Copilot never uses it.
 
 ## Env scrub
 
-The agent process env is scrubbed of secret-shaped variables (`*_KEY`,
-`*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, and runtimed's own
-`RUNTIMED_*`). So:
+Sandbox-resident agent process env is scrubbed of secret-shaped variables
+(`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, and runtimed's
+own `RUNTIMED_*`). Therefore:
 
-- An agent can never pick up a stray credential from the container env.
-- **Injecting a key via the sandbox `env` no longer reaches the agent** — e.g.
-  `ANTHROPIC_API_KEY` set at create time is dropped. Connect the provider
-  instead (API-key connect re-injects it from the managed file).
+- An agent cannot pick up a stray credential from the container env.
+- A key set via a sandbox's `env`, such as `ANTHROPIC_API_KEY`, does not reach
+  the agent. Connect the provider instead.
 
-Non-secret config (`PATH`, `HOME`, `LANG`, `*_MODEL`, `*_BASE_URL`, …) is kept.
+Non-secret config (`PATH`, `HOME`, `LANG`, `*_MODEL`, `*_BASE_URL`, and similar)
+is retained.
 
-## Agent context — platform prompt + per-app guide
+## Agent context: platform prompt and per-app guide
 
-So an agent understands its environment and doesn't break things, two context
-layers are injected with **no change to your source**:
+Two context layers are injected without changing app source:
 
-- **Platform system prompt** — a single committed
-  [`control-plane/internal/agentprompt/prompt.md`](../control-plane/internal/agentprompt/prompt.md),
-  embedded into both the control plane and `runtimed`. runtimed renders it with
-  the sandbox's real port/health and appends it to every run — via
-  `--append-system-prompt` for claude-code, and as a prompt preamble for
-  opencode. It defines the guardrails: bind `0.0.0.0`, don't rewrite
-  `sandbox.yaml` carelessly, don't touch `/run/agent-auth`, no destructive git
-  on the main branch, verify on the loopback port before finishing. It is
-  surfaced **read-only** as `agents.system_prompt` in `GET /v1/settings`
-  (Console → Settings → Agent system prompt).
-- **Per-app `AGENTS.md`** — the detected stack, upstream repo link, and how-to-run,
-  written to `workspace/app/AGENTS.md` on runtime apply (git-ignored via
-  `.git/info/exclude`) unless the repo already ships one. This is a **console**
-  behavior on top of `/v1`, not a core write.
+- **Platform system prompt**:
+  [`control-plane/internal/agentprompt/prompt.md`](../control-plane/internal/agentprompt/prompt.md)
+  is embedded into the control plane and runtimed. It is rendered with the
+  sandbox's real port and health path, then supplied to Claude Code through
+  `--append-system-prompt`, prefixed for OpenCode, and sent to GitHub Copilot
+  through the private bridge. It defines the guardrails: bind `0.0.0.0`, do not
+  rewrite `sandbox.yaml` carelessly, do not touch `/run/agent-auth`, avoid
+  destructive Git on the main branch, and verify on the loopback port. The prompt
+  is read-only at `agents.system_prompt` in `GET /v1/settings`.
+- **Per-app `AGENTS.md`**: detected stack, upstream repo link, and run guidance
+  written to `workspace/app/AGENTS.md` on runtime apply unless the imported repo
+  already provides one. This is console behavior on top of `/v1`, not a core
+  write.
 
 ## What's guaranteed
 
-Credentials are absent from: the workspace, snapshots (workspace tree only), the
-container env / `docker inspect`, task results, events, and logs. For claude-code
-subscriptions the token isn't even on the container filesystem — it lives only
-behind the control-plane proxy.
+Credentials are absent from the workspace, snapshots (workspace tree only),
+container env / `docker inspect`, task results, events, and logs. Claude Code
+subscription tokens live behind the control-plane proxy. GitHub Copilot PATs and
+SDK runtime state remain in the control plane.
 
 ## Running a task
 
-Submit `POST /v1/sandboxes/{id}/tasks` with `{"prompt":"…","agent":"opencode","model":"opencode/glm-5"}`.
-runtimed runs the CLI in the workspace (`--dangerously-skip-permissions`, since
-the containment boundary is the throwaway sandbox, not the agent), streams events
-over SSE (`/tasks/{taskId}/events`), and returns a final result. `model` maps to
-the CLI's `--model`.
+Submit `POST /v1/sandboxes/{id}/tasks` with
+`{"prompt":"...","agent":"opencode","model":"opencode/glm-5"}`.
+Sandbox-resident adapters run their CLI in the workspace
+(`--dangerously-skip-permissions`, because the containment boundary is the
+throwaway sandbox, not the agent). GitHub Copilot uses
+`{"prompt":"...","agent":"github-copilot","model":"<SDK model id>"}` and streams
+through the hosted SDK bridge. These are all one-shot task calls: events stream
+over SSE (`/tasks/{taskId}/events`) and a final result ends the task.
 
-Defaults:
+For the conversational Copilot API, submit
+`POST /v1/sandboxes/{id}/conversation/messages` with
+`{"prompt":"...","mode":"interactive"}`. Modes are `interactive`, `plan`, and
+`autopilot`; a leading `/interactive`, `/plan`, or `/autopilot` in the prompt
+overrides the JSON mode. Get the initial transcript from
+`GET /v1/sandboxes/{id}/conversation`, then connect
+`GET /v1/sandboxes/{id}/conversation/events?after=<event_cursor>`. Answer
+native input and plan cards only through their returned interaction endpoint.
+The full request and response contract is in `docs/openapi.yaml`.
 
-- **Agent** — `SANDBOXD_DEFAULT_AGENT` (default `opencode`) picks the agent for
-  tasks that don't specify one.
-- **Continue** — `continue` is a tri-state and **defaults to continuing** the
-  sandbox's most recent agent session (`claude/opencode --continue`, codex
-  `resume --last`). Omit it and runtimed continues when a prior session exists and
-  starts fresh on the first task; send `true`/`false` to force the choice. Each
-  sandbox is one workspace, so "most recent" is naturally per-sandbox.
+`SANDBOXD_DEFAULT_AGENT` (default `opencode`) chooses the agent when the task
+does not specify one. `continue` is tri-state and defaults to continuing the
+sandbox's most recent agent session. Claude Code and OpenCode use their CLI
+resume behavior; one-shot GitHub Copilot tasks use a sandbox-keyed
+control-plane mapping. Omit it to resume when a prior session exists and start
+fresh otherwise; set `true` or `false` to force the choice. Conversation turns
+always continue their active conversation until it is reset.
 
 ## Configuration reference
 
-Operator knobs for agent auth & task defaults (all optional; sensible defaults shown):
+All settings are optional; defaults are shown below.
 
 | Env var | Default | What it does |
 | --- | --- | --- |
-| `SANDBOXD_AGENT_PROXY_URL` | `http://sandboxd:9100` | In-network URL of the credential-injecting proxy. Set/empty toggles the proxy vs. legacy mounted-auth model. |
-| `SANDBOXD_DEFAULT_AGENT` | `opencode` | Agent used for tasks that don't specify one. |
-| `SANDBOXD_OPENCODE_ZEN_PATH` | `zen` | OpenCode Zen endpoint for opencode: `zen` (pay-as-you-go, full catalog) or `zengo` (the "go" subscription's models). See [OpenCode Zen: subscription vs pay-as-you-go](#opencode-zen-subscription-vs-pay-as-you-go). |
-| `SANDBOXD_OPENCODE_MODEL` | *(unset)* | Global default `--model` for opencode tasks that don't pass one. |
-| `SANDBOXD_MINIMAX_REGION` | `global_en` | MiniMax direct endpoint region for MiniMax models: `global_en` (`api.minimax.io`) or `cn_zh` (`api.minimaxi.com`). Requires a connected MiniMax API key. |
+| `SANDBOXD_AGENT_PROXY_URL` | `http://sandboxd:9100` | In-network credential-injecting proxy URL. Empty selects the legacy mounted-auth model. |
+| `SANDBOXD_DEFAULT_AGENT` | `opencode` | Agent for tasks that do not specify one. |
+| `SANDBOXD_OPENCODE_ZEN_PATH` | `zen` | OpenCode Zen endpoint: `zen` (pay-as-you-go) or `zengo` (go-subscription models). |
+| `SANDBOXD_OPENCODE_MODEL` | *(unset)* | Global default model for OpenCode tasks without one. |
+| `SANDBOXD_MINIMAX_REGION` | `global_en` | MiniMax direct endpoint region: `global_en` or `cn_zh`. |
+| `SANDBOXD_COPILOT_BRIDGE_ADDR` | `0.0.0.0:9200` | Internal listener address for the Copilot task bridge. Do not publish it. |
+| `SANDBOXD_COPILOT_BRIDGE_URL` | `http://sandboxd:9200` | In-network bridge URL injected into sandboxes. sandboxd derives an IP-address URL for gVisor. |
 
-Per-task, `POST /tasks` also accepts `agent`, `model`, and `continue` (tri-state —
-see [Running a task](#running-a-task)).
+Per task, `POST /tasks` also accepts `agent`, `model`, and `continue`.

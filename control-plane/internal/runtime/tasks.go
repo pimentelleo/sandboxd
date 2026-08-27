@@ -37,7 +37,7 @@ const (
 type StartTaskRequest struct {
 	TaskID string            `json:"task_id"`
 	Prompt string            `json:"prompt"`
-	Agent  string            `json:"agent,omitempty"` // opencode | claude-code
+	Agent  string            `json:"agent,omitempty"` // opencode | claude-code | codex | github-copilot
 	Env    map[string]string `json:"env,omitempty"`   // passed to the agent process (credentials)
 	// Model, when set, is the model this task runs on — passed to the agent CLI's
 	// model flag (opencode -m, claude --model). Agent-namespaced (opencode wants
@@ -48,7 +48,48 @@ type StartTaskRequest struct {
 	// fresh (claude/opencode --continue, codex `exec resume --last`). Tri-state:
 	// nil (omitted) = the default, which is to continue when the sandbox already
 	// has a prior session and start fresh otherwise; true/false force the choice.
+	// github-copilot forwards the tri-state to its bridge, which instead checks
+	// its own capability-to-session mapping.
 	Continue *bool `json:"continue,omitempty"`
+	// CopilotCapability authorizes one github-copilot bridge task. It is passed
+	// directly to runtimed and must never be persisted or surfaced in task events.
+	CopilotCapability string `json:"copilot_capability,omitempty"`
+}
+
+// PrepareHostedTaskRequest creates the pre-turn checkpoint for a Copilot
+// conversation turn. Unlike StartTaskRequest, it never launches an in-sandbox
+// agent process, so it is safe to leave prepared while awaiting user input.
+type PrepareHostedTaskRequest struct {
+	TaskID string `json:"task_id"`
+	Prompt string `json:"prompt"`
+}
+
+type HostedTaskPreparation struct {
+	TaskID       string    `json:"task_id"`
+	CheckpointID string    `json:"checkpoint_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// FinalizeHostedTaskRequest provides the hosted SDK outcome after it has
+// completed outside the sandbox. Runtimed applies the same changed-file,
+// build, restart, health, result, and revert semantics as a legacy task.
+type FinalizeHostedTaskRequest struct {
+	TaskID            string     `json:"task_id"`
+	Status            TaskStatus `json:"status"`
+	FailureReason     string     `json:"failure_reason,omitempty"`
+	ErrorMessage      string     `json:"error_message,omitempty"`
+	AgentMessageFinal string     `json:"agent_message_final,omitempty"`
+	Tokens            TokenUsage `json:"tokens"`
+}
+
+// AbandonHostedTaskRequest records a terminal result without running the
+// post-task build and health pipeline. It is only used as a recovery fallback
+// when a previously prepared hosted turn cannot be finalized normally.
+type AbandonHostedTaskRequest struct {
+	TaskID        string     `json:"task_id"`
+	Status        TaskStatus `json:"status"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	ErrorMessage  string     `json:"error_message,omitempty"`
 }
 
 // Event is one task progress event. Data is type-specific JSON.

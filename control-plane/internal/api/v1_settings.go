@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentauth"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentprompt"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
@@ -249,7 +248,7 @@ func (s *Server) v1PatchSettings(w http.ResponseWriter, r *http.Request) {
 			merged[k] = v
 		}
 		for agent, model := range req.Agents.DefaultModels {
-			if !agentauth.Runnable(agent) {
+			if !isTaskAgent(agent) {
 				writeV1Err(w, http.StatusBadRequest, "invalid_request",
 					"unknown agent in default_models: "+agent)
 				return

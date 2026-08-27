@@ -17,6 +17,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentauth"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/auth"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
@@ -166,6 +167,15 @@ type Server struct {
 	// → paste code → tokens) and token refresh. nil disables the OAuth endpoints.
 	AgentOAuth *agentauth.OAuth
 
+	// Copilot runs through the official SDK in the control plane. Its PAT and
+	// SDK state are never mounted into sandbox containers.
+	Copilot          *copilot.Manager
+	CopilotBridgeURL string
+	// Conversations coordinates durable hosted Copilot turns. It is lazily
+	// initialized for backwards-compatible Server literals in tests.
+	Conversations  *ConversationCoordinator
+	conversationMu sync.Mutex
+
 	// OpencodeModel, when set, is passed to opencode tasks as --model (e.g. an
 	// OpenCode Zen model "opencode/claude-sonnet-4-5"). Empty → opencode's default.
 	OpencodeModel string
@@ -254,6 +264,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sandboxes/{id}/tasks/{taskId}/revert", s.observe("POST /v1/sandboxes/{id}/tasks/{taskId}/revert", s.v1RevertTask))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/tasks/{taskId}/events", s.observe("GET /v1/sandboxes/{id}/tasks/{taskId}/events", s.v1TaskEvents))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/tasks/{taskId}/cancel", s.observe("POST /v1/sandboxes/{id}/tasks/{taskId}/cancel", s.v1CancelTask))
+	mux.HandleFunc("GET /v1/sandboxes/{id}/conversation", s.observe("GET /v1/sandboxes/{id}/conversation", s.v1ConversationSnapshot))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/conversation/messages", s.observe("POST /v1/sandboxes/{id}/conversation/messages", s.v1ConversationSubmit))
+	mux.HandleFunc("GET /v1/sandboxes/{id}/conversation/events", s.observe("GET /v1/sandboxes/{id}/conversation/events", s.v1ConversationEvents))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/conversation/interactions/{interactionId}/answer", s.observe("POST /v1/sandboxes/{id}/conversation/interactions/{interactionId}/answer", s.v1ConversationAnswer))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/conversation/interactions/{interactionId}/plan", s.observe("POST /v1/sandboxes/{id}/conversation/interactions/{interactionId}/plan", s.v1ConversationPlan))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/conversation/cancel", s.observe("POST /v1/sandboxes/{id}/conversation/cancel", s.v1ConversationCancel))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/conversation/reset", s.observe("POST /v1/sandboxes/{id}/conversation/reset", s.v1ConversationReset))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files", s.observe("GET /v1/sandboxes/{id}/files", s.v1ListFiles))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files/content", s.observe("GET /v1/sandboxes/{id}/files/content", s.v1FileContent))
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/files", s.observe("PUT /v1/sandboxes/{id}/files", s.v1PutFile))
@@ -267,6 +284,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/agents", s.observe("GET /v1/agents", s.v1ListAgents))
 	mux.HandleFunc("POST /v1/agents/claude-code/oauth/start", s.observe("POST /v1/agents/claude-code/oauth/start", s.v1AgentOAuthStart))
 	mux.HandleFunc("POST /v1/agents/claude-code/oauth/finish", s.observe("POST /v1/agents/claude-code/oauth/finish", s.v1AgentOAuthFinish))
+	mux.HandleFunc("POST /v1/agents/github-copilot/pat", s.observe("POST /v1/agents/github-copilot/pat", s.v1GitHubCopilotPAT))
 	mux.HandleFunc("POST /v1/agents/{provider}/import", s.observe("POST /v1/agents/{provider}/import", s.v1AgentImport))
 	mux.HandleFunc("POST /v1/agents/{provider}/api-key", s.observe("POST /v1/agents/{provider}/api-key", s.v1AgentAPIKey))
 	mux.HandleFunc("POST /v1/agents/{provider}/disconnect", s.observe("POST /v1/agents/{provider}/disconnect", s.v1AgentDisconnect))

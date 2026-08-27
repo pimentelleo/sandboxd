@@ -84,6 +84,88 @@ func (c *Client) StartTask(ctx context.Context, req StartTaskRequest) error {
 	}
 }
 
+// PrepareHostedTask takes the same pre-task checkpoint as a legacy task
+// without leaving an active runtimed task behind while the hosted provider
+// waits for a console interaction.
+func (c *Client) PrepareHostedTask(ctx context.Context, req PrepareHostedTaskRequest) (*HostedTaskPreparation, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, c.stream, http.MethodPost, "http://runtimed/hosted-tasks/prepare", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return nil, ErrTaskInProgress
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("runtimed hosted task prepare: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var preparation HostedTaskPreparation
+	if err := json.NewDecoder(resp.Body).Decode(&preparation); err != nil {
+		return nil, fmt.Errorf("decode runtimed hosted task preparation: %w", err)
+	}
+	return &preparation, nil
+}
+
+// FinalizeHostedTask runs the post-task lifecycle and persists the canonical
+// result for a previously prepared hosted task.
+func (c *Client) FinalizeHostedTask(ctx context.Context, req FinalizeHostedTaskRequest) (*TaskResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, c.stream, http.MethodPost,
+		"http://runtimed/hosted-tasks/"+url.PathEscape(req.TaskID)+"/finalize", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return nil, ErrTaskInProgress
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("runtimed hosted task finalize: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var result TaskResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode runtimed hosted task result: %w", err)
+	}
+	return &result, nil
+}
+
+// AbandonHostedTask clears an orphaned hosted-task record while preserving a
+// canonical terminal result. It is intentionally narrower than finalization:
+// callers use it only after normal recovery finalization failed.
+func (c *Client) AbandonHostedTask(ctx context.Context, req AbandonHostedTaskRequest) (*TaskResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, c.http, http.MethodPost,
+		"http://runtimed/hosted-tasks/"+url.PathEscape(req.TaskID)+"/abandon", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return nil, ErrTaskInProgress
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("runtimed hosted task abandon: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var result TaskResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode abandoned hosted task result: %w", err)
+	}
+	return &result, nil
+}
+
 // CancelTask asks runtimed to cancel a task. It is idempotent.
 func (c *Client) CancelTask(ctx context.Context, taskID string) error {
 	resp, err := c.do(ctx, c.http, http.MethodPost,

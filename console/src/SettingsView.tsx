@@ -51,6 +51,9 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   const [keyName, setKeyName] = useState('')
   const [newKey, setNewKey] = useState('')
   const [models, setModels] = useState<Record<string, string>>({})
+  const [githubCopilotPAT, setGithubCopilotPAT] = useState('')
+  const [githubCopilotFormOpen, setGithubCopilotFormOpen] = useState(false)
+  const [githubCopilotConnecting, setGithubCopilotConnecting] = useState(false)
 
   const loadAgents = useCallback(() => api.getAgents().then(setAgents).catch(() => {}), [])
   const loadCreds = useCallback(() => api.listGitCredentials().then(setCreds).catch(() => {}), [])
@@ -59,7 +62,6 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
     api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds); setModels(d.agents.default_models || {}) }).catch((e) => onError((e as Error).message))
     loadAgents(); loadCreds(); loadKeys()
   }, [onError, loadAgents, loadCreds, loadKeys])
-
   if (!s) return <div style={{ padding: 40, color: c.muted2 }}>Loading…</div>
   const lifecycleEditable = (s.editable || []).some((p) => p.startsWith('lifecycle.'))
   const modelsEditable = (s.editable || []).some((p) => p === 'agents.default_models')
@@ -69,6 +71,29 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   }
   const apiKey = async (id: string) => { const key = window.prompt(`Paste the ${id} API key:`); if (key) try { await api.setAgentApiKey(id, key.trim()); toast('Connected'); loadAgents() } catch (e) { onError((e as Error).message) } }
   const importCred = async (id: string) => { const v = window.prompt(`Paste the credential (from your ${id} login):`); if (v) try { await api.importAgentCredential(id, v); toast('Connected'); loadAgents() } catch (e) { onError((e as Error).message) } }
+  const connectGitHubCopilotPAT = async () => {
+    const token = githubCopilotPAT.trim()
+    if (!token) {
+      onError('Enter a fine-grained GitHub personal access token')
+      return
+    }
+    setGithubCopilotConnecting(true)
+    try {
+      const result = await api.connectGitHubCopilotPAT(token)
+      setGithubCopilotFormOpen(false)
+      toast(result.account ? `GitHub Copilot connected as ${result.account}` : 'GitHub Copilot connected')
+      loadAgents()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setGithubCopilotPAT('')
+      setGithubCopilotConnecting(false)
+    }
+  }
+  const toggleGitHubCopilotForm = () => {
+    setGithubCopilotPAT('')
+    setGithubCopilotFormOpen((open) => !open)
+  }
   const saveLifecycle = async () => { try { await api.patchSettings({ lifecycle: { idle_reap_enabled: idle, idle_threshold_seconds: idleSec, keepalive_max_seconds: keepSec } }); toast('Lifecycle saved') } catch (e) { onError((e as Error).message) } }
   const saveModels = async () => { try { const d = await api.patchSettings({ agents: { default_models: models } }); setModels(d.agents.default_models || {}); toast('Default models saved') } catch (e) { onError((e as Error).message) } }
   const addCred = async () => { if (!gc.name || !gc.host || !gc.token) return; try { await api.createGitCredential(gc); setGc({ name: '', host: '', username: '', token: '' }); toast('Credential added'); loadCreds() } catch (e) { onError((e as Error).message) } }
@@ -104,27 +129,47 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
             // put behind the credential proxy yet (see the note below).
             // MiniMax is a credential-only provider (no task-agent CLI); it's
             // connectable here but never appears in the run picker.
+            const githubCopilot = a.id === 'github-copilot'
             const disabled = a.id === 'codex'
             const credentialOnly = !a.runnable && a.id !== 'codex'
+            const connectionMethod = a.method === 'oauth'
+              ? 'subscription'
+              : a.method === 'github-pat'
+                ? 'fine-grained PAT'
+                : 'API key'
             return (
-            <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', border: `1px solid ${c.border}`, borderRadius: 8, background: c.panel2, marginBottom: 8, opacity: disabled ? 0.6 : 1 }} data-testid={`agent-${a.id}`}>
-              <div>
-                <div style={{ fontWeight: 500 }}>{a.label}</div>
-                <div style={{ ...mono, fontSize: 11, color: c.muted2 }}>{disabled ? 'temporarily unavailable' : `${a.installed_state === 'installed' ? 'installed' : 'not installed'}${a.status === 'connected' && a.method ? ` · via ${a.method === 'oauth' ? 'subscription' : 'API key'}` : ''}${credentialOnly ? ' · model gateway' : ''}`}</div>
+              <div key={a.id} data-testid={`agent-${a.id}`} style={{ marginBottom: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', border: `1px solid ${c.border}`, borderRadius: githubCopilot && githubCopilotFormOpen ? '8px 8px 0 0' : 8, background: c.panel2, opacity: disabled ? 0.6 : 1 }}>
+                  <div>
+                    <div style={{ fontWeight: 500 }}>{a.label}</div>
+                    <div style={{ ...mono, fontSize: 11, color: c.muted2 }}>{disabled ? 'temporarily unavailable' : `${a.installed_state === 'installed' ? 'installed' : 'not installed'}${a.hosted ? ' · hosted — no sandbox credential' : ''}${a.status === 'connected' && a.method ? ` · via ${connectionMethod}${a.account ? ` (${a.account})` : ''}` : ''}${credentialOnly ? ' · model gateway' : ''}`}</div>
+                  </div>
+                  {disabled ? (
+                    <span style={{ marginLeft: 'auto' }}><Pill tone="neutral">disabled</Pill></span>
+                  ) : (<>
+                    <span style={{ marginLeft: 'auto' }}><Pill tone={a.status === 'connected' ? 'good' : 'warn'}>{a.status === 'connected' ? 'connected' : 'needs login'}</Pill></span>
+                    {a.status === 'connected' ? (
+                    <Btn sm variant="ghost" onClick={() => api.disconnectAgent(a.id).then(() => { toast('Disconnected'); loadAgents() })} data-testid="agent-disconnect">Disconnect</Btn>
+                  ) : (
+                    <>
+                      {githubCopilot
+                        ? <Btn sm onClick={toggleGitHubCopilotForm} disabled={githubCopilotConnecting} data-testid="agent-connect-github-copilot">{githubCopilotFormOpen ? 'Cancel' : 'Connect GitHub Copilot'}</Btn>
+                        : a.supports_oauth && <Btn sm onClick={() => (a.id === 'claude-code' ? connectClaude() : importCred(a.id))} data-testid="agent-connect-oauth">Connect subscription</Btn>}
+                      {a.supports_api_key && <Btn sm variant="ghost" onClick={() => apiKey(a.id)} data-testid="agent-connect-apikey">Use API key</Btn>}
+                    </>
+                  )}
+                </>)}
               </div>
-              {disabled ? (
-                <span style={{ marginLeft: 'auto' }}><Pill tone="neutral">disabled</Pill></span>
-              ) : (<>
-                <span style={{ marginLeft: 'auto' }}><Pill tone={a.status === 'connected' ? 'good' : 'warn'}>{a.status === 'connected' ? 'connected' : 'needs login'}</Pill></span>
-                {a.status === 'connected' ? (
-                  <Btn sm variant="ghost" onClick={() => api.disconnectAgent(a.id).then(() => { toast('Disconnected'); loadAgents() })} data-testid="agent-disconnect">Disconnect</Btn>
-                ) : (
-                  <>
-                    {a.supports_oauth && <Btn sm onClick={() => (a.id === 'claude-code' ? connectClaude() : importCred(a.id))} data-testid="agent-connect-oauth">Connect subscription</Btn>}
-                    {a.supports_api_key && <Btn sm variant="ghost" onClick={() => apiKey(a.id)} data-testid="agent-connect-apikey">Use API key</Btn>}
-                  </>
-                )}
-              </>)}
+              {githubCopilot && githubCopilotFormOpen && a.status !== 'connected' && (
+                <div data-testid="github-copilot-pat" style={{ padding: '12px 14px', border: `1px solid ${c.border}`, borderTop: 'none', borderRadius: '0 0 8px 8px', background: c.panel }}>
+                  <label htmlFor="github-copilot-pat" style={{ display: 'block', fontSize: 12.5, color: c.fg2, marginBottom: 7 }}>Fine-grained personal access token</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <Input id="github-copilot-pat" type="password" autoComplete="off" spellCheck={false} mono value={githubCopilotPAT} onChange={(e) => setGithubCopilotPAT(e.target.value)} placeholder="github_pat_…" aria-label="GitHub Copilot fine-grained personal access token" data-testid="github-copilot-pat-input" style={{ flex: '1 1 280px' }} />
+                    <Btn sm onClick={connectGitHubCopilotPAT} disabled={!githubCopilotPAT.trim() || githubCopilotConnecting} data-testid="github-copilot-pat-submit">{githubCopilotConnecting ? 'Connecting…' : 'Connect'}</Btn>
+                  </div>
+                  <div style={{ fontSize: 12, color: c.muted2, lineHeight: 1.5, marginTop: 8 }}>Create a fine-grained token with the <b style={{ color: c.fg2 }}>Copilot Requests</b> permission and use an account with Copilot access. The control plane validates and encrypts it; no Copilot credential is sent to a sandbox.</div>
+                </div>
+              )}
             </div>
           )})}
         </div>
@@ -149,7 +194,7 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
             : <div style={{ marginTop: 8, fontSize: 12, color: c.muted2 }}>Read-only on this instance — set <span style={{ ...mono, fontSize: 11 }}>SANDBOXD_OPENCODE_MODEL</span> (opencode) or per-task model.</div>}
         </div>
 
-        <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5, marginTop: 14 }}>Each agent runs on your own account; credentials are stored opaquely server-side, never shown in the browser, and kept out of snapshots. <b style={{ color: c.fg2 }}>OpenCode</b> works out of the box with <b style={{ color: c.fg2 }}>no key</b> on its free tier — add an API key for the full model catalog. <b style={{ color: c.fg2 }}>Claude Code</b> subscriptions run through a credential-injecting proxy — the token never enters the sandbox. <b style={{ color: c.fg2 }}>Codex is disabled for now</b>: its ChatGPT-subscription auth uses a WebSocket backend that can't yet be put behind that proxy, and we won't mount a raw token into the sandbox.</div>
+        <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5, marginTop: 14 }}>Each agent runs on your own account; credentials are never shown in the browser and stay out of snapshots. <b style={{ color: c.fg2 }}>OpenCode</b> works out of the box with <b style={{ color: c.fg2 }}>no key</b> on its free tier — add an API key for the full model catalog. <b style={{ color: c.fg2 }}>Claude Code</b> subscriptions run through a credential-injecting proxy, while <b style={{ color: c.fg2 }}>GitHub Copilot</b> runs through its official SDK in the control plane with a fine-grained personal access token; neither sends a token into a sandbox. <b style={{ color: c.fg2 }}>Codex is disabled for now</b>: its ChatGPT-subscription auth uses a WebSocket backend that can't yet be put behind that proxy, and we won't mount a raw token into the sandbox.</div>
       </Card>
 
       <Card style={{ padding: 16, marginBottom: 12 }} data-testid="settings-lifecycle">

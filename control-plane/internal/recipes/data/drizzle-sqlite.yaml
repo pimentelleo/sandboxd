@@ -10,7 +10,7 @@ suggested_manifest: |
     health_path: "/"
 notes:
   - "Canonical TypeScript + SQLite stack (verified with Hono). The server must bind host 0.0.0.0 and port 3000 in code. Adjust the entry (src/index.ts)."
-  - "better-sqlite3 11.x uses a Node-22 prebuilt — no compile. DB persists across restarts (e.g. data.db grows)."
+  - "better-sqlite3 uses a platform prebuilt when available; the base image includes the native build toolchain as a fallback. DB persists across restarts (e.g. data.db grows)."
   - "Drizzle's better-sqlite3 sync driver needs a terminal `.get()/.all()/.run()` — don't array-destructure the query builder."
 tags: [node, typescript, sqlite_app]
 verified:

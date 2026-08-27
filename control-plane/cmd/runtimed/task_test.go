@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -61,5 +63,71 @@ func TestHasPriorTask(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "earlier"), 0o755)
 	if !hasPriorTask(root, "self") {
 		t.Error("a sibling task dir is a prior task")
+	}
+}
+
+func TestAbandonHostedTaskReleasesRestartedRuntime(t *testing.T) {
+	root := t.TempDir()
+	runtimeDir := filepath.Join(root, ".runtimed")
+	appDir := filepath.Join(root, "workspace", "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := &app{appDir: appDir, runtimeDir: runtimeDir, log: slog.Default()}
+	const oldTaskID = "hosted-before-restart"
+	if _, err := first.prepareHostedTask(runtime.PrepareHostedTaskRequest{
+		TaskID: oldTaskID, Prompt: "interrupted request",
+	}); err != nil {
+		t.Fatalf("prepare hosted task: %v", err)
+	}
+
+	// A fresh runtimed process restores the old marker exactly as a sandbox
+	// wake would. It must not remain an admission lock after abandonment.
+	restarted := &app{appDir: appDir, runtimeDir: runtimeDir, log: slog.Default()}
+	restarted.loadHostedTasks()
+	if _, err := restarted.prepareHostedTask(runtime.PrepareHostedTaskRequest{
+		TaskID: "new-task", Prompt: "next request",
+	}); !errors.Is(err, errTaskInProgress) {
+		t.Fatalf("prepare with restored hosted marker = %v; want task in progress", err)
+	}
+
+	result, err := restarted.abandonHostedTask(runtime.AbandonHostedTaskRequest{
+		TaskID: oldTaskID, Status: runtime.TaskFailed, FailureReason: "provider_interrupted",
+		ErrorMessage: "control plane restarted",
+	})
+	if err != nil {
+		t.Fatalf("abandon hosted task: %v", err)
+	}
+	if result.Status != runtime.TaskFailed || result.FailureReason != "provider_interrupted" {
+		t.Fatalf("abandoned result = %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(hostedTaskDir(runtimeDir, oldTaskID), hostedTaskMetadataFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hosted marker remains after abandon: %v", err)
+	}
+	if _, err := restarted.prepareHostedTask(runtime.PrepareHostedTaskRequest{
+		TaskID: "new-task", Prompt: "next request",
+	}); err != nil {
+		t.Fatalf("prepare after abandon: %v", err)
+	}
+
+	// Retrying after a lost HTTP response returns the existing terminal result
+	// rather than re-creating the metadata or failing as a missing task.
+	retried, err := restarted.abandonHostedTask(runtime.AbandonHostedTaskRequest{
+		TaskID: oldTaskID, Status: runtime.TaskFailed,
+	})
+	if err != nil {
+		t.Fatalf("retry abandon hosted task: %v", err)
+	}
+	if retried.ID != oldTaskID || retried.Status != runtime.TaskFailed {
+		t.Fatalf("retry result = %#v", retried)
+	}
+	finalized, err := restarted.finalizeHostedTask(t.Context(), runtime.FinalizeHostedTaskRequest{
+		TaskID: oldTaskID, Status: runtime.TaskFailed,
+	})
+	if err != nil {
+		t.Fatalf("retry finalize hosted task: %v", err)
+	}
+	if finalized.ID != oldTaskID || finalized.Status != runtime.TaskFailed {
+		t.Fatalf("retry finalize result = %#v", finalized)
 	}
 }

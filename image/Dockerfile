@@ -29,7 +29,7 @@
 #     PATH at runtime).
 #   - `npm install -g pnpm@${PNPM_VERSION}` instead of corepack — corepack
 #     auto-resolves to a floating pnpm; we pin an explicit version. (On the
-#     Node 22 base, pnpm 10/11 are fine; the image pins pnpm 10.x for catalog
+#     Node 24 base, pnpm 10/11 are fine; the image pins pnpm 10.x for catalog
 #     workspace support — see the PNPM_VERSION arg.)
 #   - `env UV_INSTALL_DIR=/usr/local sh` instead of mv-after-install —
 #     the uv 0.4 installer moved its default target from ~/.local/bin
@@ -50,7 +50,7 @@
 # CGO disabled -> a static binary that runs in the slim base with no
 # extra runtime deps. Build context is the repo ROOT (see install.sh
 # / docker-compose), so the control-plane source is at ./control-plane.
-FROM golang:1.22-bookworm AS runtimed-builder
+FROM golang:1.24-bookworm AS runtimed-builder
 WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./control-plane/
 RUN cd control-plane && go mod download
@@ -60,11 +60,11 @@ RUN cd control-plane && CGO_ENABLED=0 go build -trimpath -o /runtimed ./cmd/runt
 # --- Stage 2: the sandbox base image ---------------------------------
 FROM debian:stable-slim
 
-ARG NODE_VERSION=22.x
+ARG NODE_VERSION=24.x
 # pnpm 10.x: supports catalog-only `pnpm-workspace.yaml` (no `packages:` key) used by
 # modern release tarballs (e.g. Ghost 6 + `packageManager: pnpm@11`). pnpm 9 rejects
 # those with "packages field missing or empty". Still installed explicitly (not via
-# corepack) for a deterministic version; Node 22 supports pnpm 10/11.
+# corepack) for a deterministic version; Node 24 supports pnpm 10/11.
 ARG PNPM_VERSION=10.34.4
 ARG BUN_VERSION=1.1.30
 ARG UV_VERSION=0.4.20
@@ -83,8 +83,8 @@ RUN printf 'path-exclude /usr/share/doc/*\npath-exclude /usr/share/man/*\npath-e
 # `distutils-precedence.pth` hook) so node-gyp builds of native modules
 # (better-sqlite3, sqlite3, sharp, …) work on Python 3.12+ where the
 # stdlib distutils was removed. Without it, node-gyp ≤9 fails with
-# `ModuleNotFoundError: No module named 'distutils'`. (Node 22's bundled
-# node-gyp 10 no longer needs it, but project-pinned/older node-gyp and
+# `ModuleNotFoundError: No module named 'distutils'`. (Modern Node's bundled
+# node-gyp no longer needs it, but project-pinned/older node-gyp and
 # non-npm package managers still do — so we provide it unconditionally.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg git ripgrep fd-find jq unzip \
@@ -119,7 +119,7 @@ RUN npm install -g opencode-ai @openai/codex@0.142.5 \
  && chmod 755 /usr/local/bin/claude
 
 # Registry-proxy config + shell env file. /etc/npmrc and /usr/etc/npmrc
-# both ship the same content; /usr/etc/npmrc is the path Node 20's npm
+# both ship the same content; /usr/etc/npmrc is the path NodeSource's npm
 # treats as globalconfig (see header), /etc/npmrc is the documented
 # location for portability with other Node versions.
 COPY image/etc/npmrc /etc/npmrc
@@ -137,9 +137,14 @@ COPY image/skel/ /opt/sandbox-skel/
 # Add a template = drop a new dir here; the registry is additive.
 COPY image/templates/ /opt/templates/
 
-# Base-image self-check (Node 22, npm/pnpm/bun, python3/uv/setuptools, build
+# Base-image self-check (Node 24, npm/pnpm/bun, python3/uv/setuptools, build
 # tools). Run: `docker run --rm <image> bash /opt/verify-base.sh`.
 COPY image/verify-base.sh /opt/verify-base.sh
+
+# Docker build contexts from Windows can contain CRLF shell scripts even when
+# Git stores them as LF. Normalize scripts that execute inside this Linux image.
+RUN sed -i 's/\r$//' /etc/profile.d/sandbox-env.sh /opt/verify-base.sh \
+ && find /opt/templates -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
 
 # Sandbox user (uid/gid 1000 inside the container; userns-remap offsets
 # it on the host so a running sandbox's processes appear as host-uid

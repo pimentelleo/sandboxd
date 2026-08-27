@@ -12,14 +12,16 @@ export const gitCredentialsFixture: GitCredential[] = [
 
 // Read-only AI Agents status (mirrors GET /v1/agents). No tokens.
 export const agentsFixture: Agent[] = [
-  { id: 'opencode', label: 'OpenCode', installed_state: 'installed', status: 'connected', method: 'oauth', supports_oauth: true, supports_api_key: true, runnable: true },
-  { id: 'claude-code', label: 'Claude Code', installed_state: 'installed', status: 'needs_login', method: '', supports_oauth: true, supports_api_key: true, runnable: false },
-  { id: 'codex', label: 'Codex', installed_state: 'not_installed', status: 'needs_login', method: '', supports_oauth: true, supports_api_key: true, runnable: false },
+  { id: 'opencode', label: 'OpenCode', installed_state: 'installed', status: 'connected', method: 'oauth', supports_oauth: true, supports_api_key: true, supports_pat: false, runnable: true, hosted: false },
+  { id: 'claude-code', label: 'Claude Code', installed_state: 'installed', status: 'needs_login', method: '', supports_oauth: true, supports_api_key: true, supports_pat: false, runnable: false, hosted: false },
+  { id: 'github-copilot', label: 'GitHub Copilot', installed_state: 'installed', status: 'needs_login', method: '', supports_oauth: false, supports_api_key: false, supports_pat: true, runnable: true, hosted: true },
+  { id: 'codex', label: 'Codex', installed_state: 'not_installed', status: 'needs_login', method: '', supports_oauth: true, supports_api_key: true, supports_pat: false, runnable: false, hosted: false },
 ]
 
 export const presetsFixture: Preset[] = [
   { id: 'react-vite', label: 'React / Vite', description: 'React + Vite SPA', template: 'react-standard', capabilities: ['node', 'pnpm'] },
   { id: 'nextjs', label: 'Next.js', description: 'Next.js app', template: 'nextjs-standard', capabilities: ['node', 'pnpm'] },
+  { id: 'adonisjs', label: 'AdonisJS', description: 'AdonisJS v7 Hypermedia app with Edge, Alpine.js, and SQLite.', template: 'adonisjs-hypermedia-standard', capabilities: ['node', 'pnpm'] },
   { id: 'node-express', label: 'Node / Express API', description: 'Express REST API', template: 'node-express-standard', capabilities: ['node'] },
   { id: 'fastapi', label: 'Python / FastAPI', description: 'FastAPI REST API', template: 'fastapi-standard', capabilities: ['python3', 'python3-venv'] },
   { id: 'worker', label: 'Worker (no public endpoint)', description: 'Background worker', template: 'worker-standard', capabilities: [] },

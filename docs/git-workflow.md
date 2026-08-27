@@ -73,7 +73,7 @@ The split is deliberate and is the heart of the security model:
 
 `GET /v1/apps/{id}/runtime-inspect` summarizes any existing `sandbox.yaml`
 (authoritative, never overwritten), suggests a stack from the advisory recipe
-registry (runnable presets `nextjs`/`react-vite`/`node-express`/`fastapi`/`worker`,
+registry (runnable presets `nextjs`/`react-vite`/`adonisjs`/`node-express`/`fastapi`/`worker`,
 or detect-only recipes like `astro`/`docusaurus`/`gatsby`/`nuxt`/`sveltekit`/
 `vite-vue`/`remix-vite`/`eleventy`), and for detect-only stacks returns a
 `suggested_manifest` + `config_snippets`. It is purely advisory: **for an imported

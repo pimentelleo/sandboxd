@@ -10,7 +10,7 @@
 # Build context is the control-plane/ directory.
 
 # --- Stage 1: build sandboxd (CGO) -----------------------------------
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.24-bookworm AS builder
 # Version stamping — fed by docker-compose build args (see upgrade.sh/install.sh,
 # which derive them from `git describe`). Default to dev/unknown for a bare build.
 ARG VERSION=dev
@@ -19,6 +19,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Bundle the official Copilot runtime that matches the pinned Go SDK into the
+# control-plane binary. It never becomes part of the sandbox base image.
+RUN go run github.com/github/copilot-sdk/go/cmd/bundler --output ./cmd/sandboxd
 RUN CGO_ENABLED=1 go build -trimpath \
       -ldflags "-X main.buildVersion=${VERSION} -X main.buildCommit=${GIT_COMMIT}" \
       -o /sandboxd ./cmd/sandboxd

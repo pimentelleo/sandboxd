@@ -186,6 +186,22 @@ curl -s -XPOST $API/v1/sandboxes/$ID/tasks -d '{"prompt":"build a todo app on po
 # open the result at  http://s-$ID-3000.preview.localhost
 ```
 
+### GitHub Copilot conversations
+
+Connect GitHub Copilot with an entitled fine-grained PAT that has **Copilot
+Requests** permission. In the console, selecting **GitHub Copilot** opens a
+durable per-app conversation instead of a one-shot task: it can ask native
+follow-up questions, present plans for approval, and queue later messages while
+it works. `/plan` keeps workspace changes blocked until you approve the
+provider's plan action; `/interactive` permits normal collaboration; and
+`/autopilot` uses safe assumptions rather than pausing for clarification.
+
+The conversation survives a console reconnect and sandbox sleep. Its GitHub PAT
+and SDK state remain control-plane-only; neither is exposed to the app
+container. Other agents, and direct `POST /v1/sandboxes/{id}/tasks` requests,
+remain one-shot tasks. See [`docs/agent-auth.md`](docs/agent-auth.md) and the
+[OpenAPI contract](docs/openapi.yaml) for connection and API details.
+
 **Full walkthrough → [sandboxd.io/quickstart](https://sandboxd.io/quickstart).**
 
 ## 🚀 Deploy to a VPS in one click
@@ -222,7 +238,8 @@ Full per-provider walkthrough: [deploy/DEPLOY.md](deploy/DEPLOY.md).
 - **Built-in agents** — OpenCode & Claude Code. **No credential ever enters a
   sandbox** (a proxy injects it on the wire), and every task is **checkpointed &
   revertible**.
-- **Runtime presets** — React/Vite, Next.js, Node/Express, FastAPI, Worker; boot
+- **Runtime presets** — React/Vite, Next.js, AdonisJS (Edge/Alpine/SQLite),
+  Node/Express, FastAPI, Worker; boot
   to a preview and reload after agent edits.
 - **Files, Git & secrets** — in-browser editor + diffs, commit & push, per-app
   config/secrets (encrypted, write-only).

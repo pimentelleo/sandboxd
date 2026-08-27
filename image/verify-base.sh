@@ -18,9 +18,9 @@ check() { # <label> <command...>
 
 echo "sandboxd base-image verification"
 
-# Node must be 22.x (Finding B: <22 / <20.19 lacks worker_threads.markAsUncloneable).
+# Node must be 24.x (the AdonisJS v7 Hypermedia starter requires Node 24+).
 node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-if [ "$node_major" = "22" ]; then ok "node $(node --version)"; else bad "node is $(node --version 2>/dev/null) (want 22.x)"; fi
+if [ "$node_major" = "24" ]; then ok "node $(node --version)"; else bad "node is $(node --version 2>/dev/null) (want 24.x)"; fi
 # markAsUncloneable present (the undici-8 crash class).
 check "node worker_threads.markAsUncloneable" node -e 'require("worker_threads").markAsUncloneable||process.exit(1)'
 

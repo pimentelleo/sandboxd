@@ -63,9 +63,10 @@ func TestListAgentsShapeAndStatus(t *testing.T) {
 		by[p["id"].(string)] = p
 	}
 	want := map[string][2]string{
-		"opencode":    {"installed", "needs_login"},
-		"claude-code": {"installed", "connected"},
-		"codex":       {"not_installed", "needs_login"},
+		"opencode":       {"installed", "needs_login"},
+		"claude-code":    {"installed", "connected"},
+		"codex":          {"not_installed", "needs_login"},
+		"github-copilot": {"installed", "needs_login"},
 	}
 	for id, exp := range want {
 		p, ok := by[id]
@@ -76,6 +77,13 @@ func TestListAgentsShapeAndStatus(t *testing.T) {
 		if p["installed_state"] != exp[0] || p["status"] != exp[1] {
 			t.Errorf("%s: got installed=%v status=%v; want %v", id, p["installed_state"], p["status"], exp)
 		}
+	}
+	copilot := by["github-copilot"]
+	if copilot["hosted"] != true || copilot["runnable"] != true || copilot["supports_pat"] != true {
+		t.Errorf("GitHub Copilot metadata = %#v", copilot)
+	}
+	if _, ok := copilot["configured"]; ok {
+		t.Errorf("GitHub Copilot still exposes OAuth configuration state: %#v", copilot)
 	}
 }
 
@@ -90,8 +98,8 @@ func TestListAgentsProbeUnknown(t *testing.T) {
 		Providers []map[string]any `json:"providers"`
 	}
 	json.Unmarshal(w.Body.Bytes(), &d)
-	if len(d.Providers) != 4 {
-		t.Fatalf("want 4 providers, got %d", len(d.Providers))
+	if len(d.Providers) != 5 {
+		t.Fatalf("want 5 providers, got %d", len(d.Providers))
 	}
 	for _, p := range d.Providers {
 		// minimax is a credential-only provider with no CLI to probe, so its
@@ -102,6 +110,12 @@ func TestListAgentsProbeUnknown(t *testing.T) {
 			}
 			if p["runnable"] != false {
 				t.Errorf("minimax: runnable = %v; want false", p["runnable"])
+			}
+			continue
+		}
+		if p["id"] == "github-copilot" {
+			if p["installed_state"] != "installed" || p["hosted"] != true || p["supports_pat"] != true {
+				t.Errorf("github-copilot metadata = %#v", p)
 			}
 			continue
 		}

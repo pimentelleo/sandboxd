@@ -1,6 +1,9 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentauth"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 )
 
 func newImportServer(t *testing.T) (*Server, *agentauth.Store) {
@@ -141,6 +146,94 @@ func TestAgentImportNilSafe(t *testing.T) {
 			t.Errorf("got %d; want 503", w.Code)
 		}
 	}
+}
+
+const apiTestFineGrainedPAT = "github_pat_abcdefghijklmnopqrstuvwxyz0123456789"
+
+func TestGitHubCopilotPATEndpointKeepsCredentialsPrivate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+apiTestFineGrainedPAT {
+			t.Errorf("authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	}))
+	defer server.Close()
+
+	manager := newCopilotManagerForAPITest(t, server.Client(), server.URL)
+	s := &Server{Copilot: manager}
+	connect := httptest.NewRecorder()
+	s.v1GitHubCopilotPAT(connect, httptest.NewRequest(http.MethodPost, "/v1/agents/github-copilot/pat",
+		strings.NewReader(`{"token":`+jsonString(apiTestFineGrainedPAT)+`}`)))
+	if connect.Code != http.StatusOK {
+		t.Fatalf("PAT connect = %d: %s", connect.Code, connect.Body.String())
+	}
+	if body := connect.Body.String(); strings.Contains(body, apiTestFineGrainedPAT) {
+		t.Fatalf("PAT connect exposed a token: %s", body)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(connect.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != "connected" || status["account"] != "octocat" || status["method"] != "github-pat" {
+		t.Fatalf("PAT connect status = %#v", status)
+	}
+
+	disconnect := httptest.NewRecorder()
+	s.v1AgentDisconnect(disconnect, agentReq(http.MethodPost, "github-copilot", ""))
+	if disconnect.Code != http.StatusNoContent {
+		t.Fatalf("disconnect = %d: %s", disconnect.Code, disconnect.Body.String())
+	}
+	if manager.Status().Connected {
+		t.Fatal("GitHub Copilot remained connected after disconnect")
+	}
+}
+
+func TestGitHubCopilotPATRejectsInvalidRequest(t *testing.T) {
+	s := &Server{Copilot: newCopilotManagerForAPITest(t, nil, "")}
+	w := httptest.NewRecorder()
+	s.v1GitHubCopilotPAT(w, httptest.NewRequest(http.MethodPost, "/v1/agents/github-copilot/pat",
+		strings.NewReader(`{"token":"ghp_classic","unexpected":true}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid PAT request = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func newCopilotManagerForAPITest(t *testing.T, client *http.Client, baseURL string) *copilot.Manager {
+	t.Helper()
+	stateDir := t.TempDir()
+	cipher, err := secrets.Load("", filepath.Join(stateDir, "secrets.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := copilot.New(copilot.Config{
+		StateDir:   filepath.Join(stateDir, "copilot"),
+		Cipher:     cipher,
+		HTTPClient: client,
+		UserURL:    baseURL + "/user",
+		Runtime:    apiCopilotRuntime{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+type apiCopilotRuntime struct{}
+
+func (apiCopilotRuntime) Create(context.Context, copilot.RuntimeConfig) (copilot.RuntimeSession, error) {
+	return nil, errors.New("not used by API connection tests")
+}
+
+func (apiCopilotRuntime) Resume(context.Context, string, copilot.RuntimeConfig) (copilot.RuntimeSession, error) {
+	return nil, errors.New("not used by API connection tests")
+}
+
+func (apiCopilotRuntime) Delete(context.Context, string) error {
+	return nil
 }
 
 // jsonString quotes a string as a JSON literal for embedding in a request body.

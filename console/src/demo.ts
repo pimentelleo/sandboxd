@@ -26,14 +26,16 @@ const sandbox = {
 const presets = [
   { id: 'react-vite', label: 'React / Vite', description: 'React + Vite SPA with hot reload', template: 'react-standard', capabilities: ['node', 'pnpm'] },
   { id: 'nextjs', label: 'Next.js', description: 'Next.js app (App Router)', template: 'nextjs-standard', capabilities: ['node', 'pnpm'] },
+  { id: 'adonisjs', label: 'AdonisJS', description: 'AdonisJS v7 Hypermedia app with Edge, Alpine.js, and SQLite.', template: 'adonisjs-hypermedia-standard', capabilities: ['node', 'pnpm'] },
   { id: 'node-express', label: 'Node / Express API', description: 'Express REST API', template: 'node-express-standard', capabilities: ['node'] },
   { id: 'fastapi', label: 'Python / FastAPI', description: 'FastAPI + uvicorn', template: 'fastapi-standard', capabilities: ['python3', 'python3-venv'] },
   { id: 'worker', label: 'Worker (no public endpoint)', description: 'Background worker', template: 'worker-standard', capabilities: [] },
 ]
 
 const agents = [
-  { id: 'opencode', label: 'OpenCode', installed_state: 'installed', status: 'connected', method: 'oauth', supports_oauth: true, supports_api_key: true, runnable: true },
-  { id: 'claude-code', label: 'Claude Code', installed_state: 'installed', status: 'connected', method: 'api_key', supports_oauth: true, supports_api_key: true, runnable: true },
+  { id: 'opencode', label: 'OpenCode', installed_state: 'installed', status: 'connected', method: 'oauth', supports_oauth: true, supports_api_key: true, supports_pat: false, runnable: true, hosted: false },
+  { id: 'claude-code', label: 'Claude Code', installed_state: 'installed', status: 'connected', method: 'api_key', supports_oauth: true, supports_api_key: true, supports_pat: false, runnable: true, hosted: false },
+  { id: 'github-copilot', label: 'GitHub Copilot', installed_state: 'installed', status: 'connected', method: 'github-pat', supports_oauth: false, supports_api_key: false, supports_pat: true, runnable: true, hosted: true, account: 'octocat' },
 ]
 
 const settings = {
@@ -43,7 +45,7 @@ const settings = {
   runtime: { storage_mode: 'directory', base_image: 'sandboxd-base:0.3.0' },
   lifecycle: { idle_reap_enabled: true, idle_threshold_seconds: 2100, keepalive_max_seconds: 86400 },
   egress: { mode: 'disabled' },
-  agents: { providers: ['opencode', 'claude-code'] },
+  agents: { providers: ['opencode', 'claude-code', 'github-copilot'], default_models: {} },
   presets,
   capabilities: { snapshots: true, config_secrets: true, templates: false, forward_auth: true },
   editable: ['lifecycle.idle_reap_enabled', 'lifecycle.idle_threshold_seconds', 'lifecycle.keepalive_max_seconds'],

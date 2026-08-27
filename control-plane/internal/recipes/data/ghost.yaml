@@ -10,8 +10,8 @@ suggested_manifest: |
     health_path: "/"
 notes:
   - "ADVISORY, not turnkey — Ghost 6's local install is fiddly; adjust as needed."
-  - "Requires Node 22+ (Ghost 6 needs ^22.18) — satisfied by the current base image."
-  - "Needs a modern pnpm (>=10/11): Ghost 6's tarball uses a pnpm catalog workspace that pnpm 9 rejects (the command installs pnpm 11)."
+  - "Requires Node 22+ (Ghost 6 needs ^22.18) — satisfied by the current Node 24 base image."
+  - "Needs a modern pnpm (>=10/11): Ghost 6's tarball uses a pnpm catalog workspace; the base image pins pnpm 10.34.4."
   - "Global npm prefix /usr is not writable by the sandbox user, so the command repoints it to ~/.npm-global before `npm install -g`."
   - "Native sqlite3 + sharp compile from source (now works: Python setuptools/distutils + gcc). DB at content/data/ghost-local.db (auto-migrated, ~90 tables)."
   - "ghost install local defaults to 127.0.0.1:2368; the command sets server.host 0.0.0.0 + server.port 3000 so the preview can reach it."

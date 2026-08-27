@@ -33,6 +33,12 @@ type agentSpec struct {
 	// fresh (claude --continue, opencode --continue, codex `exec resume --last`).
 	// Each sandbox is one workspace, so "most recent" is naturally per-sandbox.
 	cont bool
+	// copilotContinue preserves the request's Continue tri-state for the
+	// github-copilot bridge. Nil lets the bridge apply its mapping-aware default.
+	copilotContinue *bool
+	// copilotCapability is task-scoped bridge authorization. It must not be
+	// written to task files, events, logs, or an agent environment.
+	copilotCapability string
 }
 
 // agent is the coding-agent adapter boundary. This slice implements

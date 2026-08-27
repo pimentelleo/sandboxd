@@ -26,7 +26,7 @@ type Preset struct {
 }
 
 // order fixes the display order of List().
-var order = []string{"react-vite", "nextjs", "node-express", "fastapi", "worker"}
+var order = []string{"react-vite", "nextjs", "adonisjs", "node-express", "fastapi", "worker"}
 
 var registry = map[string]Preset{
 	"react-vite": {
@@ -65,6 +65,25 @@ web:
   restart_after_task: true
 build:
   command: ""
+`,
+		Capabilities: []string{"node", "pnpm"},
+	},
+	"adonisjs": {
+		ID: "adonisjs", Label: "AdonisJS",
+		Description: "AdonisJS v7 Hypermedia app with Edge, Alpine.js, and SQLite.",
+		Template:    "adonisjs-hypermedia-standard",
+		// The first boot creates the pinned Hypermedia starter, then starts the
+		// compiled server. Its build mode keeps SQLite under source tmp/ and
+		// links build/tmp there so state persists across future builds/restarts.
+		Manifest: `version: 1
+web:
+  command: "bash /opt/templates/adonisjs-hypermedia-standard/bootstrap.sh --serve"
+  port: 3000
+  health_path: "/"
+  restart_after_task: true
+build:
+  command: "bash /opt/templates/adonisjs-hypermedia-standard/bootstrap.sh --build"
+  timeout_seconds: 180
 `,
 		Capabilities: []string{"node", "pnpm"},
 	},

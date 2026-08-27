@@ -6,6 +6,15 @@ All notable changes to sandboxd are documented here. The format is based on
 patch** — each lands the meaningful changes merged since the last one — and a
 **minor bump marks a milestone** release).
 
+## [Unreleased]
+
+### Added
+- Selectable AdonisJS v7 Hypermedia preset with Edge, Alpine.js, persistent SQLite,
+  a compiled server, and advisory imported-project detection.
+
+### Changed
+- Upgraded the stock sandbox base image from Node 22 to Node 24.
+
 ## [0.3.12] — 2026-08-25
 **Full Changelog**: https://github.com/tastyeffectco/sandboxd/compare/v0.3.11...v0.3.12
 

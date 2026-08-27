@@ -17,23 +17,65 @@ type Task struct {
 	ExternalProjectID sql.NullString
 	Agent             string
 	Prompt            string
-	Status            string // running | succeeded | failed | cancelled
+	Status            string // queued | running | waiting_* | succeeded | failed | cancelled
 	ResultJSON        sql.NullString
 	TimeoutS          int // task timeout in seconds; 0 = runtimed default
-	CreatedAt         time.Time
-	FinishedAt        sql.NullInt64
+	// ExecutionKind distinguishes runtimed's monolithic tasks from hosted
+	// control-plane turns. Only runtimed tasks are reconciled by taskwatch.
+	ExecutionKind      string
+	ConversationID     sql.NullString
+	ConversationTurnID sql.NullString
+	CreatedAt          time.Time
+	FinishedAt         sql.NullInt64
 }
 
-// CreateTask inserts a new task row in the `running` state.
+const (
+	TaskExecutionRuntimed      = "runtimed"
+	TaskExecutionHostedCopilot = "hosted-copilot"
+)
+
+const taskSelectCols = `task_id, sandbox_id, external_user_id, external_project_id,
+	agent, prompt, status, result_json, timeout_s, execution_kind, conversation_id,
+	conversation_turn_id, created_at, finished_at`
+
+func scanTask(sc scanner) (*Task, error) {
+	var t Task
+	var created int64
+	err := sc.Scan(&t.TaskID, &t.SandboxID, &t.ExternalUserID, &t.ExternalProjectID,
+		&t.Agent, &t.Prompt, &t.Status, &t.ResultJSON, &t.TimeoutS, &t.ExecutionKind,
+		&t.ConversationID, &t.ConversationTurnID, &created, &t.FinishedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	t.CreatedAt = time.Unix(created, 0).UTC()
+	return &t, nil
+}
+
+// CreateTask inserts a durable task row. Existing callers omit Status and keep
+// the legacy running/runtimed defaults; hosted conversation turns may begin
+// queued before their coordinator claims them.
 func (s *Store) CreateTask(ctx context.Context, t *Task) error {
 	return s.submit(ctx, func(db *sql.DB) error {
+		status := t.Status
+		if status == "" {
+			status = "running"
+		}
+		executionKind := t.ExecutionKind
+		if executionKind == "" {
+			executionKind = TaskExecutionRuntimed
+		}
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO task
 			  (task_id, sandbox_id, external_user_id, external_project_id,
-			   agent, prompt, status, timeout_s, created_at)
-			VALUES (?,?,?,?,?,?,'running',?,?)`,
+			   agent, prompt, status, timeout_s, execution_kind, conversation_id,
+			   conversation_turn_id, created_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 			t.TaskID, t.SandboxID, t.ExternalUserID, t.ExternalProjectID,
-			t.Agent, t.Prompt, t.TimeoutS, time.Now().Unix())
+			t.Agent, t.Prompt, status, t.TimeoutS, executionKind, t.ConversationID,
+			t.ConversationTurnID, time.Now().Unix())
 		return err
 	})
 }
@@ -51,22 +93,8 @@ func (s *Store) FinishTask(ctx context.Context, taskID, status, resultJSON strin
 
 // GetTask returns one task row, or ErrNotFound.
 func (s *Store) GetTask(ctx context.Context, taskID string) (*Task, error) {
-	var t Task
-	var created int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT task_id, sandbox_id, external_user_id, external_project_id,
-		       agent, prompt, status, result_json, timeout_s, created_at, finished_at
-		  FROM task WHERE task_id=?`, taskID).Scan(
-		&t.TaskID, &t.SandboxID, &t.ExternalUserID, &t.ExternalProjectID,
-		&t.Agent, &t.Prompt, &t.Status, &t.ResultJSON, &t.TimeoutS, &created, &t.FinishedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	t.CreatedAt = time.Unix(created, 0).UTC()
-	return &t, nil
+	return scanTask(s.db.QueryRowContext(ctx,
+		`SELECT `+taskSelectCols+` FROM task WHERE task_id=?`, taskID))
 }
 
 // ListTasksForSandbox returns a sandbox's tasks, newest first (task_id is a
@@ -77,8 +105,7 @@ func (s *Store) ListTasksForSandbox(ctx context.Context, sandboxID string, limit
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT task_id, sandbox_id, external_user_id, external_project_id,
-		       agent, prompt, status, result_json, timeout_s, created_at, finished_at
+		SELECT `+taskSelectCols+`
 		  FROM task WHERE sandbox_id=? ORDER BY task_id DESC LIMIT ?`, sandboxID, limit)
 	if err != nil {
 		return nil, err
@@ -86,51 +113,62 @@ func (s *Store) ListTasksForSandbox(ctx context.Context, sandboxID string, limit
 	defer rows.Close()
 	var out []*Task
 	for rows.Next() {
-		var t Task
-		var created int64
-		if err := rows.Scan(&t.TaskID, &t.SandboxID, &t.ExternalUserID,
-			&t.ExternalProjectID, &t.Agent, &t.Prompt, &t.Status,
-			&t.ResultJSON, &t.TimeoutS, &created, &t.FinishedAt); err != nil {
+		t, err := scanTask(rows)
+		if err != nil {
 			return nil, err
 		}
-		t.CreatedAt = time.Unix(created, 0).UTC()
-		out = append(out, &t)
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }
 
-// ListRunningTasks returns every task row still in the `running`
-// state — used by boot-time reconciliation.
+// ListRunningTasks returns every legacy runtimed task row still in the
+// `running` state. Hosted Copilot turns have their own control-plane recovery
+// path and must not be attached to a runtimed event stream.
 func (s *Store) ListRunningTasks(ctx context.Context) ([]*Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT task_id, sandbox_id, external_user_id, external_project_id,
-		       agent, prompt, status, result_json, timeout_s, created_at, finished_at
-		  FROM task WHERE status='running'`)
+		SELECT `+taskSelectCols+`
+		  FROM task WHERE status='running' AND execution_kind=?`, TaskExecutionRuntimed)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*Task
 	for rows.Next() {
-		var t Task
-		var created int64
-		if err := rows.Scan(&t.TaskID, &t.SandboxID, &t.ExternalUserID,
-			&t.ExternalProjectID, &t.Agent, &t.Prompt, &t.Status,
-			&t.ResultJSON, &t.TimeoutS, &created, &t.FinishedAt); err != nil {
+		t, err := scanTask(rows)
+		if err != nil {
 			return nil, err
 		}
-		t.CreatedAt = time.Unix(created, 0).UTC()
-		out = append(out, &t)
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }
 
-// SandboxHasRunningTask reports whether the sandbox has a task still
-// running — the idle reaper uses it to avoid reaping mid-task.
+// SandboxHasRunningTask reports whether the sandbox has active execution. A
+// waiting hosted interaction uses waiting_* instead, so idle reaping may stop
+// the sandbox while a human considers a question.
 func (s *Store) SandboxHasRunningTask(ctx context.Context, sandboxID string) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM task WHERE sandbox_id=? AND status='running')`,
+		`SELECT EXISTS(SELECT 1 FROM task WHERE sandbox_id=? AND status IN ('running','cancelling'))`,
 		sandboxID).Scan(&n)
+	return n == 1, err
+}
+
+// SandboxHasBusyConversation prevents legacy task admission while a hosted
+// turn owns the workspace, including a paused question or a queued follow-up.
+func (s *Store) SandboxHasBusyConversation(ctx context.Context, sandboxID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM conversation c
+			 WHERE c.sandbox_id=? AND c.archived_at IS NULL
+			   AND (
+				c.active_turn_id IS NOT NULL OR EXISTS(
+					SELECT 1 FROM conversation_turn t
+					 WHERE t.conversation_id=c.id AND t.status='queued'
+				)
+			   )
+		)`, sandboxID).Scan(&n)
 	return n == 1, err
 }

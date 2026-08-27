@@ -4,4 +4,4 @@ exec docker run --rm \
   -v /home/ubuntu/sandboxd/control-plane:/src \
   -v /home/ubuntu/.gocache/mod:/go/pkg/mod \
   -v /home/ubuntu/.gocache/build:/root/.cache/go-build \
-  -w /src golang:1.22-bookworm "$@"
+  -w /src golang:1.24-bookworm "$@"

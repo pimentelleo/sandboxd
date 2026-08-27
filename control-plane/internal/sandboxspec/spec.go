@@ -30,6 +30,7 @@ type Env struct {
 	PreviewEntrypoint string
 	PreviewTLS        bool
 	AgentProxyURL     string
+	CopilotBridgeURL  string
 	OpencodeModel     string
 	OpencodeZenPath   string
 	RuntimePreset     string   // from the owning app, when known
@@ -48,6 +49,9 @@ func Build(sb *store.Sandbox, e Env) docker.RunSpec {
 	}
 	if e.AgentProxyURL != "" {
 		env = append(env, "RUNTIMED_ANTHROPIC_PROXY="+e.AgentProxyURL)
+	}
+	if e.CopilotBridgeURL != "" {
+		env = append(env, "RUNTIMED_COPILOT_BRIDGE_URL="+e.CopilotBridgeURL)
 	}
 	if e.OpencodeModel != "" {
 		env = append(env, "RUNTIMED_OPENCODE_MODEL="+e.OpencodeModel)
