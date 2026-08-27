@@ -102,6 +102,7 @@ func TestMatch(t *testing.T) {
 		{"slidev by config", []string{"@slidev/cli"}, "", "", "slidev"},
 		{"chainlit", nil, "", "chainlit", "chainlit"},
 		{"drizzle-sqlite", []string{"drizzle-orm", "better-sqlite3", "tsx"}, "", "", "drizzle-sqlite"},
+		{"adonisjs", []string{"@adonisjs/core"}, "adonisrc.ts", "", "adonisjs"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -170,6 +171,55 @@ func TestN8nRecipe(t *testing.T) {
 	// NOT suggested for an empty app (no deps, no files, no requirements)
 	if m, _ := Match(map[string]bool{}, func(string) bool { return false }, ""); hasRecipe(m, "n8n") {
 		t.Error("n8n must NOT be suggested for an empty app (no n8n signal)")
+	}
+}
+
+func TestAdonisJSRecipeIsRunnableAndDoesNotInitializeImports(t *testing.T) {
+	all, err := All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adonis *Recipe
+	for i := range all {
+		if all[i].ID == "adonisjs" {
+			adonis = &all[i]
+			break
+		}
+	}
+	if adonis == nil {
+		t.Fatal("AdonisJS recipe missing")
+	}
+	if adonis.Preset != "adonisjs" {
+		t.Errorf("AdonisJS preset = %q; want adonisjs", adonis.Preset)
+	}
+	if res := manifest.Validate([]byte(adonis.SuggestedManifest)); !res.Valid {
+		t.Fatalf("AdonisJS suggested manifest invalid: %v", res.Errors)
+	}
+	for _, want := range []string{
+		"packageManager",
+		"yarn.lock",
+		"bun.lockb",
+		"package-lock.json",
+		"pnpm-lock.yaml",
+		"package_manager=yarn",
+		"package_manager=bun",
+		"package_manager=npm",
+		"package_manager=pnpm",
+		`"$package_manager" install`,
+		`"$package_manager" run build`,
+		".pnp.cjs",
+		"NODE_OPTIONS",
+		"node build/bin/server.js",
+		"restart_after_task: true",
+	} {
+		if !strings.Contains(adonis.SuggestedManifest, want) {
+			t.Errorf("AdonisJS manifest missing %q:\n%s", want, adonis.SuggestedManifest)
+		}
+	}
+	for _, forbidden := range []string{".env", "APP_KEY", "migration:run"} {
+		if strings.Contains(adonis.SuggestedManifest, forbidden) {
+			t.Errorf("AdonisJS import manifest must not initialize app state (%q):\n%s", forbidden, adonis.SuggestedManifest)
+		}
 	}
 }
 

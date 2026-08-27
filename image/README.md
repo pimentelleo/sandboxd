@@ -23,7 +23,7 @@ image/
 │   ├── pip.conf         #   pip registry + cache-dir
 │   └── profile.d/sandbox-env.sh   # PNPM_HOME + cache env + PATH
 ├── skel/                # the canonical /home/sandbox skeleton (seeded once)
-├── templates/           # runtime starter templates (react, nextjs, node-express, fastapi, worker)
+├── templates/           # runtime starter templates (react, nextjs, adonisjs, node-express, fastapi, worker)
 ├── php/Dockerfile       # optional PHP variant image
 ├── ruby/Dockerfile      # optional Ruby variant image
 └── HOME_LAYOUT.md       # the in-sandbox home contract — read this first
@@ -39,7 +39,7 @@ SANDBOXD_IMAGE=my-base:dev bash image/build.sh   # a fully custom name:tag
 
 `build.sh` runs a **multi-stage** `docker build` from the repo root: stage 1
 compiles `runtimed` from `control-plane/` (so the host needs only Docker, not Go);
-stage 2 is a `debian:stable-slim` runtime with **Node 22 + pnpm + bun** and
+stage 2 is a `debian:stable-slim` runtime with **Node 24 + pnpm + bun** and
 **Python 3 + uv** baked in. It builds for the **native architecture** (works on
 amd64 and arm64) and prints the image size. There is no `latest` tag — the control
 plane pins an exact version (`SANDBOXD_IMAGE`, default `sandboxd-base:0.3.0`). The

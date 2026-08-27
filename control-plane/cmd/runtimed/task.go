@@ -34,10 +34,14 @@ type task struct {
 	agentName string
 	model     string
 	cont      bool // continue the sandbox's most recent agent session
-	env       map[string]string
-	timeout   time.Duration
-	dir       string // .runtimed/tasks/<id>
-	createdAt time.Time
+	// copilotContinue preserves the request tri-state; the bridge, not runtimed,
+	// owns mapping-aware continuation for github-copilot.
+	copilotContinue   *bool
+	copilotCapability string
+	env               map[string]string
+	timeout           time.Duration
+	dir               string // .runtimed/tasks/<id>
+	createdAt         time.Time
 
 	mu        sync.Mutex
 	startedAt time.Time
@@ -50,16 +54,38 @@ type task struct {
 	cancel    context.CancelFunc
 }
 
+// hostedTask is persisted under its normal task directory so a sandbox
+// stop/start during a Copilot question retains its pre-turn checkpoint.
+type hostedTask struct {
+	ID           string    `json:"id"`
+	Prompt       string    `json:"prompt"`
+	CheckpointID string    `json:"checkpoint_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+const hostedTaskMetadataFile = "hosted-task.json"
+
 func newTask(req runtime.StartTaskRequest, tasksRoot string) (*task, error) {
 	// Continue is the default: resume the sandbox's prior session unless this is
 	// the first task (nothing to continue) or the caller forced a choice. This
 	// makes `--continue` the out-of-the-box behavior while the first run in a
 	// sandbox still starts cleanly.
-	cont := hasPriorTask(tasksRoot, req.TaskID)
-	if req.Continue != nil {
-		cont = *req.Continue
-		if cont && !hasPriorTask(tasksRoot, req.TaskID) {
-			cont = false // forced continue but no session yet — start fresh
+	cont := false
+	var copilotContinue *bool
+	if req.Agent == "github-copilot" {
+		// The bridge knows whether its capability maps to a resumable SDK session.
+		// Do not use unrelated runtimed task directories as a continuation proxy.
+		if req.Continue != nil {
+			value := *req.Continue
+			copilotContinue = &value
+		}
+	} else {
+		cont = hasPriorTask(tasksRoot, req.TaskID)
+		if req.Continue != nil {
+			cont = *req.Continue
+			if cont && !hasPriorTask(tasksRoot, req.TaskID) {
+				cont = false // forced continue but no session yet — start fresh
+			}
 		}
 	}
 	dir := filepath.Join(tasksRoot, req.TaskID)
@@ -75,7 +101,8 @@ func newTask(req runtime.StartTaskRequest, tasksRoot string) (*task, error) {
 		timeout = time.Duration(req.TimeoutS) * time.Second
 	}
 	return &task{
-		id: req.TaskID, prompt: req.Prompt, agentName: req.Agent, model: req.Model, cont: cont, env: req.Env,
+		id: req.TaskID, prompt: req.Prompt, agentName: req.Agent, model: req.Model, cont: cont,
+		copilotContinue: copilotContinue, copilotCapability: req.CopilotCapability, env: req.Env,
 		timeout: timeout, dir: dir, createdAt: time.Now().UTC(),
 		updatedCh: make(chan struct{}), phase: "queued", eventsW: f,
 	}, nil
@@ -170,8 +197,10 @@ func selectAgent(name string, log *slog.Logger) (agent, error) {
 		return &claudeCodeAgent{log: log}, nil
 	case "codex":
 		return &codexAgent{log: log}, nil
+	case "github-copilot":
+		return &githubCopilotAgent{log: log}, nil
 	}
-	return nil, fmt.Errorf("unsupported agent %q (supported: opencode, claude-code, codex)", name)
+	return nil, fmt.Errorf("unsupported agent %q (supported: opencode, claude-code, codex, github-copilot)", name)
 }
 
 // startTask enforces one active task per sandbox and launches the run.
@@ -181,7 +210,7 @@ func (a *app) startTask(req runtime.StartTaskRequest) (*task, error) {
 	}
 	a.taskMu.Lock()
 	defer a.taskMu.Unlock()
-	if a.task != nil && !a.task.isDone() {
+	if (a.task != nil && !a.task.isDone()) || len(a.hosted) != 0 {
 		return nil, errTaskInProgress
 	}
 	t, err := newTask(req, filepath.Join(a.runtimeDir, "tasks"))
@@ -247,9 +276,16 @@ func (a *app) runTask(t *task) {
 	sysPrompt := agentprompt.Render(agentprompt.Vars{
 		AppDir: a.appDir, Port: a.previewPort, HealthPath: a.webHealthPath,
 	})
+	// The capability is needed only while dispatching this bridge task. Remove it
+	// from the task record before the adapter can emit any task artifacts.
+	t.mu.Lock()
+	copilotCapability := t.copilotCapability
+	t.copilotCapability = ""
+	t.mu.Unlock()
 	finalMsg, usage, agentErr := ag.run(ctx, agentSpec{
 		workDir: a.appDir, prompt: t.prompt, model: t.model, env: t.env, rawLog: rl,
-		systemPrompt: sysPrompt, cont: t.cont,
+		systemPrompt: sysPrompt, cont: t.cont, copilotContinue: t.copilotContinue,
+		copilotCapability: copilotCapability,
 	}, t.emit)
 	res.AgentMessageFinal = finalMsg
 	res.Tokens = usage
@@ -265,11 +301,19 @@ func (a *app) runTask(t *task) {
 		status, reason, errMsg = runtime.TaskFailed, "agent_error", agentErr.Error()
 	}
 
+	a.runPostAgentLifecycle(ctx, t.id, checkpointID, &res, status, t.emit)
+	a.finishTask(t, &res, status, reason, errMsg)
+}
+
+// runPostAgentLifecycle is shared by legacy runtimed agents and hosted SDK
+// turns. emit is nil for hosted turns because their stream belongs to the
+// control plane's durable conversation event log.
+func (a *app) runPostAgentLifecycle(ctx context.Context, taskID, checkpointID string, res *runtime.TaskResult, status runtime.TaskStatus, emit eventSink) {
 	// 4. files changed — captured even on failure / cancel.
 	if files, ferr := filesChanged(a.appDir, checkpointID); ferr == nil {
 		res.FilesChanged = files
 	} else if checkpointID != "" {
-		a.log.Warn("files-changed diff failed", "task", t.id, "err", ferr.Error())
+		a.log.Warn("files-changed diff failed", "task", taskID, "err", ferr.Error())
 	}
 
 	// 5. post-task build check (skipped on cancel — keep cancel fast).
@@ -283,7 +327,7 @@ func (a *app) runTask(t *task) {
 		buildCmd = *a.build.Command
 	}
 	if status != runtime.TaskCancelled && buildCmd != "" {
-		t.setPhase("build_check")
+		emitTaskPhase(emit, "build_check")
 		ok, bmsg := buildCheck(a.appDir, buildCmd, time.Duration(a.build.TimeoutSeconds)*time.Second, a.log)
 		res.BuildErrorMessage = bmsg
 		if ok {
@@ -291,7 +335,9 @@ func (a *app) runTask(t *task) {
 		} else {
 			res.BuildStatus = runtime.BuildFailed
 		}
-		t.emit(runtime.EventBuild, map[string]any{"build_ok": ok, "build_status": res.BuildStatus, "build_error_message": bmsg})
+		if emit != nil {
+			emit(runtime.EventBuild, map[string]any{"build_ok": ok, "build_status": res.BuildStatus, "build_error_message": bmsg})
+		}
 	}
 	res.BuildOK = res.BuildStatus == runtime.BuildPassed
 
@@ -313,7 +359,7 @@ func (a *app) runTask(t *task) {
 	// error if the app is blank despite a clean build. Extensible — add
 	// failure modes in cmd/runtimed/health.go.
 	if status != runtime.TaskCancelled {
-		t.setPhase("health_check")
+		emitTaskPhase(emit, "health_check")
 		res.PreviewErrorMessage = a.runPostTaskChecks(ctx, res.FilesChanged)
 	}
 
@@ -326,7 +372,12 @@ func (a *app) runTask(t *task) {
 		res.AppHealthy, res.PreviewOK = postTaskHealth(a.web == nil, res.BuildStatus, st)
 	}
 
-	a.finishTask(t, &res, status, reason, errMsg)
+}
+
+func emitTaskPhase(emit eventSink, phase string) {
+	if emit != nil {
+		emit(runtime.EventStatus, map[string]any{"phase": phase})
+	}
 }
 
 // restartWorkersAfterTask bounces any worker flagged restart_after_task so it
@@ -406,6 +457,314 @@ func (a *app) finishTask(t *task, res *runtime.TaskResult, status runtime.TaskSt
 	t.finish(*res)
 	a.log.Info("task finished", "task", t.id, "status", status,
 		"build_ok", res.BuildOK, "duration_ms", res.DurationMS)
+}
+
+func (a *app) prepareHostedTask(req runtime.PrepareHostedTaskRequest) (*runtime.HostedTaskPreparation, error) {
+	if !validHostedTaskID(req.TaskID) || req.Prompt == "" {
+		return nil, errors.New("task_id and prompt are required")
+	}
+	a.taskMu.Lock()
+	if a.hosted == nil {
+		a.hosted = make(map[string]*hostedTask)
+	}
+	if a.task != nil && !a.task.isDone() {
+		a.taskMu.Unlock()
+		return nil, errTaskInProgress
+	}
+	if existing := a.hosted[req.TaskID]; existing != nil {
+		a.taskMu.Unlock()
+		return hostedPreparation(existing), nil
+	}
+	if len(a.hosted) != 0 {
+		a.taskMu.Unlock()
+		return nil, errTaskInProgress
+	}
+	hosted := &hostedTask{ID: req.TaskID, Prompt: req.Prompt, CreatedAt: time.Now().UTC()}
+	a.hosted[req.TaskID] = hosted
+	a.taskMu.Unlock()
+
+	dir := hostedTaskDir(a.runtimeDir, req.TaskID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		a.removeHostedTask(req.TaskID)
+		return nil, err
+	}
+	checkpointID, err := checkpoint(a.appDir, req.TaskID)
+	if err != nil {
+		// Legacy tasks preserve a useful task result even when the pre-turn
+		// snapshot fails; hosted turns retain the same best-effort behavior.
+		a.log.Warn("hosted task checkpoint failed", "task", req.TaskID, "err", err.Error())
+	}
+	a.taskMu.Lock()
+	hosted.CheckpointID = checkpointID
+	a.taskMu.Unlock()
+	if err := writeHostedTaskMetadata(dir, hosted); err != nil {
+		a.removeHostedTask(req.TaskID)
+		return nil, err
+	}
+	a.log.Info("hosted task prepared", "task", req.TaskID, "checkpoint", checkpointID != "")
+	return hostedPreparation(hosted), nil
+}
+
+func (a *app) finalizeHostedTask(ctx context.Context, req runtime.FinalizeHostedTaskRequest) (*runtime.TaskResult, error) {
+	if !validHostedTaskID(req.TaskID) {
+		return nil, errors.New("invalid task_id")
+	}
+	status := req.Status
+	if status == "" {
+		status = runtime.TaskSucceeded
+	}
+	switch status {
+	case runtime.TaskSucceeded, runtime.TaskFailed, runtime.TaskCancelled:
+	default:
+		return nil, errors.New("invalid hosted task status")
+	}
+	a.hostedFinalizeMu.Lock()
+	defer a.hostedFinalizeMu.Unlock()
+	hosted, err := a.findHostedTask(req.TaskID)
+	if err != nil {
+		if result, resultErr := readHostedTaskResult(a.runtimeDir, req.TaskID); resultErr == nil {
+			return result, nil
+		}
+		return nil, err
+	}
+	startedAt := time.Now().UTC()
+	result := &runtime.TaskResult{
+		ID: req.TaskID, Prompt: hosted.Prompt, Status: status,
+		FailureReason: req.FailureReason, ErrorMessage: req.ErrorMessage,
+		AgentMessageFinal: req.AgentMessageFinal, Tokens: req.Tokens,
+		CheckpointID: hosted.CheckpointID, FilesChanged: []string{},
+		CreatedAt: hosted.CreatedAt, StartedAt: startedAt,
+	}
+	a.runPostAgentLifecycle(ctx, req.TaskID, hosted.CheckpointID, result, status, nil)
+	result.FinishedAt = time.Now().UTC()
+	result.DurationMS = result.FinishedAt.Sub(startedAt).Milliseconds()
+	if result.FilesChanged == nil {
+		result.FilesChanged = []string{}
+	}
+	if err := writeTaskResult(hostedTaskDir(a.runtimeDir, req.TaskID), *result); err != nil {
+		return nil, err
+	}
+	a.removeHostedTask(req.TaskID)
+	_ = os.Remove(filepath.Join(hostedTaskDir(a.runtimeDir, req.TaskID), hostedTaskMetadataFile))
+	a.log.Info("hosted task finalized", "task", req.TaskID, "status", status,
+		"build_ok", result.BuildOK, "duration_ms", result.DurationMS)
+	return result, nil
+}
+
+// abandonHostedTask writes a terminal result and removes the checkpointed
+// hosted marker without touching the workspace. This lets recovery release a
+// task that cannot safely run the normal post-task lifecycle.
+func (a *app) abandonHostedTask(req runtime.AbandonHostedTaskRequest) (*runtime.TaskResult, error) {
+	if !validHostedTaskID(req.TaskID) {
+		return nil, errors.New("invalid task_id")
+	}
+	switch req.Status {
+	case runtime.TaskSucceeded, runtime.TaskFailed, runtime.TaskCancelled:
+	default:
+		return nil, errors.New("invalid hosted task status")
+	}
+	a.hostedFinalizeMu.Lock()
+	defer a.hostedFinalizeMu.Unlock()
+	if result, err := readHostedTaskResult(a.runtimeDir, req.TaskID); err == nil {
+		return result, nil
+	}
+	hosted, err := a.findHostedTask(req.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	result := &runtime.TaskResult{
+		ID:            req.TaskID,
+		Prompt:        hosted.Prompt,
+		Status:        req.Status,
+		FailureReason: req.FailureReason,
+		ErrorMessage:  req.ErrorMessage,
+		FilesChanged:  []string{},
+		BuildStatus:   runtime.BuildSkipped,
+		CheckpointID:  hosted.CheckpointID,
+		CreatedAt:     hosted.CreatedAt,
+		StartedAt:     now,
+		FinishedAt:    now,
+	}
+	if err := writeTaskResult(hostedTaskDir(a.runtimeDir, req.TaskID), *result); err != nil {
+		return nil, err
+	}
+	a.removeHostedTask(req.TaskID)
+	if err := os.Remove(filepath.Join(hostedTaskDir(a.runtimeDir, req.TaskID), hostedTaskMetadataFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	a.log.Warn("hosted task abandoned", "task", req.TaskID, "status", req.Status)
+	return result, nil
+}
+
+func (a *app) loadHostedTasks() {
+	root := filepath.Join(a.runtimeDir, "tasks")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	a.taskMu.Lock()
+	defer a.taskMu.Unlock()
+	if a.hosted == nil {
+		a.hosted = make(map[string]*hostedTask)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !validHostedTaskID(entry.Name()) {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if _, err := os.Stat(filepath.Join(dir, "result.json")); err == nil {
+			continue
+		}
+		hosted, err := readHostedTaskMetadata(dir)
+		if err != nil || hosted.ID != entry.Name() || hosted.Prompt == "" {
+			continue
+		}
+		a.hosted[hosted.ID] = hosted
+	}
+}
+
+func (a *app) findHostedTask(id string) (*hostedTask, error) {
+	a.taskMu.Lock()
+	defer a.taskMu.Unlock()
+	if hosted := a.hosted[id]; hosted != nil {
+		copy := *hosted
+		return &copy, nil
+	}
+	return nil, errors.New("no such hosted task")
+}
+
+func (a *app) removeHostedTask(id string) {
+	a.taskMu.Lock()
+	delete(a.hosted, id)
+	a.taskMu.Unlock()
+}
+
+func (a *app) handlePrepareHostedTask(w http.ResponseWriter, r *http.Request) {
+	var req runtime.PrepareHostedTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	preparation, err := a.prepareHostedTask(req)
+	if errors.Is(err, errTaskInProgress) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "task_in_progress"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, preparation)
+}
+
+func (a *app) handleFinalizeHostedTask(w http.ResponseWriter, r *http.Request) {
+	var req runtime.FinalizeHostedTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	req.TaskID = r.PathValue("id")
+	result, err := a.finalizeHostedTask(r.Context(), req)
+	if errors.Is(err, errTaskInProgress) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "task_in_progress"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *app) handleAbandonHostedTask(w http.ResponseWriter, r *http.Request) {
+	var req runtime.AbandonHostedTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	req.TaskID = r.PathValue("id")
+	result, err := a.abandonHostedTask(req)
+	if errors.Is(err, errTaskInProgress) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "task_in_progress"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func hostedPreparation(hosted *hostedTask) *runtime.HostedTaskPreparation {
+	return &runtime.HostedTaskPreparation{
+		TaskID: hosted.ID, CheckpointID: hosted.CheckpointID, CreatedAt: hosted.CreatedAt,
+	}
+}
+
+func hostedTaskDir(runtimeDir, id string) string {
+	return filepath.Join(runtimeDir, "tasks", id)
+}
+
+func writeHostedTaskMetadata(dir string, hosted *hostedTask) error {
+	raw, err := json.Marshal(hosted)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, hostedTaskMetadataFile), raw, 0o600)
+}
+
+func readHostedTaskMetadata(dir string) (*hostedTask, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, hostedTaskMetadataFile))
+	if err != nil {
+		return nil, err
+	}
+	var hosted hostedTask
+	if err := json.Unmarshal(raw, &hosted); err != nil {
+		return nil, err
+	}
+	return &hosted, nil
+}
+
+func writeTaskResult(dir string, result runtime.TaskResult) error {
+	raw, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "result.json"), raw, 0o644)
+}
+
+func readHostedTaskResult(runtimeDir, id string) (*runtime.TaskResult, error) {
+	raw, err := os.ReadFile(filepath.Join(hostedTaskDir(runtimeDir, id), "result.json"))
+	if err != nil {
+		return nil, err
+	}
+	var result runtime.TaskResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	if result.ID != id {
+		return nil, errors.New("hosted task result id does not match")
+	}
+	switch result.Status {
+	case runtime.TaskSucceeded, runtime.TaskFailed, runtime.TaskCancelled:
+		return &result, nil
+	default:
+		return nil, errors.New("hosted task result is not terminal")
+	}
+}
+
+func validHostedTaskID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, char := range id {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // activeTaskRef is the GET /status active-task summary, or nil.
@@ -497,7 +856,7 @@ func (a *app) handleListTasks(w http.ResponseWriter, _ *http.Request) {
 func (a *app) handleRevertTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	a.taskMu.Lock()
-	busy := a.task != nil && !a.task.isDone()
+	busy := (a.task != nil && !a.task.isDone()) || len(a.hosted) != 0
 	a.taskMu.Unlock()
 	if busy {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "a task is in progress"})

@@ -39,6 +39,23 @@ func TestApplyPresetImportDoesNotWriteManifest(t *testing.T) {
 	}
 }
 
+func TestApplyAdonisPresetImportDoesNotMutateWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"name":"imported-adonis"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, ok := preset.Get("adonisjs")
+	if !ok {
+		t.Fatal("AdonisJS preset missing")
+	}
+	applyPreset(dir, p, quietLog())
+	for _, name := range []string{ManifestFile, "bootstrap.sh"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("imported AdonisJS workspace must not receive %s", name)
+		}
+	}
+}
+
 // Import that already has sandbox.yaml: it is preserved unchanged.
 func TestApplyPresetImportKeepsExisting(t *testing.T) {
 	dir := t.TempDir()

@@ -103,6 +103,48 @@ func TestFastapiPreset(t *testing.T) {
 	}
 }
 
+func TestAdonisJSPreset(t *testing.T) {
+	p, ok := Get("adonisjs")
+	if !ok {
+		t.Fatal("adonisjs preset missing")
+	}
+	if p.Template != "adonisjs-hypermedia-standard" {
+		t.Errorf("template = %q; want adonisjs-hypermedia-standard", p.Template)
+	}
+	for _, want := range []string{
+		"port: 3000",
+		"health_path: \"/\"",
+		"restart_after_task: true",
+		"bootstrap.sh --serve",
+		"bootstrap.sh --build",
+	} {
+		if !strings.Contains(p.Manifest, want) {
+			t.Errorf("AdonisJS manifest missing %q:\n%s", want, p.Manifest)
+		}
+	}
+
+	_, thisFile, _, _ := runtime.Caller(0)
+	repo := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	script := filepath.Join(repo, "image", "templates", "adonisjs-hypermedia-standard", "bootstrap.sh")
+	data, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatalf("AdonisJS bootstrap missing: %v", err)
+	}
+	for _, want := range []string{
+		"create-adonisjs@3.4.0",
+		"919a6e8ac1b2f347ace03d3bc0a30465dc33bcbd",
+		"--pkg=pnpm",
+		"node ace migration:run --force",
+		"ln -s ../tmp",
+		"HOST=0.0.0.0 PORT=3000",
+		"node_modules/.bin/adonis-kit",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("AdonisJS bootstrap missing %q", want)
+		}
+	}
+}
+
 // The Next.js template ships a .gitignore so node_modules/.next don't become
 // checkpoint noise (the workspace git repo relies on the committed .gitignore).
 func TestNextjsTemplateHasGitignore(t *testing.T) {

@@ -18,7 +18,7 @@ The full platform, self-hostable on one Docker host today:
   editor, git diff/commit/push, task history + revert, config & secrets,
   snapshots, activity, settings. (Optional — the engine also runs headless over `/v1`.)
 - **One-command install** — builds the image + control plane and starts the stack.
-- **Runtime presets** — React/Vite, Next.js, Node/Express, FastAPI, Worker.
+- **Runtime presets** — React/Vite, Next.js, AdonisJS, Node/Express, FastAPI, Worker.
 - **Built-in coding agents** — OpenCode (default) & Claude Code via a
   credential-injecting proxy, so **no key ever enters a sandbox**. OpenCode Zen
   (`zen` / `zengo`) supported.

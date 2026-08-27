@@ -16,6 +16,8 @@ High level:
   `docker` CLI. (A second provider is a future concern.)
 - **Traefik** — edge router; publishes a preview URL per running sandbox.
 - **runtimed** — in-sandbox supervisor + task runner, baked into the base image.
+- **GitHub Copilot coordinator** — control-plane-owned durable conversations,
+  native input/plan callbacks, and per-turn hosted-task finalization.
 - **sandbox.yaml** — the per-app runtime manifest runtimed reads (web/workers/
   build/health/restart_after_task).
 - **Presets / templates / base image** — the create-time layering (see
@@ -80,6 +82,12 @@ template + generated `sandbox.yaml` + capabilities — behind `GET /v1/presets` 
 the `runtime_preset` create field. Process state and per-process logs are exposed
 over the API. Schema + rules: `docs/sandbox-manifest.md`.
 
+For a GitHub Copilot conversation, runtimed does not host an agent process. It
+prepares a durable pre-turn checkpoint and later finalizes the result after the
+control-plane SDK finishes. The prepared record survives sandbox sleep so a
+native question or plan can pause safely; restart recovery finalizes or abandons
+an orphaned record before admitting further sandbox work.
+
 ### Traefik (edge)
 Docker label provider, scoped by a `sandboxd.managed=true` constraint so it
 only routes containers this stack owns. Running sandboxes win on a
@@ -91,8 +99,10 @@ default; TLS is a config switch (see README → Production / TLS).
 A small React SPA served behind the same Traefik (`console.<domain>`). It is a
 **pure `/v1` API client** — it never opens the DB or a workspace. It creates
 apps, picks presets, drives sandbox lifecycle + preview, and runs the agent
-chat with **persistent task history + per-task revert**. It also **browses and
-edits workspace files** (a tree + an in-browser CodeMirror editor, lazy-loaded,
+chat. GitHub Copilot uses a durable per-sandbox conversation with native
+questions, plan approval, FIFO follow-up messages, and replayable SSE events;
+other providers retain **persistent task history + per-task revert**. It also
+**browses and edits workspace files** (a tree + an in-browser CodeMirror editor, lazy-loaded,
 with inline git status/diff), **reviews and pushes with Git** (diff viewer,
 commit, push), manages config/secrets, shows the events timeline and per-process
 logs, does snapshot/fork/restore, connects agents, and reads settings (editing
@@ -126,6 +136,13 @@ only the lifecycle tunables). Contract: `docs/openapi.yaml`.
   staging area. It's the `files_changed` baseline and the **revert seam**:
   `POST /v1/sandboxes/{id}/tasks/{taskId}/revert` restores the worktree to a
   checkpoint. Distinct from snapshots (full workspace freezes) and user commits.
+- **Copilot conversations** — one active `github-copilot` transcript per
+  sandbox in SQLite. Each turn captures its mode and is serialized FIFO. Native
+  input and plan callbacks are persisted before being rendered, and redacted
+  conversation events provide an SSE reconnect cursor. A stopped sandbox wakes
+  before an accepted response resumes workspace operations. The control plane
+  owns the SDK session keyed by conversation ID, so SDK state and the GitHub PAT
+  never enter a workspace.
 
 ## Runtime model
 
@@ -236,19 +253,20 @@ hardcode the sandbox id; use the preview URL handed back by the API.)
 ### Embedded databases
 
 **App-bundled SQLite works** and is part of the sandbox's workspace state (verified:
-n8n → `~/.n8n/database.sqlite`, Express + Prisma → `prisma/dev.db`, Directus →
-`data.db`; the engines — better-sqlite3, Prisma's bundled `libquery_engine` — ship
+n8n → `~/.n8n/database.sqlite`, AdonisJS Hypermedia → `tmp/db.sqlite3`, Express +
+Prisma → `prisma/dev.db`, Directus → `data.db`; the engines — better-sqlite3,
+Prisma's bundled `libquery_engine` — ship
 with the app, so no system `sqlite3` CLI is needed). The DB file lives in the
 workspace, so **snapshots include it and can grow large**. Postgres/MySQL/Redis
 need a custom image or an external service — there's no in-sandbox service layer,
 DB provisioning, or Docker Compose (by design).
 
-On **Node 22**, SQLite is a non-issue across the board: `better-sqlite3` 11.x and
-`@libsql` ship arm64 **prebuilts** (no compile); Node's built-in `node:sqlite` works
-with `NODE_OPTIONS=--experimental-sqlite`; and Python's `apsw`/`python-fasthtml`
-bundle their own engine. The base image's Python `setuptools`/`distutils` fix is the
-safety net for the cases that *do* compile from source (e.g. Ghost's `sqlite3` +
-`sharp`). Recipes stay advisory — the DB file is app state.
+On **Node 24**, SQLite remains self-contained: packages such as `better-sqlite3` and
+`@libsql` supply platform builds where available, and app-bundled engines need no
+system `sqlite3` CLI. The base image's Python `setuptools`/`distutils` fix is the
+safety net for packages that *do* compile from source (e.g. Ghost's `sqlite3` +
+`sharp`). The AdonisJS preset links `build/tmp` back to persistent `tmp/` after each
+compiled build. Recipes stay advisory — the DB file is app state.
 
 `--userns=host` is set on the infra containers (and, by default, on sandboxes)
 so workspace ownership is deterministic whether or not the host daemon uses

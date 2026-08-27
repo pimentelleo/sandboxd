@@ -12,7 +12,7 @@ import (
 
 func TestPresetWebPort(t *testing.T) {
 	// Built-in presets all declare 3000 today; unknown/empty default to 3000.
-	for _, id := range []string{"nextjs", "react-vite", "fastapi", "node-express"} {
+	for _, id := range []string{"nextjs", "react-vite", "adonisjs", "fastapi", "node-express"} {
 		if got := presetWebPort(id); got != 3000 {
 			t.Errorf("presetWebPort(%q) = %d; want 3000", id, got)
 		}

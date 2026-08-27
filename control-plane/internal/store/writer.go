@@ -197,6 +197,12 @@ func (s *Store) PurgeSandbox(ctx context.Context, id string) error {
 			return err
 		}
 		defer tx.Rollback()
+		// Hosted SDK state is cleaned by the caller before this transaction;
+		// delete its transcript/event rows with the sandbox's irreversible
+		// workspace purge rather than leave inaccessible conversation history.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM conversation WHERE sandbox_id=?`, id); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sandbox WHERE id=?`, id); err != nil {
 			return err
 		}

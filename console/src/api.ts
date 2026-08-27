@@ -58,10 +58,13 @@ export interface Agent {
   installed_state: 'installed' | 'not_installed' | 'unknown'
   status: 'connected' | 'needs_login'
   // How the provider is currently connected. '' when not connected.
-  method: 'oauth' | 'api_key' | ''
+  method: 'oauth' | 'api_key' | 'github-pat' | ''
   supports_oauth: boolean
   supports_api_key: boolean
+  supports_pat: boolean
   runnable: boolean
+  hosted: boolean
+  account?: string
 }
 
 export interface SettingsPatch {
@@ -279,6 +282,78 @@ export interface TaskResult {
   preview_status_after?: string
 }
 
+// Durable hosted GitHub Copilot conversation state. Unlike task history, these
+// messages and interactions are a resumable provider transcript.
+export type ConversationMode = 'interactive' | 'plan' | 'autopilot'
+export interface Conversation {
+  id: string
+  sandbox_id: string
+  agent: string
+  state: string
+  default_mode: ConversationMode
+  active_turn_id?: string
+  last_error?: string
+  created_at: string
+  updated_at: string
+  archived_at?: string
+}
+export interface ConversationTurn {
+  id: string
+  task_id: string
+  sequence: number
+  prompt: string
+  mode: ConversationMode
+  status: string
+  error_message?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+}
+export interface ConversationMessage {
+  id: string
+  turn_id: string
+  sequence: number
+  role: 'user' | 'assistant' | string
+  content: string
+  status: string
+  created_at: string
+}
+export interface ConversationInteraction {
+  id: string
+  turn_id: string
+  sequence: number
+  type: 'user_input' | 'plan' | string
+  status: string
+  question?: string
+  choices: string[]
+  allow_freeform: boolean
+  summary?: string
+  plan?: string
+  actions: string[]
+  recommended_action?: string
+  answer?: string
+  approved?: boolean
+  selected_action?: string
+  feedback?: string
+  created_at: string
+  resolved_at?: string
+}
+export interface ConversationSnapshot {
+  conversation: Conversation | null
+  turns: ConversationTurn[]
+  messages: ConversationMessage[]
+  interactions: ConversationInteraction[]
+  event_cursor: number
+  next_queue_slot: number
+}
+export interface ConversationEvent {
+  id: number
+  type: string
+  turn_id?: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
 // 401 hook — App registers this to flip auth state back to "logged out" when any
 // request comes back Unauthorized (e.g. the session cookie expired).
 let onUnauthorized: (() => void) | null = null
@@ -348,6 +423,10 @@ export const api = {
     req<{ provider: string; status: string; method: string }>('POST', `/v1/agents/${provider}/oauth/finish`, {
       code,
     }),
+  connectGitHubCopilotPAT: (token: string) =>
+    req<{ provider: string; status: string; method: string; account?: string }>(
+      'POST', '/v1/agents/github-copilot/pat', { token },
+    ),
   patchSettings: (body: SettingsPatch) => req<Settings>('PATCH', '/v1/settings', body),
 
   // Auth — session lifecycle. The session cookie is HttpOnly, so state is read
@@ -509,6 +588,28 @@ export const api = {
     req<{ status: string }>('POST', `/v1/sandboxes/${id}/tasks/${taskId}/revert`),
   taskEventsURL: (id: string, taskId: string) =>
     `/v1/sandboxes/${id}/tasks/${taskId}/events`,
+  getConversation: (sandboxId: string) =>
+    req<ConversationSnapshot>('GET', `/v1/sandboxes/${sandboxId}/conversation`),
+  sendConversationMessage: (sandboxId: string, prompt: string, mode: ConversationMode) =>
+    req<{ id: string; task_id: string; status: string; mode: ConversationMode; queue_position: number }>(
+      'POST', `/v1/sandboxes/${sandboxId}/conversation/messages`, { prompt, mode },
+    ),
+  answerConversationInteraction: (sandboxId: string, interactionId: string, answer: string) =>
+    req<{ id: string; status: string }>(
+      'POST', `/v1/sandboxes/${sandboxId}/conversation/interactions/${interactionId}/answer`, { answer },
+    ),
+  answerConversationPlan: (
+    sandboxId: string, interactionId: string,
+    body: { approved: boolean; selected_action?: string; feedback?: string },
+  ) => req<{ id: string; status: string }>(
+    'POST', `/v1/sandboxes/${sandboxId}/conversation/interactions/${interactionId}/plan`, body,
+  ),
+  cancelConversation: (sandboxId: string) =>
+    req<{ id: string; status: string }>('POST', `/v1/sandboxes/${sandboxId}/conversation/cancel`),
+  resetConversation: (sandboxId: string, defaultMode: ConversationMode) =>
+    req<{ conversation: Conversation }>('POST', `/v1/sandboxes/${sandboxId}/conversation/reset`, { default_mode: defaultMode }),
+  conversationEventsURL: (sandboxId: string, after: number) =>
+    `/v1/sandboxes/${sandboxId}/conversation/events?after=${after}`,
 
   createSnapshot: (sandboxId: string, name: string) =>
     req<{ id: string }>('POST', '/v1/snapshots', { source_sandbox_id: sandboxId, name }),

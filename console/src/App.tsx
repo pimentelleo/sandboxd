@@ -216,6 +216,7 @@ export default function App() {
 const PRESET_META: Record<string, { short: string; tag: string }> = {
   'react-vite': { short: 'React', tag: 'Vite SPA · hot reload' },
   nextjs: { short: 'Next.js', tag: 'App Router · SSR' },
+  adonisjs: { short: 'AdonisJS', tag: 'Edge · SQLite · compiled' },
   'node-express': { short: 'Express', tag: 'Node REST API' },
   fastapi: { short: 'FastAPI', tag: 'Python REST API' },
   worker: { short: 'Worker', tag: 'Background · no preview' },

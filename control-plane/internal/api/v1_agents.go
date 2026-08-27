@@ -26,15 +26,21 @@ type v1Agent struct {
 	// offers, so the console can show only the relevant actions.
 	SupportsOAuth  bool `json:"supports_oauth"`
 	SupportsAPIKey bool `json:"supports_api_key"`
+	SupportsPAT    bool `json:"supports_pat"`
 	// Runnable: runtimed has a task adapter for this provider. When connected
 	// but NOT runnable, the credentials are "imported, runner not enabled yet".
 	Runnable bool `json:"runnable"`
+	// Hosted providers run their agent runtime in the control plane rather than
+	// exposing a provider binary or credential to a sandbox.
+	Hosted bool `json:"hosted"`
+	// Account is a safe display name for the connected hosted-provider account.
+	Account string `json:"account,omitempty"`
 }
 
 // v1ListAgents — GET /v1/agents.
 func (s *Server) v1ListAgents(w http.ResponseWriter, _ *http.Request) {
 	installed := s.installedAgents()
-	out := make([]v1Agent, 0, len(agentauth.Providers()))
+	out := make([]v1Agent, 0, len(agentauth.Providers())+1)
 	for _, p := range agentauth.Providers() {
 		state := "unknown"
 		if installed != nil {
@@ -59,6 +65,27 @@ func (s *Server) v1ListAgents(w http.ResponseWriter, _ *http.Request) {
 			Runnable:       agentauth.Runnable(p.ID),
 		})
 	}
+	copilotStatus := "needs_login"
+	copilotMethod, copilotAccount := "", ""
+	if s.Copilot != nil {
+		status := s.Copilot.Status()
+		if status.Connected {
+			copilotStatus, copilotMethod, copilotAccount = "connected", status.Method, status.Account
+		}
+	}
+	// GitHub Copilot is hosted by the control plane through the official SDK,
+	// rather than probed as a binary in an untrusted sandbox image.
+	out = append(out, v1Agent{
+		ID:             "github-copilot",
+		Label:          "GitHub Copilot",
+		InstalledState: "installed",
+		Status:         copilotStatus,
+		Method:         copilotMethod,
+		SupportsPAT:    true,
+		Runnable:       true,
+		Hosted:         true,
+		Account:        copilotAccount,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"providers": out})
 }
 

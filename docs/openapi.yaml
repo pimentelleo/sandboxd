@@ -19,6 +19,7 @@ tags:
   - name: apps
   - name: sandboxes
   - name: tasks
+  - name: conversations
   - name: snapshots
 
 paths:
@@ -334,10 +335,13 @@ paths:
                         label: { type: string }
                         installed_state: { type: string, enum: [installed, not_installed, unknown] }
                         status: { type: string, enum: [connected, needs_login] }
-                        method: { type: string, enum: ["", oauth, api_key], description: How the provider is currently connected }
+                        method: { type: string, enum: ["", oauth, api_key, github-pat], description: How the provider is currently connected }
                         supports_oauth: { type: boolean }
                         supports_api_key: { type: boolean }
+                        supports_pat: { type: boolean, description: True when the provider accepts a fine-grained personal access token. }
                         runnable: { type: boolean, description: runtimed has a task adapter for this provider }
+                        hosted: { type: boolean, description: "True when the provider runtime and credential remain in the control plane rather than a sandbox." }
+                        account: { type: string, description: "Safe display name for a connected hosted-provider account." }
 
   /v1/agents/{provider}/import:
     post:
@@ -383,9 +387,9 @@ paths:
     post:
       operationId: disconnectAgent
       tags: [apps]
-      summary: Disconnect a provider — deletes the stored auth dir.
+      summary: Disconnect a provider and remove its host-side credential.
       parameters:
-        - { name: provider, in: path, required: true, schema: { type: string, enum: [opencode, claude-code, codex] } }
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [opencode, claude-code, codex, github-copilot] } }
       responses:
         "204": { description: Disconnected }
         "404": { description: Unknown provider }
@@ -423,6 +427,37 @@ paths:
         "200": { description: Connected }
         "400": { description: Missing/invalid code, or no pending login }
         "503": { description: OAuth not configured }
+  /v1/agents/github-copilot/pat:
+    post:
+      operationId: connectGitHubCopilotPAT
+      tags: [apps]
+      summary: Connect the hosted GitHub Copilot provider with a fine-grained personal access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: "Fine-grained GitHub personal access token with Copilot Requests permission. Write-only; never returned." }
+      responses:
+        "200":
+          description: Token validated and stored encrypted in the control plane.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, status, method, account]
+                properties:
+                  provider: { type: string, enum: [github-copilot] }
+                  status: { type: string, enum: [connected] }
+                  method: { type: string, enum: [github-pat] }
+                  account: { type: string }
+        "400": { description: Missing, malformed, or non-fine-grained personal access token }
+        "409": { description: The GitHub Copilot connection changed while this request was validating }
+        "502": { description: GitHub could not validate the token }
+        "503": { description: GitHub Copilot is unavailable }
 
   /v1/presets:
     get:
@@ -1264,6 +1299,166 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
 
+  /v1/sandboxes/{id}/conversation:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get:
+      operationId: getCopilotConversation
+      tags: [conversations]
+      summary: Get the durable GitHub Copilot conversation for a sandbox
+      description: >
+        Returns the current transcript, queued and completed turns, native
+        input/plan interactions, and an event cursor. A sandbox with no prior
+        Copilot conversation returns an empty snapshot with conversation null.
+      responses:
+        "200":
+          description: Current conversation snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationSnapshot" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/messages:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    post:
+      operationId: submitCopilotConversationMessage
+      tags: [conversations]
+      summary: Queue a durable GitHub Copilot message
+      description: >
+        Messages are accepted while Copilot is working or waiting for input and
+        are processed FIFO. The control plane wakes a stopped sandbox when the
+        turn reaches execution. A leading /plan, /interactive, or /autopilot
+        command overrides mode and is removed from prompt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConversationMessageRequest" }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationSubmission" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/events:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get:
+      operationId: streamCopilotConversationEvents
+      tags: [conversations]
+      summary: Stream durable GitHub Copilot conversation events
+      description: >
+        Server-Sent Events replayed after the `after` query cursor (or
+        Last-Event-ID header). Load the conversation snapshot first, then
+        connect with its event_cursor to avoid a snapshot-to-subscribe race.
+        Event payloads are allowlisted and redacted; credentials and SDK state
+        are never emitted.
+      parameters:
+        - in: query
+          name: after
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/interactions/{interactionId}/answer:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+      - in: path
+        name: interactionId
+        required: true
+        schema: { type: string }
+    post:
+      operationId: answerCopilotConversationInput
+      tags: [conversations]
+      summary: Answer a native GitHub Copilot input request
+      description: >
+        The answer must be one of the presented choices unless the interaction
+        permits free text. A stopped sandbox wakes before Copilot resumes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConversationInputAnswerRequest" }
+      responses:
+        "200": { description: Answer delivered }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/interactions/{interactionId}/plan:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+      - in: path
+        name: interactionId
+        required: true
+        schema: { type: string }
+    post:
+      operationId: answerCopilotConversationPlan
+      tags: [conversations]
+      summary: Approve, reject, or provide feedback on a native Copilot plan
+      description: >
+        `approved` is required. In plan mode, workspace mutations remain
+        blocked until an approval selects an action supplied by the provider.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConversationPlanResponseRequest" }
+      responses:
+        "200": { description: Plan response delivered }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/cancel:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    post:
+      operationId: cancelCopilotConversation
+      tags: [conversations]
+      summary: Cancel the active GitHub Copilot conversation turn
+      responses:
+        "202": { description: Cancellation requested }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/reset:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    post:
+      operationId: resetCopilotConversation
+      tags: [conversations]
+      summary: Archive an idle transcript and create a new GitHub Copilot conversation
+      description: >
+        Only available when the current conversation has no active or queued
+        turn. The old transcript remains until the sandbox is deleted.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConversationResetRequest" }
+      responses:
+        "201":
+          description: New conversation created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversation: { $ref: "#/components/schemas/Conversation" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
   /v1/sandboxes/{id}/files:
     parameters: [ { $ref: "#/components/parameters/Id" } ]
     get:
@@ -1565,7 +1760,7 @@ components:
     Preset:
       type: object
       properties:
-        id: { type: string, description: "e.g. react-vite, nextjs, node-express, fastapi, worker." }
+        id: { type: string, description: "e.g. react-vite, nextjs, adonisjs, node-express, fastapi, worker." }
         label: { type: string }
         description: { type: string }
         template: { type: string }
@@ -1705,15 +1900,19 @@ components:
       required: [prompt]
       properties:
         prompt: { type: string }
-        agent: { type: string, enum: [opencode, claude-code], default: opencode }
+        agent: { type: string, enum: [opencode, claude-code, codex, github-copilot], default: opencode }
         model:
           type: string
           description: >
-            Optional per-task model, passed to the agent CLI's --model. Agent-namespaced:
-            opencode wants "provider/model" (e.g. opencode/claude-sonnet-4-5), claude an
-            alias/id (e.g. sonnet). Empty = the agent's default. Max 200 chars; validity
-            is the agent's concern (an unknown model fails the task).
+            Optional per-task model. Empty uses the agent default. For GitHub Copilot,
+            provide an SDK-supported model id; validity is checked by the provider.
         timeout_s: { type: integer, description: "0/omitted = 10m default; max 86400." }
+        continue:
+          type: boolean
+          description: >
+            Omit to resume a prior sandbox session when one exists. True/false forces
+            continuation/fresh behavior. GitHub Copilot stores its per-sandbox session
+            mapping in control-plane state, outside the workspace.
     TaskResult:
       type: object
       properties:
@@ -1730,6 +1929,116 @@ components:
         preview_ok: { type: boolean, description: "Web apps only; omitted for worker-only." }
         app_healthy: { type: boolean }
         duration_ms: { type: integer }
+    Conversation:
+      type: object
+      description: >
+        The current hosted GitHub Copilot context. The SDK session identifier
+        and credentials are control-plane private and never appear here.
+      properties:
+        id: { type: string }
+        sandbox_id: { type: string }
+        agent: { type: string, enum: [github-copilot] }
+        state: { type: string, enum: [idle, running, waiting_input, waiting_plan, failed, archived] }
+        default_mode: { type: string, enum: [interactive, plan, autopilot] }
+        active_turn_id: { type: string }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        archived_at: { type: string, format: date-time }
+    ConversationTurn:
+      type: object
+      properties:
+        id: { type: string }
+        task_id: { type: string, description: "Canonical hosted task result identifier." }
+        sequence: { type: integer }
+        prompt: { type: string }
+        mode: { type: string, enum: [interactive, plan, autopilot] }
+        status: { type: string, enum: [queued, running, waiting_input, waiting_plan, cancelling, succeeded, failed, cancelled] }
+        error_message: { type: string }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+    ConversationMessage:
+      type: object
+      properties:
+        id: { type: string }
+        turn_id: { type: string }
+        sequence: { type: integer }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        status: { type: string, enum: [streaming, complete] }
+        created_at: { type: string, format: date-time }
+    ConversationInteraction:
+      type: object
+      description: >
+        A native Copilot input or plan request. `provider_request_id` is
+        intentionally omitted: it is held only by the control plane.
+      properties:
+        id: { type: string }
+        turn_id: { type: string }
+        sequence: { type: integer }
+        type: { type: string, enum: [user_input, plan] }
+        status: { type: string, enum: [pending, resolved, interrupted] }
+        question: { type: string }
+        choices: { type: array, items: { type: string } }
+        allow_freeform: { type: boolean }
+        summary: { type: string }
+        plan: { type: string }
+        actions: { type: array, items: { type: string } }
+        recommended_action: { type: string }
+        answer: { type: string }
+        approved: { type: boolean }
+        selected_action: { type: string }
+        feedback: { type: string }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+    ConversationSnapshot:
+      type: object
+      properties:
+        conversation:
+          allOf: [{ $ref: "#/components/schemas/Conversation" }]
+          nullable: true
+        turns:
+          type: array
+          items: { $ref: "#/components/schemas/ConversationTurn" }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/ConversationMessage" }
+        interactions:
+          type: array
+          items: { $ref: "#/components/schemas/ConversationInteraction" }
+        event_cursor: { type: integer, minimum: 0 }
+        next_queue_slot: { type: integer, minimum: 0 }
+    ConversationMessageRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt: { type: string }
+        mode: { type: string, enum: [interactive, plan, autopilot], default: interactive }
+    ConversationSubmission:
+      type: object
+      properties:
+        id: { type: string }
+        task_id: { type: string }
+        status: { type: string, enum: [queued] }
+        mode: { type: string, enum: [interactive, plan, autopilot] }
+        queue_position: { type: integer, minimum: 1 }
+    ConversationInputAnswerRequest:
+      type: object
+      required: [answer]
+      properties:
+        answer: { type: string }
+    ConversationPlanResponseRequest:
+      type: object
+      required: [approved]
+      properties:
+        approved: { type: boolean }
+        selected_action: { type: string }
+        feedback: { type: string }
+    ConversationResetRequest:
+      type: object
+      properties:
+        default_mode: { type: string, enum: [interactive, plan, autopilot], default: interactive }
     Event:
       type: object
       description: One entry in the durable activity timeline.

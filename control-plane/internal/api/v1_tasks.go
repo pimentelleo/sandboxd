@@ -27,6 +27,16 @@ func (s *Server) runtimeClientFor(id string) *runtime.Client {
 // task falls back to. It must be one of Zen's free (no-auth) models — "big-pickle"
 // is opencode's featured free model. Override with SANDBOXD_OPENCODE_FREE_MODEL.
 const defaultOpencodeFreeModel = "big-pickle"
+const githubCopilotAgentID = "github-copilot"
+
+const copilotCapabilityTTL = 2 * time.Minute
+
+// isTaskAgent keeps API-side validation aligned with runtimed's adapters. The
+// hosted Copilot adapter deliberately lives outside agentauth's sandbox-CLI
+// registry because it never has a credential mount or sandbox binary.
+func isTaskAgent(agent string) bool {
+	return agent == githubCopilotAgentID || agentauth.Runnable(agent)
+}
 
 // opencodeFreeModel is the model used when opencode runs with no connected
 // credential (its zero-friction free tier). Operator-overridable.
@@ -68,6 +78,19 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	// Hosted Copilot conversations retain the workspace lock across queued
+	// turns and native questions. Do this before waking a stopped sandbox so a
+	// rejected legacy task cannot perturb an idle conversation.
+	busy, err := s.Store.SandboxHasBusyConversation(r.Context(), id)
+	if err != nil {
+		writeV1Err(w, http.StatusInternalServerError, "internal", "could not inspect Copilot conversation state")
+		return
+	}
+	if busy {
+		writeV1Err(w, http.StatusConflict, "conversation_in_progress",
+			"a GitHub Copilot conversation owns this workspace; cancel or finish it first")
+		return
+	}
 
 	// B1 — wake-on-task-submit: a stopped sandbox is woken first by
 	// delegating to the proven internal wake path. (A private sandbox
@@ -92,7 +115,9 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req v1TaskSubmitReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid json: "+err.Error())
 		return
 	}
@@ -110,9 +135,9 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 	// Only providers runtimed can actually run as a task agent are accepted.
 	// An explicit agent is honored regardless of the default; the provider's
 	// creds are mounted at sandbox create if connected. See docs/agent-auth.md.
-	if !agentauth.Runnable(agent) {
+	if !isTaskAgent(agent) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request",
-			"unsupported agent (supported: opencode, claude-code)")
+			"unsupported agent (supported: opencode, claude-code, codex, github-copilot)")
 		return
 	}
 	if req.TimeoutS < 0 {
@@ -151,12 +176,42 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 		req.Model = opencodeFreeModel()
 	}
 
+	if agent == githubCopilotAgentID {
+		if s.Copilot == nil {
+			writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "GitHub Copilot is unavailable")
+			return
+		}
+		if !s.Copilot.Status().Connected {
+			writeV1Err(w, http.StatusConflict, "agent_not_connected", "GitHub Copilot is not connected")
+			return
+		}
+	}
+
 	taskID := newULID()
+	copilotCapability := ""
+	if agent == githubCopilotAgentID {
+		var issueErr error
+		copilotCapability, issueErr = s.Copilot.IssueCapability(id, taskID, copilotCapabilityTTL)
+		if issueErr != nil {
+			writeV1Err(w, http.StatusInternalServerError, "internal", "could not authorize GitHub Copilot task")
+			return
+		}
+	}
 	if err := s.runtimeClientFor(id).StartTask(r.Context(), runtime.StartTaskRequest{
 		TaskID: taskID, Prompt: req.Prompt, Agent: agent, Model: req.Model, TimeoutS: req.TimeoutS, Continue: req.Continue,
+		CopilotCapability: copilotCapability,
 	}); err != nil {
+		if copilotCapability != "" {
+			s.Copilot.CancelCapability(copilotCapability)
+		}
 		if errors.Is(err, runtime.ErrTaskInProgress) {
 			writeV1Err(w, http.StatusConflict, "task_in_progress", "a task is already in progress")
+			return
+		}
+		if agent == githubCopilotAgentID {
+			// The capability crossed into runtimed; do not reflect an
+			// untrusted sandbox-side error back to the public API.
+			writeV1Err(w, http.StatusBadGateway, "sandbox_unavailable", "runtimed is unavailable")
 			return
 		}
 		writeV1Err(w, http.StatusBadGateway, "sandbox_unavailable", "runtimed: "+err.Error())
@@ -220,9 +275,34 @@ func (s *Server) v1GetTask(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no such task for that sandbox")
 		return
 	}
-	if t.Status == "running" || !t.ResultJSON.Valid {
+	if t.Status == "running" || t.Status == "queued" || t.Status == "waiting_input" || t.Status == "waiting_plan" || t.Status == "cancelling" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": taskID, "sandbox_id": id, "status": "running",
+		})
+		return
+	}
+	if !t.ResultJSON.Valid {
+		status := runtime.TaskStatus(t.Status)
+		switch status {
+		case runtime.TaskSucceeded, runtime.TaskFailed, runtime.TaskCancelled:
+		default:
+			writeV1Err(w, http.StatusInternalServerError, "internal", "task has an invalid terminal status")
+			return
+		}
+		writeJSON(w, http.StatusOK, v1Task{
+			SandboxID: id,
+			TaskResult: runtime.TaskResult{
+				ID:            taskID,
+				Prompt:        t.Prompt,
+				Status:        status,
+				FailureReason: "result_unavailable",
+				ErrorMessage:  "The task ended before sandboxd could persist its result.",
+				FilesChanged:  []string{},
+				BuildStatus:   runtime.BuildSkipped,
+				CreatedAt:     t.CreatedAt,
+				FinishedAt:    timeFromNullUnix(t.FinishedAt, t.CreatedAt),
+				DurationMS:    timeFromNullUnix(t.FinishedAt, t.CreatedAt).Sub(t.CreatedAt).Milliseconds(),
+			},
 		})
 		return
 	}

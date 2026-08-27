@@ -40,6 +40,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/auth"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/authproxy"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
@@ -383,6 +384,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	// GitHub Copilot is a hosted provider: its fine-grained PAT and the official SDK
+	// runtime live only under this control-plane state directory. Sandboxes get
+	// a private bridge URL plus a one-time task capability, never credentials.
+	copilotManager, err := copilot.New(copilot.Config{
+		StateDir: filepath.Join(stateDir, "copilot"),
+		Cipher:   secretsCipher,
+		Executor: copilotDockerExecutor{client: dockerClient},
+		Log:      log.With("component", "copilot"),
+	})
+	if err != nil {
+		log.Error("init GitHub Copilot provider", "err", err.Error())
+		os.Exit(1)
+	}
+	copilotBridgeURL := envDefault("SANDBOXD_COPILOT_BRIDGE_URL", "http://sandboxd:9200")
+	if err := validateCopilotBridgeURL(copilotBridgeURL); err != nil {
+		log.Error("invalid GitHub Copilot bridge URL", "err", err.Error())
+		os.Exit(1)
+	}
+	copilotBridgeAddr := envDefault("SANDBOXD_COPILOT_BRIDGE_ADDR", "0.0.0.0:9200")
+	copilotBridgeListener, err := net.Listen("tcp", copilotBridgeAddr)
+	if err != nil {
+		log.Error("GitHub Copilot bridge listen", "addr", copilotBridgeAddr, "err", err.Error())
+		os.Exit(1)
+	}
+	copilotBridgeServer := newCopilotBridgeServer(copilotManager.Handler())
+	log.Info("GitHub Copilot bridge listening", "addr", copilotBridgeAddr)
+
 	// Phase 10B A0 — host-side agent auth store (read-only here). Best-effort
 	// root creation; never fatal.
 	agentAuth := agentauth.NewStore(dataDir)
@@ -457,22 +485,31 @@ func main() {
 		} else {
 			log.Info("gvisor runtime enabled", "runtime", sbxRuntime, "dns", ns)
 		}
-		// gVisor sandboxes use public DNS (above) and can't reach Docker's
-		// embedded resolver, so an internal service name like "sandboxd" won't
-		// resolve inside them. Pin the agent proxy URL to its IP — the control
-		// plane (not under gVisor) can resolve it — so sandboxes reach the proxy
-		// by address. Without this, every agent task hangs/fails on DNS.
-		if u, perr := url.Parse(agentProxyURL); perr == nil && u.Hostname() != "" && net.ParseIP(u.Hostname()) == nil {
-			if ips, lerr := net.LookupHost(u.Hostname()); lerr == nil && len(ips) > 0 {
-				if p := u.Port(); p != "" {
-					u.Host = net.JoinHostPort(ips[0], p)
+		// gVisor sandboxes use public DNS (above) and cannot reach Docker's
+		// embedded resolver. Pin each in-network control-plane service to its
+		// IP before putting it in a sandbox environment.
+		for _, service := range []struct {
+			name  string
+			value *string
+		}{
+			{name: "agent proxy", value: &agentProxyURL},
+			{name: "GitHub Copilot bridge", value: &copilotBridgeURL},
+		} {
+			if *service.value == "" {
+				continue
+			}
+			if u, perr := url.Parse(*service.value); perr == nil && u.Hostname() != "" && net.ParseIP(u.Hostname()) == nil {
+				if ips, lerr := net.LookupHost(u.Hostname()); lerr == nil && len(ips) > 0 {
+					if p := u.Port(); p != "" {
+						u.Host = net.JoinHostPort(ips[0], p)
+					} else {
+						u.Host = ips[0]
+					}
+					log.Info("gvisor: pinned service to IP", "service", service.name, "from", *service.value, "to", u.String())
+					*service.value = u.String()
 				} else {
-					u.Host = ips[0]
+					log.Warn("gvisor: could not resolve service host to IP; sandboxes may fail to reach it", "service", service.name, "host", u.Hostname())
 				}
-				log.Info("gvisor: pinned agent proxy to IP", "from", agentProxyURL, "to", u.String())
-				agentProxyURL = u.String()
-			} else {
-				log.Warn("gvisor: could not resolve agent proxy host to IP; sandboxes may fail to reach it", "host", u.Hostname())
 			}
 		}
 	}
@@ -495,6 +532,7 @@ func main() {
 			PreviewEntrypoint: previewEntrypoint,
 			PreviewTLS:        previewTLS,
 			AgentProxyURL:     agentProxyURL,
+			CopilotBridgeURL:  copilotBridgeURL,
 			OpencodeModel:     envDefault("SANDBOXD_OPENCODE_MODEL", ""),
 			OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
 			RuntimePreset:     runtimePresetForSandbox(ctx, st, sb),
@@ -514,6 +552,8 @@ func main() {
 		Update:            updateChecker,
 		AgentAuth:         agentAuth,
 		AgentOAuth:        agentOAuth,
+		Copilot:           copilotManager,
+		CopilotBridgeURL:  copilotBridgeURL,
 		OpencodeModel:     envDefault("SANDBOXD_OPENCODE_MODEL", ""),
 		OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
 		DefaultAgent:      defaultAgent,
@@ -559,7 +599,7 @@ func main() {
 			AuthEnabled:          !authCfg.Disabled,
 			StorageMode:          "directory", // OSS bind-mounted workspaces (see internal/loopback)
 			EgressMode:           egressModeLabel(egressMgr),
-			AgentProviders:       []string{"opencode"},
+			AgentProviders:       []string{"opencode", "claude-code", "codex", "github-copilot"},
 			IdleReapEnabled:      idleInterval > 0,
 			IdleThresholdSeconds: int(idleThreshold.Seconds()),
 		},
@@ -569,6 +609,10 @@ func main() {
 	// Finalize any coding task left `running` by a previous sandboxd
 	// run before the idle reaper (which trusts the task table) starts.
 	server.ReconcileTasks(ctx)
+	// Hosted Copilot turns have no runtimed event stream to reattach after a
+	// restart, so make their interrupted callback state explicit before clients
+	// can submit a response or a follow-up.
+	server.RecoverConversations(ctx)
 
 	// Phase 5 — after reconcile, if MemAvailable is
 	// already below the healthy floor, run one synchronous pressure
@@ -606,6 +650,19 @@ func main() {
 	// --- Phase 5 background goroutines ---------------------------------
 	gctx, gcancel := context.WithCancel(context.Background())
 	defer gcancel()
+
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return
+			case <-ticker.C:
+				copilotManager.CleanupExpired()
+			}
+		}
+	}()
 
 	// --- Anonymous telemetry + update check (internal/telemetry) -------
 	// Keep the release-checker cache warm regardless of the telemetry opt-out:
@@ -787,6 +844,14 @@ func main() {
 
 	// Listen + serve.
 	errCh := make(chan error, 1)
+	if copilotBridgeServer != nil {
+		go func() {
+			err := copilotBridgeServer.Serve(copilotBridgeListener)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("GitHub Copilot bridge: %w", err)
+			}
+		}()
+	}
 	go func() {
 		log.Info("startup: listening",
 			"addr", addr,
@@ -844,6 +909,11 @@ func main() {
 	defer shutCancel()
 	if err := httpSrv.Shutdown(shutCtx); err != nil {
 		log.Error("shutdown: http server shutdown failed", "err", err.Error())
+	}
+	if copilotBridgeServer != nil {
+		if err := copilotBridgeServer.Shutdown(shutCtx); err != nil {
+			log.Error("shutdown: GitHub Copilot bridge shutdown failed", "err", err.Error())
+		}
 	}
 }
 
@@ -913,6 +983,53 @@ type dockerExecAdapter struct{ d *docker.Client }
 func (a dockerExecAdapter) Exec(ctx context.Context, name string, cmd []string) (nginxwatch.ExecResult, error) {
 	r, err := a.d.Exec(ctx, name, cmd)
 	return nginxwatch.ExecResult{Stdout: r.Stdout, Stderr: r.Stderr, ExitCode: r.ExitCode}, err
+}
+
+// copilotDockerExecutor constrains SDK tools to the current sandbox namespace,
+// unprivileged user, and application workspace before invoking docker exec.
+type copilotDockerExecutor struct{ client *docker.Client }
+
+func (a copilotDockerExecutor) ExecScoped(ctx context.Context, request copilot.ScopedExecRequest) (copilot.ScopedExecResult, error) {
+	if a.client == nil {
+		return copilot.ScopedExecResult{}, errors.New("GitHub Copilot executor is unavailable")
+	}
+	if !strings.HasPrefix(request.Container, "s-") || len(request.Container) <= len("s-") ||
+		request.User != "sandbox" || request.Workdir != "/home/sandbox/workspace/app" {
+		return copilot.ScopedExecResult{}, errors.New("invalid GitHub Copilot sandbox scope")
+	}
+	result, err := a.client.ExecScoped(ctx, docker.ScopedExecRequest{
+		Container:   request.Container,
+		User:        request.User,
+		Workdir:     request.Workdir,
+		Command:     request.Command,
+		Stdin:       request.Stdin,
+		Timeout:     request.Timeout,
+		OutputLimit: request.OutputLimit,
+	})
+	return copilot.ScopedExecResult{
+		Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.ExitCode,
+	}, err
+}
+
+func newCopilotBridgeServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		// A sandbox must not be able to occupy a bridge handler indefinitely
+		// by sending a valid header and then trickling the request body.
+		ReadTimeout: 15 * time.Second,
+		IdleTimeout: 60 * time.Second,
+	}
+}
+
+func validateCopilotBridgeURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" ||
+		u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return errors.New("must be an http(s) URL with host and no credentials, path, query, or fragment")
+	}
+	return nil
 }
 
 func durationFromEnvSec(k string, dSec int) time.Duration {

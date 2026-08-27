@@ -1,0 +1,104 @@
+id: adonisjs
+display_name: AdonisJS v7 (Hypermedia)
+preset: adonisjs
+detect:
+  deps: ["@adonisjs/core"]
+  config_files: [adonisrc.ts, adonisrc.js]
+suggested_manifest: |
+  version: 1
+  web:
+    command: |
+      prepare_package_manager() {
+        package_manager=""
+        package_manager_pinned=false
+        if [ -f package.json ]; then
+          if ! package_manager="$(node -e 'const fs = require("fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); const manager = String(pkg.packageManager || "").split("@")[0]; if (["pnpm", "npm", "yarn", "bun"].includes(manager)) process.stdout.write(manager)')"; then
+            echo "Cannot read package.json to select the package manager." >&2
+            exit 1
+          fi
+          if [ -n "$package_manager" ]; then
+            package_manager_pinned=true
+          fi
+        fi
+        if [ -z "$package_manager" ]; then
+          for lockfile in yarn.lock bun.lockb bun.lock package-lock.json pnpm-lock.yaml; do
+            if [ -f "$lockfile" ]; then
+              case "$lockfile" in
+                yarn.lock) package_manager=yarn ;;
+                bun.lockb|bun.lock) package_manager=bun ;;
+                package-lock.json) package_manager=npm ;;
+                pnpm-lock.yaml) package_manager=pnpm ;;
+              esac
+              break
+            fi
+          done
+        fi
+        package_manager="${package_manager:-pnpm}"
+        if [ "$package_manager" = "yarn" ] || { [ "$package_manager_pinned" = true ] && [ "$package_manager" = "pnpm" ]; }; then
+          mkdir -p "$HOME/.local/bin"
+          corepack enable --install-directory "$HOME/.local/bin"
+        fi
+      }
+      install_dependencies() {
+        if [ "$package_manager" = "yarn" ] && [ -f .pnp.cjs ]; then
+          return
+        fi
+        [ -x node_modules/.bin/adonis-kit ] || "$package_manager" install
+      }
+      prepare_package_manager
+      install_dependencies
+      "$package_manager" run build
+      if [ "$package_manager" = "yarn" ] && [ -f .pnp.cjs ]; then
+        export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require=$PWD/.pnp.cjs"
+      fi
+      exec env HOST=0.0.0.0 PORT=3000 NODE_ENV=production node build/bin/server.js
+    port: 3000
+    health_path: "/"
+    restart_after_task: true
+  build:
+    command: |
+      prepare_package_manager() {
+        package_manager=""
+        package_manager_pinned=false
+        if [ -f package.json ]; then
+          if ! package_manager="$(node -e 'const fs = require("fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); const manager = String(pkg.packageManager || "").split("@")[0]; if (["pnpm", "npm", "yarn", "bun"].includes(manager)) process.stdout.write(manager)')"; then
+            echo "Cannot read package.json to select the package manager." >&2
+            exit 1
+          fi
+          if [ -n "$package_manager" ]; then
+            package_manager_pinned=true
+          fi
+        fi
+        if [ -z "$package_manager" ]; then
+          for lockfile in yarn.lock bun.lockb bun.lock package-lock.json pnpm-lock.yaml; do
+            if [ -f "$lockfile" ]; then
+              case "$lockfile" in
+                yarn.lock) package_manager=yarn ;;
+                bun.lockb|bun.lock) package_manager=bun ;;
+                package-lock.json) package_manager=npm ;;
+                pnpm-lock.yaml) package_manager=pnpm ;;
+              esac
+              break
+            fi
+          done
+        fi
+        package_manager="${package_manager:-pnpm}"
+        if [ "$package_manager" = "yarn" ] || { [ "$package_manager_pinned" = true ] && [ "$package_manager" = "pnpm" ]; }; then
+          mkdir -p "$HOME/.local/bin"
+          corepack enable --install-directory "$HOME/.local/bin"
+        fi
+      }
+      prepare_package_manager
+      if [ "$package_manager" != "yarn" ] || [ ! -f .pnp.cjs ]; then
+        [ -x node_modules/.bin/adonis-kit ] || "$package_manager" install
+      fi
+      "$package_manager" run build
+    timeout_seconds: 180
+notes:
+  - "Runs the compiled Adonis server on sandboxd's one preview port; the Hypermedia Vite HMR listener is not exposed."
+  - "Imports are not initialized: sandboxd does not create or copy .env, generate APP_KEY, choose database configuration, or run migrations. Provide production environment settings and database state yourself."
+  - "The command honors packageManager first, then yarn, bun, npm, and pnpm lockfiles. AdonisJS v7 requires Node 24+."
+tags: [node, adonisjs, edge, compiled_server]
+verified:
+  starter: "adonisjs/starter-kits Hypermedia"
+  version: "create-adonisjs@3.4.0, kit 919a6e8"

@@ -42,6 +42,28 @@ func (s *Server) purgeOne(ctx context.Context, id string) (freedBytes int64, ext
 		externalUserID = wo.ExternalUserID
 	}
 
+	// Hosted Copilot state is durable outside a workspace. First make an active
+	// callback terminal, then remove every conversation-scoped SDK mapping before
+	// the database cascade removes the IDs needed to find them.
+	if coordinator := s.conversationCoordinator(); coordinator != nil {
+		coordinator.InterruptSandbox(ctx, id,
+			"Copilot was interrupted because this sandbox was deleted.")
+	}
+	if s.Copilot != nil {
+		conversationIDs, e := s.Store.ListConversationIDsForSandbox(ctx, id)
+		if e != nil {
+			return 0, externalUserID, fmt.Errorf("list Copilot conversations: %w", e)
+		}
+		for _, conversationID := range conversationIDs {
+			if e := s.Copilot.CleanupConversation(conversationID); e != nil {
+				return 0, externalUserID, fmt.Errorf("Copilot conversation cleanup: %w", e)
+			}
+		}
+		if e := s.Copilot.CleanupSandbox(id); e != nil {
+			return 0, externalUserID, fmt.Errorf("copilot cleanup: %w", e)
+		}
+	}
+
 	// Container teardown if one exists.
 	name := "s-" + id
 	if _, e := s.Docker.Inspect(ctx, name); e == nil {

@@ -18,8 +18,8 @@ existing apps keep working unchanged. runtimed reads the manifest on (re)start.
 > for NiceGUI/Chainlit socket.io, Sanic native WS, Streamlit, Jupyter kernels,
 > Gradio SSE).
 
-> **Presets & the process API.** Five runtime presets ship — `react-vite`,
-> `nextjs`, `fastapi`, `node-express`, `worker` — each booting to a preview and
+> **Presets & the process API.** Six runtime presets ship — `react-vite`,
+> `nextjs`, `adonisjs`, `fastapi`, `node-express`, `worker` — each booting to a preview and
 > surviving agent tasks + fork/restore. `GET /v1/sandboxes/{id}` includes
 > `processes[]`; `GET /v1/sandboxes/{id}/processes/{name}/logs` tails a process's
 > log; `GET /v1/presets` lists the presets and `runtime_preset` is accepted on
@@ -83,8 +83,9 @@ Resolution rules (how **runtimed** runs a manifest — lenient, the app always b
 ### Build checks (and how to skip them)
 The build check is **runtime verification** — after a coding task, runtimed runs
 `build.command` in the workspace to catch obvious breakage before reporting the
-result. It is **not a production deployment build**: there is no artifact, no
-bundling for release, no deploy. Stacks whose "build" would be meaningless or
+result. It may create the artifacts needed by a compiled runtime, but it is **not a
+deployment**: sandboxd does not publish an artifact or deploy it elsewhere. Stacks
+whose "build" would be meaningless or
 harmful as a post-task check (a Next.js dev server, a FastAPI/Express API, a
 worker) should **skip** it.
 
@@ -133,8 +134,21 @@ It is **opt-in**, used only where the runtime has no live reload of its own:
 | React/Vite | Vite HMR (no restart) |
 | FastAPI | `uvicorn --reload` (no restart) |
 | Next.js | `web.restart_after_task: true` (also heals agent `next build` poison) |
+| AdonisJS | compiled server rebuilt, then `web.restart_after_task: true` |
 | Node/Express | `web.restart_after_task: true` (`node server.js` has no reload) |
 | Worker | worker `restart_after_task: true` (re-runs the editable `worker.sh`) |
+
+### AdonisJS preset
+
+`adonisjs` creates the pinned AdonisJS v7 Hypermedia starter (Edge, Alpine.js, and
+SQLite), builds it, and serves the compiled app on `0.0.0.0:3000`. Its generated
+SQLite file stays at `tmp/db.sqlite3`; each build recreates `build/tmp` as a link to
+that persistent directory. The compiled server is restarted after every coding task
+so source edits become live.
+
+For an imported AdonisJS repository, runtime detection only suggests a manifest. It
+does not create or copy `.env`, generate `APP_KEY`, configure a database, or run
+migrations; provide those production settings and data explicitly.
 
 ### JavaScript projects that do not use pnpm
 

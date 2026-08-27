@@ -31,7 +31,7 @@ See [`sandbox-manifest.md`](./sandbox-manifest.md) for the full schema and
 
 - A **preset** scaffolds a *new* app: starter files baked into an image template +
   Go code + capabilities. Heavyweight; only a handful exist (`react-vite`,
-  `nextjs`, `node-express`, `fastapi`, `worker`).
+  `nextjs`, `adonisjs`, `node-express`, `fastapi`, `worker`).
 - A **recipe** just configures an *existing* (imported) repo: a `sandbox.yaml` text
   + a detect rule + notes. **Pure data, never executed, never written by core.**
 
@@ -102,11 +102,24 @@ also have a **production "build-then-serve"** shape that's worth knowing:
   **not** infer production mode and there is no generic built-server abstraction —
   pick the recipe you want.
 
+### AdonisJS v7 Hypermedia
+
+The built-in `adonisjs` preset creates the official Hypermedia starter with Edge,
+Alpine.js, and SQLite. It uses a compiled server at `0.0.0.0:3000`, not the
+two-process Vite HMR flow, and rebuilds/restarts after coding tasks. The generated
+database persists at `tmp/db.sqlite3`; `build/tmp` points there after every build.
+
+An imported AdonisJS app is detected from `@adonisjs/core` and `adonisrc.*`, then
+gets an advisory compiled-server manifest. Adoption does **not** create or copy
+`.env`, generate `APP_KEY`, select a database, or run migrations. Configure the
+production environment and database explicitly before running it.
+
 ## Compatibility matrix
 
 | Framework | `runtime-inspect` | `allowedHosts`? | Verified starter |
 |---|---|---|---|
 | Next.js | `nextjs` preset | no | theodorusclarence/ts-nextjs-tailwind-starter |
+| AdonisJS v7 Hypermedia | `adonisjs` preset / recipe | no (compiled server) | adonisjs/starter-kits Hypermedia |
 | Vite + React | `react-vite` preset | **yes** | SafdarJamal/vite-template-react |
 | Astro | recipe (detect-only) | **yes** | astro blog starter |
 | Docusaurus | recipe (detect-only) | no | slorber/docusaurus-starter |
@@ -179,11 +192,11 @@ there's a real signal (e.g. the `n8n` dependency), never for an empty app.
 
 These were verified beyond "200" — admin UI **plus** a real DB write **plus** the API:
 
-| Recipe | Proven | DB | Node 22 note |
+| Recipe | Proven | DB | Node 24 note |
 |---|---|---|---|
 | **Strapi** v5 (`@strapi/strapi`) | admin 200, `POST /admin/register-admin` → super-admin (id 1), `/_health` 204 | `.tmp/data.db` (better-sqlite3, arm64 prebuilt) | health on `/admin` (`/` 302s) |
 | **Payload** v3 (`payload`) | admin 200, `POST /api/users/first-register` → user 1, REST **+** GraphQL live | `payload.db` (libsql, 9 tables incl. `payload_migrations`) | bare `next dev` binds localhost → pinned `-H 0.0.0.0` |
-| **Ghost** 6 (`ghost`) | front-end 200, `/ghost/` admin 200, Admin API 200 | `content/data/ghost-local.db` (~90 tables, auto-migrated) | **Node-22-only** (needs ^22.18); `sqlite3`+`sharp` compile from source |
+| **Ghost** 6 (`ghost`) | front-end 200, `/ghost/` admin 200, Admin API 200 | `content/data/ghost-local.db` (~90 tables, auto-migrated) | Node 24 base satisfies its `^22.18` requirement; `sqlite3`+`sharp` compile from source |
 
 **Ghost is advisory, not turnkey:** Ghost 6's local install needs a modern **pnpm
 (≥10/11)** (its tarball uses a pnpm catalog that pnpm 9 rejects) and a **writable
@@ -198,7 +211,6 @@ external service).
 
 ## Maintainers — candidate presets
 
-`runtime-inspect` detects all ten, but only Next.js + Vite-React are runnable
-presets. Gatsby, Vue, Nuxt, SvelteKit, and Eleventy work via the recipes above and
-are clean candidates for built-in presets (keyed on their package.json dep) if the
-image/template cost is justified later.
+The built-in catalog exposes the selectable presets above. Gatsby, Vue, Nuxt,
+SvelteKit, and Eleventy work through advisory recipes and remain candidates for
+future built-in presets if their image/template cost is justified.

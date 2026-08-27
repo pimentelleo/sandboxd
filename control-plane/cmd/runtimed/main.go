@@ -47,6 +47,13 @@ type app struct {
 
 	taskMu sync.Mutex // guards task; serializes start (one task at a time)
 	task   *task      // the current / last task, or nil
+	// hostedFinalizeMu serializes normal hosted finalization with recovery
+	// abandonment so a retry can only observe one durable terminal result.
+	hostedFinalizeMu sync.Mutex
+	// hosted holds checkpointed control-plane-owned turns. It intentionally
+	// does not feed GET /status.active_task, because it may wait for a human
+	// while the sandbox is eligible to stop.
+	hosted map[string]*hostedTask
 }
 
 func main() {
@@ -124,6 +131,7 @@ func main() {
 		runtimeDir: runtimeDir,
 		log:        log,
 		bootedAt:   time.Now(),
+		hosted:     make(map[string]*hostedTask),
 	}
 	if m.Web != nil {
 		a.web = newProcess("web", "web", appDir, m.Web.Command, filepath.Join(runtimeDir, "web.log"), log)
@@ -141,6 +149,7 @@ func main() {
 	// Finalize any task interrupted by a previous stop/crash before
 	// accepting new work — an interrupted task is failed, never resumed.
 	recoverInterruptedTasks(filepath.Join(runtimeDir, "tasks"), log)
+	a.loadHostedTasks()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

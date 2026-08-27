@@ -63,7 +63,7 @@ func TestV1PresetsResponseShape(t *testing.T) {
 			byID[id] = p
 		}
 	}
-	for _, id := range []string{"react-vite", "nextjs", "node-express", "fastapi", "worker"} {
+	for _, id := range []string{"react-vite", "nextjs", "adonisjs", "node-express", "fastapi", "worker"} {
 		p, ok := byID[id]
 		if !ok {
 			t.Errorf("required preset %q missing", id)

@@ -15,9 +15,12 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentauth"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
 )
 
 // provider validates {provider} against the registry, returning it and writing a
@@ -124,8 +127,68 @@ func (s *Server) v1AgentOAuthFinish(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"provider": "claude-code", "status": "connected", "method": "oauth"})
 }
 
+// POST /v1/agents/github-copilot/pat stores a fine-grained GitHub personal
+// access token in the control plane. It is write-only and is never mounted in
+// a sandbox.
+func (s *Server) v1GitHubCopilotPAT(w http.ResponseWriter, r *http.Request) {
+	if s.Copilot == nil {
+		writeErr(w, http.StatusServiceUnavailable, "GitHub Copilot is unavailable")
+		return
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil || body.Token == "" {
+		writeErr(w, http.StatusBadRequest, "missing token")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	status, err := s.Copilot.ConnectPAT(r.Context(), body.Token)
+	if errors.Is(err, copilot.ErrInvalidPAT) {
+		writeErr(w, http.StatusBadRequest, "a fine-grained GitHub personal access token is required")
+		return
+	}
+	if errors.Is(err, copilot.ErrCredentialChanged) {
+		writeErr(w, http.StatusConflict, "GitHub Copilot connection changed; retry")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "could not validate GitHub Copilot token")
+		return
+	}
+	if coordinator := s.conversationCoordinator(); coordinator != nil {
+		coordinator.InterruptAll(r.Context(),
+			"Copilot was interrupted because the GitHub Copilot credential changed.")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": "github-copilot", "status": "connected",
+		"method": status.Method, "account": status.Account,
+	})
+}
+
 // POST /v1/agents/{provider}/disconnect — deletes the stored auth dir.
 func (s *Server) v1AgentDisconnect(w http.ResponseWriter, r *http.Request) {
+	if r.PathValue("provider") == "github-copilot" {
+		if s.Copilot == nil {
+			writeErr(w, http.StatusServiceUnavailable, "GitHub Copilot is unavailable")
+			return
+		}
+		if err := s.Copilot.Disconnect(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not disconnect GitHub Copilot")
+			return
+		}
+		if coordinator := s.conversationCoordinator(); coordinator != nil {
+			coordinator.InterruptAll(r.Context(),
+				"Copilot was interrupted because the GitHub Copilot credential was disconnected.")
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	p, ok := s.agentProvider(w, r)
 	if !ok {
 		return

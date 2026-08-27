@@ -112,7 +112,7 @@ func TestParseClaudeStreamResultError(t *testing.T) {
 
 func TestSelectAgentClaudeCode(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, name := range []string{"claude-code", "opencode", "codex"} {
+	for _, name := range []string{"claude-code", "opencode", "codex", "github-copilot"} {
 		a, err := selectAgent(name, log)
 		if err != nil || a.name() != name {
 			t.Fatalf("selectAgent(%q) = %v, %v", name, a, err)

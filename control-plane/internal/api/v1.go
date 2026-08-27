@@ -227,7 +227,7 @@ type v1CreateReq struct {
 	// snapshot the caller's tenant owns
 	// instead of the default template. Mutually exclusive with Template.
 	FromSnapshot string `json:"from_snapshot,omitempty"`
-	// RuntimePreset selects a runtime preset (react-vite, nextjs, …). Applied
+	// RuntimePreset selects a runtime preset (react-vite, nextjs, adonisjs, …). Applied
 	// by runtimed on first boot; takes precedence over Template.
 	RuntimePreset string `json:"runtime_preset,omitempty"`
 	// Image is rejected — per-app image selection is not supported (instance-wide
@@ -364,6 +364,20 @@ func (s *Server) v1StopSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	if sb.Status != "running" {
 		writeV1Err(w, http.StatusConflict, "conflict", "sandbox is not running")
+		return
+	}
+	// A hosted Copilot turn does not remain visible as runtimed's active task,
+	// so consult durable task state before its runtime status as well. Parked
+	// user-input and plan turns are intentionally waiting_*, and remain
+	// stoppable until their response wakes the sandbox.
+	runningTask, err := s.Store.SandboxHasRunningTask(r.Context(), id)
+	if err != nil {
+		writeV1Err(w, http.StatusInternalServerError, "internal", "could not inspect active task state")
+		return
+	}
+	if runningTask {
+		writeV1Err(w, http.StatusConflict, "task_in_progress",
+			"a task is in progress; cancel it before stopping")
 		return
 	}
 	// Reject a stop while a task is active — the upstream cancels first.

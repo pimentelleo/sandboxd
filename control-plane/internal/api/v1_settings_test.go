@@ -81,7 +81,7 @@ func TestV1SettingsShapeAndNoSecretLeak(t *testing.T) {
 	for _, p := range m["presets"].([]any) {
 		ids[p.(map[string]any)["id"].(string)] = true
 	}
-	for _, want := range []string{"react-vite", "nextjs", "fastapi", "worker"} {
+	for _, want := range []string{"react-vite", "nextjs", "adonisjs", "fastapi", "worker"} {
 		if !ids[want] {
 			t.Errorf("settings presets missing %q", want)
 		}

@@ -103,7 +103,7 @@ type Result struct {
 // runnablePresets are the stack ids that have a built-in runtime preset today
 // (must match internal/preset). astro/docusaurus are detect-only for now.
 var runnablePresets = map[string]bool{
-	"nextjs": true, "react-vite": true, "node-express": true, "fastapi": true, "worker": true,
+	"nextjs": true, "react-vite": true, "adonisjs": true, "node-express": true, "fastapi": true, "worker": true,
 }
 
 type pkgJSON struct {

@@ -46,7 +46,7 @@ A compatible image **must**:
    without a writable rootfs assumption. **No `--privileged`, no Docker socket, no
    extra capabilities.**
 7. **Must provide the toolchains the presets you use require** — e.g. `node` +
-   `pnpm` for `react-vite` / `nextjs` / `node-express`, and `python3` + `venv` for
+   `pnpm` for `react-vite` / `nextjs` / `adonisjs` / `node-express`, and `python3` + `venv` for
    `fastapi`. (Presets install their dependencies at runtime, but the interpreter/
    package manager must already be present.)
 8. **Toolchains must be on the login PATH.** runtimed runs app/web/worker commands
@@ -59,11 +59,11 @@ match the same surface.
 
 ## Native languages (Go / PHP / Ruby / Rust / Java / .NET / Deno)
 
-The default base ships **Node 22** (npm 10, pnpm 9, bun) and **Python 3.13 + uv**
+The default base ships **Node 24** (npm, pnpm 10.34.4, bun) and **Python 3.13 + uv**
 **with `setuptools`** (so node-gyp can build native modules — better-sqlite3,
 sqlite3, sharp — on Python 3.12+ where stdlib `distutils` was removed), plus
 `git`/`make`/`gcc`/`g++`/`curl`/`perl`. Node, Python, and Bun stacks therefore run
-on the stock image. (Node 22 also has `worker_threads.markAsUncloneable`, so libs
+on the stock image. (Node 24 also has `worker_threads.markAsUncloneable`, so libs
 like undici 8 no longer crash the dev server on boot.) Self-check the image with
 `docker run --rm <image> bash /opt/verify-base.sh`. **Go, PHP, Ruby, Rust, Java, .NET, and the `sqlite3` CLI are
 not in the base** — those need a **custom image** (operator-scoped, instance-wide):

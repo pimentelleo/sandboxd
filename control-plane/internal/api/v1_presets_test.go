@@ -55,7 +55,7 @@ func TestListPresets(t *testing.T) {
 	for _, p := range got.Presets {
 		ids[p.ID] = true
 	}
-	for _, want := range []string{"react-vite", "nextjs", "node-express", "fastapi", "worker"} {
+	for _, want := range []string{"react-vite", "nextjs", "adonisjs", "node-express", "fastapi", "worker"} {
 		if !ids[want] {
 			t.Errorf("missing preset %q in %v", want, ids)
 		}
@@ -66,18 +66,18 @@ func TestListPresets(t *testing.T) {
 func TestCreateAppRuntimePreset(t *testing.T) {
 	s := newPresetTestServer(t)
 
-	w := presetReq(s, "POST", "/v1/apps", `{"name":"API","runtime_preset":"fastapi"}`, cfgTenant, nil, s.v1CreateApp)
+	w := presetReq(s, "POST", "/v1/apps", `{"name":"API","runtime_preset":"adonisjs"}`, cfgTenant, nil, s.v1CreateApp)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
 	}
 	var app v1App
 	json.Unmarshal(w.Body.Bytes(), &app)
-	if app.RuntimePreset != "fastapi" {
+	if app.RuntimePreset != "adonisjs" {
 		t.Errorf("runtime_preset not returned: %+v", app)
 	}
 	// Persisted on the row.
 	got, _ := s.Store.GetAppForOwner(context.Background(), app.ID, cfgTenant)
-	if !got.RuntimePreset.Valid || got.RuntimePreset.String != "fastapi" {
+	if !got.RuntimePreset.Valid || got.RuntimePreset.String != "adonisjs" {
 		t.Errorf("runtime_preset not stored: %+v", got.RuntimePreset)
 	}
 

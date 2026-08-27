@@ -110,6 +110,9 @@ services:
       # explicit rollback (it trips the "your API is open" warning).
       SANDBOXD_API_AUTH_DISABLED: ${SANDBOXD_API_AUTH_DISABLED:-false}
       SANDBOXD_API_TOKENS: ${SANDBOXD_API_TOKENS:-}
+      # --- hosted GitHub Copilot (official SDK; bridge stays internal) ---
+      SANDBOXD_COPILOT_BRIDGE_ADDR: ${SANDBOXD_COPILOT_BRIDGE_ADDR:-0.0.0.0:9200}
+      SANDBOXD_COPILOT_BRIDGE_URL: ${SANDBOXD_COPILOT_BRIDGE_URL:-http://sandboxd:9200}
       # --- idle lifecycle (override if you like) ---
       SANDBOXD_IDLE_THRESHOLD_SECONDS: ${SANDBOXD_IDLE_THRESHOLD_SECONDS:-2100}
     networks:

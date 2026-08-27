@@ -21,7 +21,7 @@ doesn't notice.
 **2. v1 launch scope = Node + Python + static-binary apps only (one base image).**
 Ship the 77 apps that run on the stock `sandboxd-base:0.3.0` with **no foreign runtime dropped**:
 - `binary` (41): download one pinned static Go/Rust binary, `chmod`, run. Simplest + most reliable.
-- `node` (17): `npm/pnpm/bun install` on base Node 22.
+- `node` (17): `npm/pnpm/bun install` on base Node 24.
 - `python` (19): `uv venv` + `uv pip install` on base Python 3.13.
 
 **3. Runtime-drop families are SHELVED, not deleted.** The 15 recipes that curl a foreign runtime into

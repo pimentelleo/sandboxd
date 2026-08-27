@@ -79,7 +79,7 @@ type createReq struct {
 	// API. The sandbox is the app's current running instance.
 	AppID string `json:"app_id,omitempty"`
 	// RuntimePreset, when set, names a runtime preset (react-vite, nextjs,
-	// node-express, fastapi, worker). runtimed applies the preset's template +
+	// adonisjs, node-express, fastapi, worker). runtimed applies the preset's template +
 	// sandbox.yaml on first boot. Takes precedence over Template.
 	RuntimePreset string `json:"runtime_preset,omitempty"`
 
@@ -711,6 +711,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// reading a mounted credential. runtimed only acts on this for claude-code.
 	if s.AgentProxyURL != "" {
 		envFlags = append(envFlags, "RUNTIMED_ANTHROPIC_PROXY="+s.AgentProxyURL)
+	}
+	// Hosted GitHub Copilot tasks call this private control-plane bridge with a
+	// one-time capability. No GitHub credential or SDK state enters a sandbox.
+	if s.CopilotBridgeURL != "" {
+		envFlags = append(envFlags, "RUNTIMED_COPILOT_BRIDGE_URL="+s.CopilotBridgeURL)
 	}
 	// Optional OpenCode model (e.g. an OpenCode Zen model) for opencode tasks.
 	if s.OpencodeModel != "" {
