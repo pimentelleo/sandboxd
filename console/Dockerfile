@@ -8,6 +8,9 @@ COPY . .
 RUN pnpm build
 
 FROM nginx:stable-alpine
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# The official nginx entrypoint renders this template after discovering the
+# container network's DNS resolver from /etc/resolv.conf.
+ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 80
