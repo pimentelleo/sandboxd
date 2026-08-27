@@ -6,7 +6,25 @@ import (
 	"sync"
 )
 
-const autopilotAssumption = "Proceed with the least-surprising assumption, then state that assumption clearly in the final response."
+const (
+	autopilotAssumption = "Proceed with the least-surprising assumption, then state that assumption clearly in the final response."
+
+	conversationInteractionInstructions = `
+
+## Asking for clarification
+
+Use the native ask_user tool whenever information materially affects the app's
+scope, architecture, integrations, data model, authentication, deployment, or
+visual direction. This is mandatory when the user explicitly asks you to ask
+questions. Ask one concise, highest-impact question at a time, offer choices
+when they are genuinely constrained, and allow a freeform answer when needed.
+Wait for its response before making dependent changes.
+
+Never present a blocking question only as normal assistant text. Use normal text
+for explanations and progress updates, not as a substitute for ask_user. Do not
+ask questions merely to defer low-impact work; make a reasonable assumption
+instead and disclose it in the final response.`
+)
 
 // ConversationTurnRequest is a hosted, durable conversation turn. It is never
 // accepted directly from a sandbox; the control-plane coordinator supplies the
@@ -76,7 +94,7 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 
 	gate := newMutationGate(request.Mode != ConversationModePlan)
 	runtimeConfig := RuntimeConfig{
-		Model: request.Model, Token: token, SystemPrompt: request.SystemPrompt,
+		Model: request.Model, Token: token, SystemPrompt: conversationSystemPrompt(request.SystemPrompt),
 		Workdir: m.runtimeWorkdir(), Tools: conversationTools(request.SandboxID, m.cfg.Executor, gate),
 		OnEvent: func(event RuntimeEvent) {
 			select {
@@ -264,4 +282,8 @@ func validConversationMode(mode string) bool {
 
 func allowsMutation(action string) bool {
 	return action == ConversationModeInteractive || action == ConversationModeAutopilot
+}
+
+func conversationSystemPrompt(base string) string {
+	return base + conversationInteractionInstructions
 }

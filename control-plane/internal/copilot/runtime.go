@@ -22,7 +22,7 @@ func (r *sdkRuntime) Resume(ctx context.Context, id string, config RuntimeConfig
 	session, err := r.client.ResumeSession(ctx, id, &sdk.ResumeSessionConfig{
 		ClientName: "sandboxd",
 		Model:      config.Model, GitHubToken: config.Token, WorkingDirectory: config.Workdir,
-		Tools: tools, AvailableTools: customToolSet(), SystemMessage: systemMessage(config.SystemPrompt),
+		Tools: tools, AvailableTools: availableTools(config), SystemMessage: systemMessage(config.SystemPrompt),
 		EnableConfigDiscovery: sdk.Bool(false), EnableOnDemandInstructionDiscovery: sdk.Bool(false),
 		EnableFileHooks: sdk.Bool(false), EnableHostGitOperations: sdk.Bool(false),
 		EnableSessionStore: sdk.Bool(false), EnableSkills: sdk.Bool(false),
@@ -44,7 +44,7 @@ func (r *sdkRuntime) open(ctx context.Context, _ string, config RuntimeConfig) (
 	session, err := r.client.CreateSession(ctx, &sdk.SessionConfig{
 		ClientName: "sandboxd",
 		Model:      config.Model, GitHubToken: config.Token, WorkingDirectory: config.Workdir,
-		Tools: tools, AvailableTools: customToolSet(), SystemMessage: systemMessage(config.SystemPrompt),
+		Tools: tools, AvailableTools: availableTools(config), SystemMessage: systemMessage(config.SystemPrompt),
 		EnableConfigDiscovery: sdk.Bool(false), EnableOnDemandInstructionDiscovery: sdk.Bool(false),
 		EnableFileHooks: sdk.Bool(false), EnableHostGitOperations: sdk.Bool(false),
 		EnableSessionStore: sdk.Bool(false), EnableSkills: sdk.Bool(false),
@@ -88,8 +88,15 @@ func (s sdkSession) Disconnect() error {
 	return s.session.Disconnect()
 }
 
-func customToolSet() []string {
-	return sdk.NewToolSet().
+func availableTools(config RuntimeConfig) []string {
+	tools := sdk.NewToolSet()
+	if config.OnUserInputRequest != nil {
+		tools.AddBuiltIn("ask_user")
+	}
+	if config.OnPlanRequest != nil {
+		tools.AddBuiltIn("exit_plan_mode")
+	}
+	return tools.
 		AddCustom("list_files").
 		AddCustom("read_file").
 		AddCustom("search_files").
