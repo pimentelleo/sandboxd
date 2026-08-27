@@ -12,6 +12,10 @@ patch** — each lands the meaningful changes merged since the last one — and 
 - Selectable AdonisJS v7 Hypermedia preset with Edge, Alpine.js, persistent SQLite,
   a compiled server, and advisory imported-project detection.
 
+### Fixed
+- GitHub Copilot conversations now present native clarification and plan-approval
+  interactions instead of requiring the agent to write blocking questions as chat text.
+
 ### Changed
 - Upgraded the stock sandbox base image from Node 22 to Node 24.
 
