@@ -53,6 +53,7 @@ func (m *Manager) ConnectPAT(ctx context.Context, rawToken string) (Status, erro
 		return Status{}, errors.New("unable to store GitHub personal access token")
 	}
 	m.credentialGeneration++
+	m.invalidateModelCatalogLocked()
 	m.mu.Unlock()
 
 	for _, task := range previousActive {
@@ -72,6 +73,7 @@ func (m *Manager) ConnectPAT(ctx context.Context, rawToken string) (Status, erro
 			_ = m.runtime.Delete(context.Background(), sessionID)
 		}
 	}
+	m.invalidateRuntimeModelCatalog()
 	return Status{Connected: true, Account: account, Method: "github-pat"}, nil
 }
 

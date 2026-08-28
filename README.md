@@ -202,6 +202,12 @@ container. Other agents, and direct `POST /v1/sandboxes/{id}/tasks` requests,
 remain one-shot tasks. See [`docs/agent-auth.md`](docs/agent-auth.md) and the
 [OpenAPI contract](docs/openapi.yaml) for connection and API details.
 
+The Copilot composer lists only models available to the connected account. For
+each message, choose an entitled model, its supported reasoning effort, and
+standard or long context. Leaving model or effort at the default lets sandboxd
+or Copilot choose it. sandboxd validates the selection and snapshots it with
+the queued turn, so later default or UI changes cannot alter in-flight work.
+
 **Full walkthrough → [sandboxd.io/quickstart](https://sandboxd.io/quickstart).**
 
 ## 🚀 Deploy to a VPS in one click

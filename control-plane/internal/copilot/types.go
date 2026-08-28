@@ -22,10 +22,12 @@ const (
 )
 
 var (
-	ErrInvalidPAT        = errors.New("invalid GitHub Copilot personal access token")
-	ErrCredentialChanged = errors.New("GitHub Copilot connection changed")
-	ErrNotConnected      = errors.New("GitHub Copilot is not connected")
-	ErrCapability        = errors.New("invalid or expired task capability")
+	ErrInvalidPAT              = errors.New("invalid GitHub Copilot personal access token")
+	ErrCredentialChanged       = errors.New("GitHub Copilot connection changed")
+	ErrNotConnected            = errors.New("GitHub Copilot is not connected")
+	ErrCapability              = errors.New("invalid or expired task capability")
+	ErrInvalidModelSelection   = errors.New("invalid GitHub Copilot model selection")
+	ErrModelCatalogUnavailable = errors.New("GitHub Copilot model catalog is unavailable")
 )
 
 // Config configures the hosted Copilot provider. StateDir must be a private
@@ -120,6 +122,32 @@ type RuntimeClient interface {
 	Delete(context.Context, string) error
 }
 
+// ModelInfo is the allowlisted subset of SDK model metadata that may be
+// returned to an authenticated console client. It intentionally excludes
+// policy, billing, capabilities, and all SDK transport details.
+type ModelInfo struct {
+	ID                        string   `json:"id"`
+	Name                      string   `json:"name"`
+	SupportedReasoningEfforts []string `json:"supported_reasoning_efforts"`
+	DefaultReasoningEffort    string   `json:"default_reasoning_effort,omitempty"`
+	MaxContextWindowTokens    *int     `json:"max_context_window_tokens,omitempty"`
+}
+
+// ModelCatalogRuntime is an optional extension of RuntimeClient. Keeping it
+// separate preserves the existing runtime test seam and legacy task adapter.
+type ModelCatalogRuntime interface {
+	ListModels(context.Context, string) ([]ModelInfo, error)
+	InvalidateModelCatalog()
+}
+
+// ModelSelection is the normalized, immutable selection stored with a
+// conversation turn. An empty Model delegates model selection to the provider.
+type ModelSelection struct {
+	Model           string
+	ReasoningEffort string
+	ContextTier     string
+}
+
 type RuntimeSession interface {
 	ID() string
 	Send(context.Context, string) error
@@ -137,6 +165,8 @@ type ConversationRuntimeSession interface {
 
 type RuntimeConfig struct {
 	Model               string
+	ReasoningEffort     string
+	ContextTier         string
 	Token               string
 	SystemPrompt        string
 	Workdir             string

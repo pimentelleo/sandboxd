@@ -171,6 +171,27 @@ func (s *Server) v1GitHubCopilotPAT(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /v1/agents/github-copilot/models exposes the connected account's
+// allowlisted model catalog. It never returns tokens, SDK state, billing, or
+// policy metadata.
+func (s *Server) v1GitHubCopilotModels(w http.ResponseWriter, r *http.Request) {
+	if s.Copilot == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "GitHub Copilot is unavailable")
+		return
+	}
+	models, err := s.Copilot.ListModels(r.Context())
+	switch {
+	case errors.Is(err, copilot.ErrNotConnected), errors.Is(err, copilot.ErrCredentialChanged):
+		writeV1Err(w, http.StatusConflict, "agent_not_connected", "GitHub Copilot is not connected")
+	case errors.Is(err, copilot.ErrModelCatalogUnavailable):
+		writeV1Err(w, http.StatusServiceUnavailable, "model_catalog_unavailable", "Copilot model choices are temporarily unavailable")
+	case err != nil:
+		writeV1Err(w, http.StatusInternalServerError, "internal", "could not load Copilot model choices")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"models": models})
+	}
+}
+
 // POST /v1/agents/{provider}/disconnect — deletes the stored auth dir.
 func (s *Server) v1AgentDisconnect(w http.ResponseWriter, r *http.Request) {
 	if r.PathValue("provider") == "github-copilot" {

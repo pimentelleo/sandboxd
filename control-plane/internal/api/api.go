@@ -285,6 +285,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/agents/claude-code/oauth/start", s.observe("POST /v1/agents/claude-code/oauth/start", s.v1AgentOAuthStart))
 	mux.HandleFunc("POST /v1/agents/claude-code/oauth/finish", s.observe("POST /v1/agents/claude-code/oauth/finish", s.v1AgentOAuthFinish))
 	mux.HandleFunc("POST /v1/agents/github-copilot/pat", s.observe("POST /v1/agents/github-copilot/pat", s.v1GitHubCopilotPAT))
+	mux.HandleFunc("GET /v1/agents/github-copilot/models", s.observe("GET /v1/agents/github-copilot/models", s.v1GitHubCopilotModels))
 	mux.HandleFunc("POST /v1/agents/{provider}/import", s.observe("POST /v1/agents/{provider}/import", s.v1AgentImport))
 	mux.HandleFunc("POST /v1/agents/{provider}/api-key", s.observe("POST /v1/agents/{provider}/api-key", s.v1AgentAPIKey))
 	mux.HandleFunc("POST /v1/agents/{provider}/disconnect", s.observe("POST /v1/agents/{provider}/disconnect", s.v1AgentDisconnect))

@@ -10,7 +10,14 @@ import (
 
 // sdkRuntime is the only production use of the official SDK. It runs in the
 // control-plane process and is never passed a sandbox workspace path.
-type sdkRuntime struct{ client *sdk.Client }
+type sdkRuntime struct {
+	client                    *sdk.Client
+	modelCatalogBaseDirectory string
+
+	modelCatalogMu     sync.Mutex
+	modelCatalogClient *sdk.Client
+	modelCatalogToken  string
+}
 
 func (r *sdkRuntime) Create(ctx context.Context, config RuntimeConfig) (RuntimeSession, error) {
 	return r.open(ctx, "", config)
@@ -19,18 +26,7 @@ func (r *sdkRuntime) Create(ctx context.Context, config RuntimeConfig) (RuntimeS
 func (r *sdkRuntime) Resume(ctx context.Context, id string, config RuntimeConfig) (RuntimeSession, error) {
 	tools := sdkTools(config.Tools)
 	correlation := newInteractionCorrelator()
-	session, err := r.client.ResumeSession(ctx, id, &sdk.ResumeSessionConfig{
-		ClientName: "sandboxd",
-		Model:      config.Model, GitHubToken: config.Token, WorkingDirectory: config.Workdir,
-		Tools: tools, AvailableTools: availableTools(config), SystemMessage: systemMessage(config.SystemPrompt),
-		EnableConfigDiscovery: sdk.Bool(false), EnableOnDemandInstructionDiscovery: sdk.Bool(false),
-		EnableFileHooks: sdk.Bool(false), EnableHostGitOperations: sdk.Bool(false),
-		EnableSessionStore: sdk.Bool(false), EnableSkills: sdk.Bool(false),
-		Streaming: sdk.Bool(true), ContinuePendingWork: sdk.Bool(config.ContinuePendingWork),
-		OnEvent:               eventAdapter(config.OnEvent, correlation),
-		OnUserInputRequest:    inputHandler(config.OnUserInputRequest, correlation),
-		OnExitPlanModeRequest: planHandler(config.OnPlanRequest, correlation),
-	})
+	session, err := r.client.ResumeSession(ctx, id, sdkResumeSessionConfig(config, tools, correlation))
 	if err != nil {
 		correlation.close()
 		return nil, err
@@ -41,9 +37,35 @@ func (r *sdkRuntime) Resume(ctx context.Context, id string, config RuntimeConfig
 func (r *sdkRuntime) open(ctx context.Context, _ string, config RuntimeConfig) (RuntimeSession, error) {
 	tools := sdkTools(config.Tools)
 	correlation := newInteractionCorrelator()
-	session, err := r.client.CreateSession(ctx, &sdk.SessionConfig{
+	session, err := r.client.CreateSession(ctx, sdkSessionConfig(config, tools, correlation))
+	if err != nil {
+		correlation.close()
+		return nil, err
+	}
+	return sdkSession{session: session, correlation: correlation}, nil
+}
+
+func sdkResumeSessionConfig(config RuntimeConfig, tools []sdk.Tool, correlation *interactionCorrelator) *sdk.ResumeSessionConfig {
+	return &sdk.ResumeSessionConfig{
 		ClientName: "sandboxd",
-		Model:      config.Model, GitHubToken: config.Token, WorkingDirectory: config.Workdir,
+		Model:      config.Model, ReasoningEffort: config.ReasoningEffort, ContextTier: sdk.ContextTier(config.ContextTier),
+		GitHubToken: config.Token, WorkingDirectory: config.Workdir,
+		Tools: tools, AvailableTools: availableTools(config), SystemMessage: systemMessage(config.SystemPrompt),
+		EnableConfigDiscovery: sdk.Bool(false), EnableOnDemandInstructionDiscovery: sdk.Bool(false),
+		EnableFileHooks: sdk.Bool(false), EnableHostGitOperations: sdk.Bool(false),
+		EnableSessionStore: sdk.Bool(false), EnableSkills: sdk.Bool(false),
+		Streaming: sdk.Bool(true), ContinuePendingWork: sdk.Bool(config.ContinuePendingWork),
+		OnEvent:               eventAdapter(config.OnEvent, correlation),
+		OnUserInputRequest:    inputHandler(config.OnUserInputRequest, correlation),
+		OnExitPlanModeRequest: planHandler(config.OnPlanRequest, correlation),
+	}
+}
+
+func sdkSessionConfig(config RuntimeConfig, tools []sdk.Tool, correlation *interactionCorrelator) *sdk.SessionConfig {
+	return &sdk.SessionConfig{
+		ClientName: "sandboxd",
+		Model:      config.Model, ReasoningEffort: config.ReasoningEffort, ContextTier: sdk.ContextTier(config.ContextTier),
+		GitHubToken: config.Token, WorkingDirectory: config.Workdir,
 		Tools: tools, AvailableTools: availableTools(config), SystemMessage: systemMessage(config.SystemPrompt),
 		EnableConfigDiscovery: sdk.Bool(false), EnableOnDemandInstructionDiscovery: sdk.Bool(false),
 		EnableFileHooks: sdk.Bool(false), EnableHostGitOperations: sdk.Bool(false),
@@ -52,16 +74,67 @@ func (r *sdkRuntime) open(ctx context.Context, _ string, config RuntimeConfig) (
 		OnEvent:               eventAdapter(config.OnEvent, correlation),
 		OnUserInputRequest:    inputHandler(config.OnUserInputRequest, correlation),
 		OnExitPlanModeRequest: planHandler(config.OnPlanRequest, correlation),
-	})
-	if err != nil {
-		correlation.close()
-		return nil, err
 	}
-	return sdkSession{session: session, correlation: correlation}, nil
 }
 
 func (r *sdkRuntime) Delete(ctx context.Context, id string) error {
 	return r.client.DeleteSession(ctx, id)
+}
+
+// ListModels uses an isolated SDK runtime so the live conversation client
+// never shares catalog authentication state with an account replacement.
+func (r *sdkRuntime) ListModels(ctx context.Context, token string) ([]ModelInfo, error) {
+	if token == "" {
+		return nil, ErrNotConnected
+	}
+	r.modelCatalogMu.Lock()
+	defer r.modelCatalogMu.Unlock()
+
+	if r.modelCatalogClient == nil || r.modelCatalogToken != token {
+		if r.modelCatalogClient != nil {
+			_ = r.modelCatalogClient.Stop()
+		}
+		r.modelCatalogClient = sdk.NewClient(&sdk.ClientOptions{
+			Mode: sdk.ModeEmpty, BaseDirectory: r.modelCatalogBaseDirectory,
+			WorkingDirectory: r.modelCatalogBaseDirectory, GitHubToken: token,
+			UseLoggedInUser: sdk.Bool(false), LogLevel: "error",
+		})
+		r.modelCatalogToken = token
+	}
+	if err := r.modelCatalogClient.Start(ctx); err != nil {
+		return nil, err
+	}
+	models, err := r.modelCatalogClient.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ModelInfo, 0, len(models))
+	for _, model := range models {
+		item := ModelInfo{
+			ID: model.ID, Name: model.Name,
+			SupportedReasoningEfforts: append([]string(nil), model.SupportedReasoningEfforts...),
+			DefaultReasoningEffort:    model.DefaultReasoningEffort,
+		}
+		if model.Capabilities.Limits.MaxContextWindowTokens != nil {
+			limit := *model.Capabilities.Limits.MaxContextWindowTokens
+			item.MaxContextWindowTokens = &limit
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+// InvalidateModelCatalog removes the SDK's in-process catalog cache after a
+// credential change. The next lookup starts a private runtime with the new PAT.
+func (r *sdkRuntime) InvalidateModelCatalog() {
+	r.modelCatalogMu.Lock()
+	client := r.modelCatalogClient
+	r.modelCatalogClient = nil
+	r.modelCatalogToken = ""
+	r.modelCatalogMu.Unlock()
+	if client != nil {
+		_ = client.Stop()
+	}
 }
 
 type sdkSession struct {

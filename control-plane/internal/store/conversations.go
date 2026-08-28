@@ -67,17 +67,29 @@ type Conversation struct {
 // ConversationTurn is one queued or completed user request within a
 // conversation. TaskID links to the existing checkpoint/result/revert flow.
 type ConversationTurn struct {
-	ID             string
-	ConversationID string
-	TaskID         string
-	Sequence       int64
-	Prompt         string
-	Mode           string
-	Status         string
-	ErrorMessage   sql.NullString
-	CreatedAt      time.Time
-	StartedAt      sql.NullInt64
-	FinishedAt     sql.NullInt64
+	ID              string
+	ConversationID  string
+	TaskID          string
+	Sequence        int64
+	Prompt          string
+	Mode            string
+	Model           string
+	ReasoningEffort string
+	ContextTier     string
+	Status          string
+	ErrorMessage    sql.NullString
+	CreatedAt       time.Time
+	StartedAt       sql.NullInt64
+	FinishedAt      sql.NullInt64
+}
+
+// ConversationTurnSettings captures the immutable provider settings resolved
+// when a user queues a turn. They must never be read from current live settings
+// at execution time because a later settings update must not change queued work.
+type ConversationTurnSettings struct {
+	Model           string
+	ReasoningEffort string
+	ContextTier     string
 }
 
 // ConversationMessage is an ordered user or assistant transcript item.
@@ -143,7 +155,8 @@ const conversationSelectCols = `id, sandbox_id, agent, state, default_mode,
 	active_turn_id, last_error, next_sequence, created_at, updated_at, archived_at`
 
 const conversationTurnSelectCols = `id, conversation_id, task_id, sequence,
-	prompt, mode, status, error_message, created_at, started_at, finished_at`
+	prompt, mode, model, reasoning_effort, context_tier, status, error_message,
+	created_at, started_at, finished_at`
 
 const conversationMessageSelectCols = `id, conversation_id, turn_id, sequence,
 	role, content, status, created_at`
@@ -173,7 +186,8 @@ func scanConversationTurn(sc scanner) (*ConversationTurn, error) {
 	var turn ConversationTurn
 	var created int64
 	if err := sc.Scan(&turn.ID, &turn.ConversationID, &turn.TaskID, &turn.Sequence,
-		&turn.Prompt, &turn.Mode, &turn.Status, &turn.ErrorMessage, &created,
+		&turn.Prompt, &turn.Mode, &turn.Model, &turn.ReasoningEffort,
+		&turn.ContextTier, &turn.Status, &turn.ErrorMessage, &created,
 		&turn.StartedAt, &turn.FinishedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -370,9 +384,16 @@ func (s *Store) ArchiveActiveConversation(ctx context.Context, sandboxID string)
 // EnqueueConversationTurn atomically creates the user transcript message, its
 // task row, and a FIFO turn. The caller chooses opaque IDs so retries cannot
 // accidentally duplicate an otherwise valid turn.
-func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, turnID, taskID, prompt, mode string) (*ConversationTurn, int, error) {
+func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, turnID, taskID, prompt, mode string, settings ConversationTurnSettings) (*ConversationTurn, int, error) {
 	if conversationID == "" || turnID == "" || taskID == "" || prompt == "" {
 		return nil, 0, errors.New("invalid conversation turn")
+	}
+	if settings.ContextTier == "" {
+		settings.ContextTier = "default"
+	}
+	if len(settings.Model) > 256 || len(settings.ReasoningEffort) > 64 ||
+		len(settings.ContextTier) > 64 {
+		return nil, 0, errors.New("invalid conversation turn settings")
 	}
 	var (
 		turn     *ConversationTurn
@@ -408,10 +429,12 @@ func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, tur
 		now := time.Now().Unix()
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO conversation_turn
-			    (id, conversation_id, task_id, sequence, prompt, mode, status,
-			     error_message, created_at, started_at, finished_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)`,
+			    (id, conversation_id, task_id, sequence, prompt, mode, model,
+			     reasoning_effort, context_tier, status, error_message, created_at,
+			     started_at, finished_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)`,
 			turnID, conversation.ID, taskID, sequence, prompt, mode,
+			settings.Model, settings.ReasoningEffort, settings.ContextTier,
 			ConversationTurnQueued, now); err != nil {
 			if isUniqueViolation(err) {
 				return ErrConflict
@@ -461,7 +484,9 @@ func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, tur
 		}
 		turn = &ConversationTurn{
 			ID: turnID, ConversationID: conversation.ID, TaskID: taskID,
-			Sequence: sequence, Prompt: prompt, Mode: mode, Status: ConversationTurnQueued,
+			Sequence: sequence, Prompt: prompt, Mode: mode, Model: settings.Model,
+			ReasoningEffort: settings.ReasoningEffort, ContextTier: settings.ContextTier,
+			Status:    ConversationTurnQueued,
 			CreatedAt: time.Unix(now, 0).UTC(),
 		}
 		return tx.Commit()
@@ -548,7 +573,8 @@ func (s *Store) ConversationHasQueuedTurn(ctx context.Context, conversationID st
 func (s *Store) ListActiveConversationTurns(ctx context.Context) ([]*ConversationTurn, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.id, t.conversation_id, t.task_id, t.sequence, t.prompt, t.mode,
-		       t.status, t.error_message, t.created_at, t.started_at, t.finished_at
+		       t.model, t.reasoning_effort, t.context_tier, t.status,
+		       t.error_message, t.created_at, t.started_at, t.finished_at
 		  FROM conversation_turn t
 		  JOIN conversation c ON c.active_turn_id=t.id
 		 WHERE c.archived_at IS NULL`)

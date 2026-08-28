@@ -458,6 +458,23 @@ paths:
         "409": { description: The GitHub Copilot connection changed while this request was validating }
         "502": { description: GitHub could not validate the token }
         "503": { description: GitHub Copilot is unavailable }
+  /v1/agents/github-copilot/models:
+    get:
+      operationId: listGitHubCopilotModels
+      tags: [apps]
+      summary: List models available to the connected GitHub Copilot account.
+      description: >
+        Returns only sanitized model metadata for the connected account. The
+        GitHub PAT, SDK session state, policy, and billing data never appear in
+        this response.
+      responses:
+        "200":
+          description: Available Copilot models
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CopilotModelCatalog" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
 
   /v1/presets:
     get:
@@ -1953,6 +1970,13 @@ components:
         sequence: { type: integer }
         prompt: { type: string }
         mode: { type: string, enum: [interactive, plan, autopilot] }
+        model:
+          type: string
+          description: The model ID selected when this turn was queued. Empty means the configured sandboxd default or provider default was used.
+        reasoning_effort:
+          type: string
+          description: The selected model-specific reasoning effort. Empty uses the model default.
+        context_tier: { type: string, enum: [default, long_context] }
         status: { type: string, enum: [queued, running, waiting_input, waiting_plan, cancelling, succeeded, failed, cancelled] }
         error_message: { type: string }
         created_at: { type: string, format: date-time }
@@ -2015,6 +2039,22 @@ components:
       properties:
         prompt: { type: string }
         mode: { type: string, enum: [interactive, plan, autopilot], default: interactive }
+        model:
+          type: string
+          maxLength: 256
+          description: >
+            Optional model ID from GET /v1/agents/github-copilot/models. Empty
+            resolves to sandboxd's configured GitHub Copilot default, if any,
+            otherwise the provider's default.
+        reasoning_effort:
+          type: string
+          maxLength: 64
+          description: Optional effort supported by the selected model. Empty uses that model's default.
+        context_tier:
+          type: string
+          enum: [default, long_context]
+          default: default
+          description: long_context requires an explicit or configured model.
     ConversationSubmission:
       type: object
       properties:
@@ -2022,7 +2062,28 @@ components:
         task_id: { type: string }
         status: { type: string, enum: [queued] }
         mode: { type: string, enum: [interactive, plan, autopilot] }
+        model: { type: string }
+        reasoning_effort: { type: string }
+        context_tier: { type: string, enum: [default, long_context] }
         queue_position: { type: integer, minimum: 1 }
+    CopilotModel:
+      type: object
+      required: [id, name, supported_reasoning_efforts]
+      properties:
+        id: { type: string, description: SDK model identifier accepted when queuing a Copilot conversation turn. }
+        name: { type: string, description: Safe display name for the model. }
+        supported_reasoning_efforts:
+          type: array
+          items: { type: string }
+        default_reasoning_effort: { type: string }
+        max_context_window_tokens: { type: integer, minimum: 1 }
+    CopilotModelCatalog:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items: { $ref: "#/components/schemas/CopilotModel" }
     ConversationInputAnswerRequest:
       type: object
       required: [answer]

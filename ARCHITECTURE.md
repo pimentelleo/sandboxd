@@ -17,7 +17,8 @@ High level:
 - **Traefik** — edge router; publishes a preview URL per running sandbox.
 - **runtimed** — in-sandbox supervisor + task runner, baked into the base image.
 - **GitHub Copilot coordinator** — control-plane-owned durable conversations,
-  native input/plan callbacks, and per-turn hosted-task finalization.
+  native input/plan callbacks, private model discovery, and per-turn
+  hosted-task finalization.
 - **sandbox.yaml** — the per-app runtime manifest runtimed reads (web/workers/
   build/health/restart_after_task).
 - **Presets / templates / base image** — the create-time layering (see
@@ -101,6 +102,8 @@ A small React SPA served behind the same Traefik (`console.<domain>`). It is a
 apps, picks presets, drives sandbox lifecycle + preview, and runs the agent
 chat. GitHub Copilot uses a durable per-sandbox conversation with native
 questions, plan approval, FIFO follow-up messages, and replayable SSE events;
+each queued turn also snapshots its selected entitled model, reasoning effort,
+and context tier;
 other providers retain **persistent task history + per-task revert**. It also
 **browses and edits workspace files** (a tree + an in-browser CodeMirror editor, lazy-loaded,
 with inline git status/diff), **reviews and pushes with Git** (diff viewer,
@@ -137,12 +140,13 @@ only the lifecycle tunables). Contract: `docs/openapi.yaml`.
   `POST /v1/sandboxes/{id}/tasks/{taskId}/revert` restores the worktree to a
   checkpoint. Distinct from snapshots (full workspace freezes) and user commits.
 - **Copilot conversations** — one active `github-copilot` transcript per
-  sandbox in SQLite. Each turn captures its mode and is serialized FIFO. Native
-  input and plan callbacks are persisted before being rendered, and redacted
-  conversation events provide an SSE reconnect cursor. A stopped sandbox wakes
-  before an accepted response resumes workspace operations. The control plane
-  owns the SDK session keyed by conversation ID, so SDK state and the GitHub PAT
-  never enter a workspace.
+  sandbox in SQLite. Each turn captures its mode, model, reasoning effort, and
+  context tier and is serialized FIFO. Native input and plan callbacks are
+  persisted before being rendered, and redacted conversation events provide an
+  SSE reconnect cursor. A stopped sandbox wakes before an accepted response
+  resumes workspace operations. A separate control-plane SDK client obtains the
+  account's allowlisted model catalog; its state, all live SDK sessions, and the
+  GitHub PAT never enter a workspace.
 
 ## Runtime model
 

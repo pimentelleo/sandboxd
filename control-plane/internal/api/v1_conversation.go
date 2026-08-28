@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -28,16 +29,19 @@ type v1Conversation struct {
 }
 
 type v1ConversationTurn struct {
-	ID           string `json:"id"`
-	TaskID       string `json:"task_id"`
-	Sequence     int64  `json:"sequence"`
-	Prompt       string `json:"prompt"`
-	Mode         string `json:"mode"`
-	Status       string `json:"status"`
-	ErrorMessage string `json:"error_message,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	StartedAt    string `json:"started_at,omitempty"`
-	FinishedAt   string `json:"finished_at,omitempty"`
+	ID              string `json:"id"`
+	TaskID          string `json:"task_id"`
+	Sequence        int64  `json:"sequence"`
+	Prompt          string `json:"prompt"`
+	Mode            string `json:"mode"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ContextTier     string `json:"context_tier"`
+	Status          string `json:"status"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+	CreatedAt       string `json:"created_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+	FinishedAt      string `json:"finished_at,omitempty"`
 }
 
 type v1ConversationMessage struct {
@@ -89,8 +93,11 @@ type v1ConversationEvent struct {
 }
 
 type v1ConversationMessageReq struct {
-	Prompt string `json:"prompt"`
-	Mode   string `json:"mode,omitempty"`
+	Prompt          string `json:"prompt"`
+	Mode            string `json:"mode,omitempty"`
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ContextTier     string `json:"context_tier,omitempty"`
 }
 
 type v1ConversationAnswerReq struct {
@@ -141,7 +148,9 @@ func v1ConversationSnapshotFromStore(snapshot *store.ConversationSnapshot) v1Con
 	for _, turn := range snapshot.Turns {
 		item := v1ConversationTurn{
 			ID: turn.ID, TaskID: turn.TaskID, Sequence: turn.Sequence, Prompt: turn.Prompt,
-			Mode: turn.Mode, Status: turn.Status, CreatedAt: turn.CreatedAt.UTC().Format(time.RFC3339),
+			Mode: turn.Mode, Model: turn.Model, ReasoningEffort: turn.ReasoningEffort,
+			ContextTier: turn.ContextTier, Status: turn.Status,
+			CreatedAt: turn.CreatedAt.UTC().Format(time.RFC3339),
 		}
 		if turn.ErrorMessage.Valid {
 			item.ErrorMessage = turn.ErrorMessage.String
@@ -232,17 +241,23 @@ func (s *Server) v1ConversationSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	coordinator := s.conversationCoordinator()
-	turn, position, err := coordinator.Submit(r.Context(), id, prompt, mode)
+	turn, position, err := coordinator.Submit(r.Context(), id, prompt, mode,
+		request.Model, request.ReasoningEffort, request.ContextTier)
 	if err != nil {
 		writeConversationActionError(w, err)
 		return
 	}
 	s.auditAction(r, audit.Entry{
 		Action: "conversation.message.create", Target: id,
-		Detail: map[string]any{"turn_id": turn.ID, "mode": turn.Mode},
+		Detail: map[string]any{
+			"turn_id": turn.ID, "mode": turn.Mode, "model": turn.Model,
+			"reasoning_effort": turn.ReasoningEffort, "context_tier": turn.ContextTier,
+		},
 	})
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id": turn.ID, "task_id": turn.TaskID, "status": turn.Status, "mode": turn.Mode,
+		"model": turn.Model, "reasoning_effort": turn.ReasoningEffort,
+		"context_tier":   turn.ContextTier,
 		"queue_position": position,
 	})
 }
@@ -494,6 +509,12 @@ func writeConversationActionError(w http.ResponseWriter, err error) {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "GitHub Copilot conversations are unavailable")
 	case errors.Is(err, errInvalidConversation):
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid Copilot conversation request")
+	case errors.Is(err, copilot.ErrInvalidModelSelection):
+		writeV1Err(w, http.StatusBadRequest, "invalid_model_selection", "choose an available Copilot model and compatible settings")
+	case errors.Is(err, copilot.ErrNotConnected), errors.Is(err, copilot.ErrCredentialChanged):
+		writeV1Err(w, http.StatusConflict, "agent_not_connected", "GitHub Copilot connection changed; reconnect and try again")
+	case errors.Is(err, copilot.ErrModelCatalogUnavailable):
+		writeV1Err(w, http.StatusServiceUnavailable, "model_catalog_unavailable", "Copilot model choices are temporarily unavailable")
 	case errors.Is(err, errSandboxUnavailable):
 		writeV1Err(w, http.StatusBadGateway, "sandbox_unavailable", "the sandbox is unavailable")
 	default:
