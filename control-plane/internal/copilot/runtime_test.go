@@ -3,6 +3,8 @@ package copilot
 import (
 	"strings"
 	"testing"
+
+	sdk "github.com/github/copilot-sdk/go"
 )
 
 func TestAvailableToolsExposeNativeInteractionsOnlyWhenHandlersExist(t *testing.T) {
@@ -62,6 +64,36 @@ func TestConversationSystemPromptRequiresNativeClarification(t *testing.T) {
 	if !strings.Contains(prompt, "native ask_user tool") ||
 		!strings.Contains(prompt, "Never present a blocking question only as normal assistant text") {
 		t.Fatalf("conversation instructions do not require native clarification: %q", prompt)
+	}
+}
+
+func TestSDKSessionConfigsForwardModelControls(t *testing.T) {
+	config := RuntimeConfig{
+		Model:           "gpt-5.3-codex",
+		ReasoningEffort: "high",
+		ContextTier:     ContextTierLongContext,
+		Token:           "private-token",
+		Workdir:         "/private/workdir",
+	}
+	tools := []sdk.Tool{{Name: "read_file"}}
+	correlation := newInteractionCorrelator()
+	t.Cleanup(correlation.close)
+
+	create := sdkSessionConfig(config, tools, correlation)
+	resume := sdkResumeSessionConfig(config, tools, correlation)
+	for _, candidate := range []struct {
+		name            string
+		model           string
+		reasoningEffort string
+		contextTier     sdk.ContextTier
+	}{
+		{"create", create.Model, create.ReasoningEffort, create.ContextTier},
+		{"resume", resume.Model, resume.ReasoningEffort, resume.ContextTier},
+	} {
+		if candidate.model != config.Model || candidate.reasoningEffort != config.ReasoningEffort ||
+			candidate.contextTier != sdk.ContextTier(config.ContextTier) {
+			t.Fatalf("%s config did not preserve model controls: %#v", candidate.name, candidate)
+		}
 	}
 }
 

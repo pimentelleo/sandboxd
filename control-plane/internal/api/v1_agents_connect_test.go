@@ -203,6 +203,10 @@ func TestGitHubCopilotPATRejectsInvalidRequest(t *testing.T) {
 }
 
 func newCopilotManagerForAPITest(t *testing.T, client *http.Client, baseURL string) *copilot.Manager {
+	return newCopilotManagerWithRuntimeForAPITest(t, client, baseURL, apiCopilotRuntime{})
+}
+
+func newCopilotManagerWithRuntimeForAPITest(t *testing.T, client *http.Client, baseURL string, runtime copilot.RuntimeClient) *copilot.Manager {
 	t.Helper()
 	stateDir := t.TempDir()
 	cipher, err := secrets.Load("", filepath.Join(stateDir, "secrets.key"))
@@ -214,7 +218,7 @@ func newCopilotManagerForAPITest(t *testing.T, client *http.Client, baseURL stri
 		Cipher:     cipher,
 		HTTPClient: client,
 		UserURL:    baseURL + "/user",
-		Runtime:    apiCopilotRuntime{},
+		Runtime:    runtime,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -234,6 +238,100 @@ func (apiCopilotRuntime) Resume(context.Context, string, copilot.RuntimeConfig) 
 
 func (apiCopilotRuntime) Delete(context.Context, string) error {
 	return nil
+}
+
+type apiCatalogRuntime struct {
+	apiCopilotRuntime
+	models []copilot.ModelInfo
+	err    error
+	calls  int
+}
+
+func (r *apiCatalogRuntime) ListModels(context.Context, string) ([]copilot.ModelInfo, error) {
+	r.calls++
+	return r.models, r.err
+}
+
+func (*apiCatalogRuntime) InvalidateModelCatalog() {}
+
+func TestGitHubCopilotModelsEndpointReturnsOnlyCatalogMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	}))
+	defer server.Close()
+
+	limit := 256000
+	runtime := &apiCatalogRuntime{models: []copilot.ModelInfo{{
+		ID: "gpt-5.3-codex", Name: "GPT-5.3 Codex",
+		SupportedReasoningEfforts: []string{"low", "high"},
+		DefaultReasoningEffort:    "high",
+		MaxContextWindowTokens:    &limit,
+	}}}
+	manager := newCopilotManagerWithRuntimeForAPITest(t, server.Client(), server.URL, runtime)
+	s := &Server{Copilot: manager}
+	connect := httptest.NewRecorder()
+	s.v1GitHubCopilotPAT(connect, httptest.NewRequest(http.MethodPost, "/v1/agents/github-copilot/pat",
+		strings.NewReader(`{"token":`+jsonString(apiTestFineGrainedPAT)+`}`)))
+	if connect.Code != http.StatusOK {
+		t.Fatalf("connect = %d: %s", connect.Code, connect.Body.String())
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		w := httptest.NewRecorder()
+		s.v1GitHubCopilotModels(w, httptest.NewRequest(http.MethodGet, "/v1/agents/github-copilot/models", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("models = %d: %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), apiTestFineGrainedPAT) {
+			t.Fatalf("model catalog exposed credential: %s", w.Body.String())
+		}
+		var response struct {
+			Models []copilot.ModelInfo `json:"models"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Models) != 1 || response.Models[0].ID != "gpt-5.3-codex" ||
+			response.Models[0].DefaultReasoningEffort != "high" ||
+			response.Models[0].MaxContextWindowTokens == nil ||
+			*response.Models[0].MaxContextWindowTokens != limit {
+			t.Fatalf("model response = %#v", response)
+		}
+	}
+	if runtime.calls != 1 {
+		t.Fatalf("runtime catalog calls = %d; want cache hit on second request", runtime.calls)
+	}
+}
+
+func TestGitHubCopilotModelsEndpointRequiresConnection(t *testing.T) {
+	s := &Server{Copilot: newCopilotManagerForAPITest(t, nil, "")}
+	w := httptest.NewRecorder()
+	s.v1GitHubCopilotModels(w, httptest.NewRequest(http.MethodGet, "/v1/agents/github-copilot/models", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "agent_not_connected") {
+		t.Fatalf("disconnected catalog response = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGitHubCopilotModelsEndpointReportsCatalogFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	}))
+	defer server.Close()
+	runtime := &apiCatalogRuntime{err: errors.New("provider unavailable")}
+	manager := newCopilotManagerWithRuntimeForAPITest(t, server.Client(), server.URL, runtime)
+	if _, err := manager.ConnectPAT(context.Background(), apiTestFineGrainedPAT); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Copilot: manager}
+	w := httptest.NewRecorder()
+	s.v1GitHubCopilotModels(w, httptest.NewRequest(http.MethodGet, "/v1/agents/github-copilot/models", nil))
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "model_catalog_unavailable") {
+		t.Fatalf("failed catalog response = %d: %s", w.Code, w.Body.String())
+	}
 }
 
 // jsonString quotes a string as a JSON literal for embedding in a request body.

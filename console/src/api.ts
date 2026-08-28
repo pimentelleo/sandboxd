@@ -285,6 +285,19 @@ export interface TaskResult {
 // Durable hosted GitHub Copilot conversation state. Unlike task history, these
 // messages and interactions are a resumable provider transcript.
 export type ConversationMode = 'interactive' | 'plan' | 'autopilot'
+export type ContextTier = 'default' | 'long_context'
+export interface CopilotModel {
+  id: string
+  name: string
+  supported_reasoning_efforts: string[]
+  default_reasoning_effort?: string
+  max_context_window_tokens?: number
+}
+export interface ConversationModelSettings {
+  model: string
+  reasoning_effort: string
+  context_tier: ContextTier
+}
 export interface Conversation {
   id: string
   sandbox_id: string
@@ -303,6 +316,9 @@ export interface ConversationTurn {
   sequence: number
   prompt: string
   mode: ConversationMode
+  model?: string
+  reasoning_effort?: string
+  context_tier: ContextTier
   status: string
   error_message?: string
   created_at: string
@@ -345,6 +361,16 @@ export interface ConversationSnapshot {
   interactions: ConversationInteraction[]
   event_cursor: number
   next_queue_slot: number
+}
+export interface ConversationSubmission {
+  id: string
+  task_id: string
+  status: string
+  mode: ConversationMode
+  model?: string
+  reasoning_effort?: string
+  context_tier: ContextTier
+  queue_position: number
 }
 export interface ConversationEvent {
   id: number
@@ -427,6 +453,7 @@ export const api = {
     req<{ provider: string; status: string; method: string; account?: string }>(
       'POST', '/v1/agents/github-copilot/pat', { token },
     ),
+  getGitHubCopilotModels: () => req<{ models: CopilotModel[] }>('GET', '/v1/agents/github-copilot/models'),
   patchSettings: (body: SettingsPatch) => req<Settings>('PATCH', '/v1/settings', body),
 
   // Auth — session lifecycle. The session cookie is HttpOnly, so state is read
@@ -590,9 +617,9 @@ export const api = {
     `/v1/sandboxes/${id}/tasks/${taskId}/events`,
   getConversation: (sandboxId: string) =>
     req<ConversationSnapshot>('GET', `/v1/sandboxes/${sandboxId}/conversation`),
-  sendConversationMessage: (sandboxId: string, prompt: string, mode: ConversationMode) =>
-    req<{ id: string; task_id: string; status: string; mode: ConversationMode; queue_position: number }>(
-      'POST', `/v1/sandboxes/${sandboxId}/conversation/messages`, { prompt, mode },
+  sendConversationMessage: (sandboxId: string, prompt: string, mode: ConversationMode, settings: ConversationModelSettings) =>
+    req<ConversationSubmission>(
+      'POST', `/v1/sandboxes/${sandboxId}/conversation/messages`, { prompt, mode, ...settings },
     ),
   answerConversationInteraction: (sandboxId: string, interactionId: string, answer: string) =>
     req<{ id: string; status: string }>(

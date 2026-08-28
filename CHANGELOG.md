@@ -11,6 +11,8 @@ patch** — each lands the meaningful changes merged since the last one — and 
 ### Added
 - Selectable AdonisJS v7 Hypermedia preset with Edge, Alpine.js, persistent SQLite,
   a compiled server, and advisory imported-project detection.
+- GitHub Copilot conversation controls for entitled models, model-specific
+  reasoning effort, and context tier, with immutable per-turn settings.
 
 ### Fixed
 - GitHub Copilot conversations now present native clarification and plan-approval

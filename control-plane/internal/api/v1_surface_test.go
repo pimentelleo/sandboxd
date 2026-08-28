@@ -14,6 +14,7 @@ var requiredPublicSurface = []string{
 	"GET /v1/settings",
 	"PATCH /v1/settings",
 	"GET /v1/agents",
+	"GET /v1/agents/github-copilot/models",
 	"GET /v1/presets",
 	"POST /v1/git-credentials",
 	"GET /v1/git-credentials",

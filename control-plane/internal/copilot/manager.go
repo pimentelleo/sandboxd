@@ -65,6 +65,8 @@ type Manager struct {
 	activeConversations  map[string]activeTask
 	generations          map[string]uint64
 	runtime              RuntimeClient
+	modelCatalog         []ModelInfo
+	modelCatalogFetch    *modelCatalogFetch
 }
 
 // New initializes state without starting the SDK runtime or contacting GitHub.
@@ -114,10 +116,17 @@ func New(cfg Config) (*Manager, error) {
 		if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
 			return nil, fmt.Errorf("create copilot runtime directory: %w", err)
 		}
-		m.runtime = &sdkRuntime{client: sdk.NewClient(&sdk.ClientOptions{
-			Mode: sdk.ModeEmpty, BaseDirectory: runtimeDir, WorkingDirectory: runtimeDir,
-			UseLoggedInUser: sdk.Bool(false), LogLevel: "error",
-		})}
+		catalogDir := filepath.Join(cfg.StateDir, "copilot-model-catalog")
+		if err := os.MkdirAll(catalogDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create Copilot model catalog directory: %w", err)
+		}
+		m.runtime = &sdkRuntime{
+			client: sdk.NewClient(&sdk.ClientOptions{
+				Mode: sdk.ModeEmpty, BaseDirectory: runtimeDir, WorkingDirectory: runtimeDir,
+				UseLoggedInUser: sdk.Bool(false), LogLevel: "error",
+			}),
+			modelCatalogBaseDirectory: catalogDir,
+		}
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -157,6 +166,7 @@ func (m *Manager) Disconnect() error {
 		m.activeConversations = activeConversations
 	} else {
 		m.credentialGeneration++
+		m.invalidateModelCatalogLocked()
 	}
 	m.mu.Unlock()
 	if err != nil {
@@ -179,6 +189,7 @@ func (m *Manager) Disconnect() error {
 			_ = m.runtime.Delete(context.Background(), sessionID)
 		}
 	}
+	m.invalidateRuntimeModelCatalog()
 	return err
 }
 

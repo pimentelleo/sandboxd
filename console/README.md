@@ -53,6 +53,12 @@ commands. The transcript and interaction cards survive a page reload or a
 sandbox sleep, and the console reconnects to the redacted SSE stream from its
 durable event cursor.
 
+The Copilot composer loads the connected account's safe model catalog and lets
+the user choose a model, one of its supported reasoning efforts, and standard
+or long context for each message. A message can still use the sandboxd/Copilot
+default if catalog discovery is unavailable. The selected values are sent with
+the message and are immutable once that turn enters the server-side FIFO queue.
+
 New App offers a **runtime preset** picker (React/Vite, Next.js, AdonisJS,
 Node/Express, FastAPI, Worker), data-driven from `GET /v1/presets`; the chosen preset is stored
 on the app and applied to its sandbox.

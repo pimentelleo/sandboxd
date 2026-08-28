@@ -23,7 +23,7 @@ func TestInterruptConversationTurnPersistsTerminalTaskResult(t *testing.T) {
 		t.Fatalf("create conversation: %v", err)
 	}
 	turn, _, err := st.EnqueueConversationTurn(ctx, conversation.ID, "turn-1", "task-1",
-		"make the dashboard clearer", ConversationModeInteractive)
+		"make the dashboard clearer", ConversationModeInteractive, ConversationTurnSettings{})
 	if err != nil {
 		t.Fatalf("enqueue turn: %v", err)
 	}
@@ -67,7 +67,9 @@ func TestSnapshotActiveConversationIncludesSingleCursorForStoredState(t *testing
 		t.Fatalf("create conversation: %v", err)
 	}
 	turn, _, err := st.EnqueueConversationTurn(ctx, conversation.ID, "turn-snapshot", "task-snapshot",
-		"build a form", ConversationModeInteractive)
+		"build a form", ConversationModeInteractive, ConversationTurnSettings{
+			Model: "gpt-5.3-codex", ReasoningEffort: "high", ContextTier: "long_context",
+		})
 	if err != nil {
 		t.Fatalf("enqueue turn: %v", err)
 	}
@@ -91,5 +93,9 @@ func TestSnapshotActiveConversationIncludesSingleCursorForStoredState(t *testing
 	}
 	if len(snapshot.Messages) != 2 || snapshot.Messages[1].Content != "I will build it." {
 		t.Fatalf("snapshot messages = %#v", snapshot.Messages)
+	}
+	if len(snapshot.Turns) != 1 || snapshot.Turns[0].Model != "gpt-5.3-codex" ||
+		snapshot.Turns[0].ReasoningEffort != "high" || snapshot.Turns[0].ContextTier != "long_context" {
+		t.Fatalf("snapshot model settings = %#v", snapshot.Turns)
 	}
 }

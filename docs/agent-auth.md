@@ -111,6 +111,13 @@ response resumes workspace tools. A control-plane restart attempts to release
 the prepared runtimed task record before recording an unrecoverable in-flight
 provider call as interrupted and admitting subsequent work.
 
+`GET /v1/agents/github-copilot/models` lists the connected account's currently
+available model IDs, display names, supported reasoning efforts, default effort,
+and reported context limit. This catalog is fetched and cached only in the
+control plane with a separate private SDK client; it is cleared when the PAT is
+replaced or disconnected. The response never includes the PAT, SDK session
+state, billing data, or provider policy.
+
 Both paths give the SDK only five custom tools: `list_files`, `read_file`,
 `search_files`, `write_file`, and `run_command`. Each tool is executed through
 a bounded `docker exec` as user `sandbox`, with workdir
@@ -126,6 +133,14 @@ conversation archives its transcript and starts a fresh one. Purging or
 disconnecting removes retained session mappings and outstanding capabilities.
 Connecting a different GitHub account also cancels prior active tasks before it
 accepts the new credential.
+
+Each conversational message may set `model`, `reasoning_effort`, and
+`context_tier`. An empty model resolves to sandboxd's GitHub Copilot default
+when configured, otherwise Copilot chooses its default. An effort must be
+advertised by the selected model, and `long_context` requires a selected or
+configured model. sandboxd validates and stores the normalized settings with
+the turn before it enters the FIFO queue, so every turn runs with the exact
+selection it was submitted with.
 
 ### OpenCode Zen: subscription vs pay-as-you-go
 
@@ -224,9 +239,11 @@ over SSE (`/tasks/{taskId}/events`) and a final result ends the task.
 
 For the conversational Copilot API, submit
 `POST /v1/sandboxes/{id}/conversation/messages` with
-`{"prompt":"...","mode":"interactive"}`. Modes are `interactive`, `plan`, and
-`autopilot`; a leading `/interactive`, `/plan`, or `/autopilot` in the prompt
-overrides the JSON mode. Get the initial transcript from
+`{"prompt":"...","mode":"interactive","model":"<catalog id>","reasoning_effort":"high","context_tier":"long_context"}`.
+`model`, `reasoning_effort`, and `context_tier` are optional; retrieve valid
+model choices from `GET /v1/agents/github-copilot/models`. Modes are
+`interactive`, `plan`, and `autopilot`; a leading `/interactive`, `/plan`, or
+`/autopilot` in the prompt overrides the JSON mode. Get the initial transcript from
 `GET /v1/sandboxes/{id}/conversation`, then connect
 `GET /v1/sandboxes/{id}/conversation/events?after=<event_cursor>`. Answer
 native input and plan cards only through their returned interaction endpoint.

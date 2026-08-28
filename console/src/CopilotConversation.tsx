@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  api, ConversationEvent, ConversationInteraction, ConversationMessage,
-  ConversationMode, ConversationSnapshot, ConversationTurn, Sandbox,
+  api, ContextTier, ConversationEvent, ConversationInteraction, ConversationMessage,
+  ConversationMode, ConversationSnapshot, ConversationTurn, CopilotModel, Sandbox,
 } from './api'
 import { c, Card, Btn, H, Input, mono, Pill } from './design/kit'
 
 const ACTIVE_TURN_STATUSES = new Set(['running', 'waiting_input', 'waiting_plan', 'cancelling'])
+type CatalogState = 'loading' | 'ready' | 'empty' | 'unavailable' | 'not_connected'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -115,6 +116,13 @@ function conversationBubble(message: ConversationMessage) {
   )
 }
 
+function contextLimitHint(model: CopilotModel | undefined) {
+  if (!model?.max_context_window_tokens) {
+    return model ? 'Context limit not reported by Copilot.' : 'Choose a model to enable long context.'
+  }
+  return `Up to ${Math.round(model.max_context_window_tokens / 1000).toLocaleString()}k tokens of context.`
+}
+
 function InputInteraction({ interaction, sandboxId, onDone, onError }: { interaction: ConversationInteraction; sandboxId: string; onDone: () => void; onError: (message: string) => void }) {
   const [answer, setAnswer] = useState('')
   const [sending, setSending] = useState(false)
@@ -174,6 +182,11 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
   const [snapshot, setSnapshot] = useState<ConversationSnapshot | null>(null)
   const [text, setText] = useState('')
   const [mode, setMode] = useState<ConversationMode>('interactive')
+  const [models, setModels] = useState<CopilotModel[]>([])
+  const [catalogState, setCatalogState] = useState<CatalogState>('loading')
+  const [model, setModel] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState('')
+  const [contextTier, setContextTier] = useState<ContextTier>('default')
   const [loading, setLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -182,6 +195,18 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
   const snapshotRef = useRef<ConversationSnapshot | null>(null)
   const cursorRef = useRef(0)
   const sandboxId = sb?.id
+
+  const loadModels = useCallback(async () => {
+    setCatalogState('loading')
+    try {
+      const response = await api.getGitHubCopilotModels()
+      setModels(response.models)
+      setCatalogState(response.models.length > 0 ? 'ready' : 'empty')
+    } catch (error) {
+      setModels([])
+      setCatalogState((error as { status?: number }).status === 409 ? 'not_connected' : 'unavailable')
+    }
+  }, [])
 
   const loadSnapshot = useCallback(async () => {
     if (!sandboxId) { snapshotRef.current = null; setSnapshot(null); return }
@@ -201,6 +226,7 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
   }, [sandboxId, onError])
 
   useEffect(() => { loadSnapshot() }, [loadSnapshot])
+  useEffect(() => { void loadModels() }, [loadModels])
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight }, [snapshot])
 
   useEffect(() => {
@@ -239,13 +265,24 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
   const queued = turns.filter((turn) => turn.status === 'queued')
   const pending = (snapshot?.interactions || []).filter((interaction) => interaction.status === 'pending')
   const resetAllowed = !active && queued.length === 0
+  const selectedModel = models.find((candidate) => candidate.id === model)
+  const reasoningEfforts = selectedModel?.supported_reasoning_efforts || []
+  const catalogReady = catalogState === 'ready'
+  const setSelectedModel = (nextModel: string) => {
+    setModel(nextModel)
+    const next = models.find((candidate) => candidate.id === nextModel)
+    setReasoningEffort((current) => next?.supported_reasoning_efforts.includes(current) ? current : '')
+    if (!nextModel) setContextTier('default')
+  }
   const submit = async () => {
     if (!sandboxId || sending) return
     const parsed = parseConversationPrompt(text, mode)
     if (!parsed.prompt) { if (text.trim().startsWith('/')) setMode(parsed.mode); return }
     setSending(true)
     try {
-      await api.sendConversationMessage(sandboxId, parsed.prompt, parsed.mode)
+      await api.sendConversationMessage(sandboxId, parsed.prompt, parsed.mode, {
+        model, reasoning_effort: reasoningEffort, context_tier: contextTier,
+      })
       setText('')
       setMode(parsed.mode)
       await loadSnapshot()
@@ -285,12 +322,39 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
           : <InputInteraction key={interaction.id} interaction={interaction} sandboxId={sandboxId!} onDone={loadSnapshot} onError={onError} />)}
         {snapshot?.conversation?.last_error && <div style={{ color: c.bad, fontSize: 12.5 }}>{snapshot.conversation.last_error}</div>}
       </div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', padding: 10, borderTop: `1px solid ${c.border}`, background: c.panel3 }}>
-        <select value={mode} onChange={(event) => setMode(event.target.value as ConversationMode)} aria-label="Conversation mode" data-testid="copilot-mode" style={selectStyle}>
-          <option value="interactive">Interactive</option><option value="plan">Plan</option><option value="autopilot">Autopilot</option>
-        </select>
-        <textarea value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit() } }} placeholder={sandboxId ? 'Message Copilot…' : 'Create a sandbox to start a conversation'} aria-label="Message Copilot" data-testid="copilot-prompt" rows={1} disabled={!sandboxId || sending} style={{ flex: 1, resize: 'none', background: c.panel, border: `1px solid ${c.border2}`, borderRadius: 7, padding: '8px 11px', color: c.fg, fontFamily: 'inherit', fontSize: 12.5 }} />
-        <Btn variant="primary" disabled={!sandboxId || sending || !text.trim()} onClick={submit} data-testid="copilot-send">Send</Btn>
+      <div style={{ borderTop: `1px solid ${c.border}`, background: c.panel3 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: 8, padding: '8px 10px', borderBottom: `1px solid ${c.border}` }}>
+          <label style={composerLabelStyle}>Model
+            <select value={model} onChange={(event) => setSelectedModel(event.target.value)} disabled={!catalogReady || sending} aria-label="Copilot model" data-testid="copilot-model" style={{ ...selectStyle, minWidth: 178 }}>
+              <option value="">Sandboxd / Copilot default</option>
+              {models.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+            </select>
+          </label>
+          <label style={composerLabelStyle}>Reasoning
+            <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value)} disabled={!catalogReady || !selectedModel || reasoningEfforts.length === 0 || sending} aria-label="Reasoning effort" data-testid="copilot-reasoning-effort" style={selectStyle}>
+              <option value="">Model default</option>
+              {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+            </select>
+          </label>
+          <label style={composerLabelStyle}>Context
+            <select value={contextTier} onChange={(event) => setContextTier(event.target.value as ContextTier)} disabled={sending} aria-describedby="copilot-context-hint" aria-label="Context window" data-testid="copilot-context-tier" style={selectStyle}>
+              <option value="default">Standard</option>
+              <option value="long_context" disabled={!selectedModel}>Long context</option>
+            </select>
+          </label>
+          <span id="copilot-context-hint" data-testid="copilot-context-hint" style={{ alignSelf: 'center', color: c.muted2, fontSize: 11.5 }}>{contextLimitHint(selectedModel)}</span>
+          {catalogState === 'loading' && <span style={{ alignSelf: 'center', color: c.muted2, fontSize: 11.5 }}>Loading models…</span>}
+          {catalogState === 'empty' && <span style={{ alignSelf: 'center', color: c.muted2, fontSize: 11.5 }}>No selectable models returned.</span>}
+          {catalogState === 'not_connected' && <span role="status" data-testid="copilot-model-catalog-error" style={{ alignSelf: 'center', color: c.warn, fontSize: 11.5 }}>Connect GitHub Copilot to load models.</span>}
+          {catalogState === 'unavailable' && <span role="status" data-testid="copilot-model-catalog-error" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, alignSelf: 'center', color: c.warn, fontSize: 11.5 }}>Models are temporarily unavailable.<Btn sm variant="ghost" disabled={sending} onClick={loadModels} data-testid="copilot-model-retry">Retry</Btn></span>}
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', padding: 10 }}>
+          <select value={mode} onChange={(event) => setMode(event.target.value as ConversationMode)} aria-label="Conversation mode" data-testid="copilot-mode" style={selectStyle}>
+            <option value="interactive">Interactive</option><option value="plan">Plan</option><option value="autopilot">Autopilot</option>
+          </select>
+          <textarea value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit() } }} placeholder={sandboxId ? 'Message Copilot…' : 'Create a sandbox to start a conversation'} aria-label="Message Copilot" data-testid="copilot-prompt" rows={1} disabled={!sandboxId || sending} style={{ flex: 1, resize: 'none', background: c.panel, border: `1px solid ${c.border2}`, borderRadius: 7, padding: '8px 11px', color: c.fg, fontFamily: 'inherit', fontSize: 12.5 }} />
+          <Btn variant="primary" disabled={!sandboxId || sending || !text.trim()} onClick={submit} data-testid="copilot-send">Send</Btn>
+        </div>
       </div>
     </Card>
     </div>
@@ -298,3 +362,4 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
 }
 
 const selectStyle: React.CSSProperties = { background: c.bg, border: `1px solid ${c.border2}`, borderRadius: 7, padding: '5px 7px', color: c.fg, fontSize: 11.5 }
+const composerLabelStyle: React.CSSProperties = { display: 'grid', gap: 3, color: c.muted, fontSize: 10.5, fontWeight: 600 }

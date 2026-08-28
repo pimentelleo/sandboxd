@@ -210,8 +210,9 @@ func (c *ConversationCoordinator) Recover(ctx context.Context) {
 }
 
 // Submit creates the first conversation on demand, persists a queued user turn,
-// and starts its worker. It does not require the sandbox to already be running.
-func (c *ConversationCoordinator) Submit(ctx context.Context, sandboxID, prompt, mode string) (*store.ConversationTurn, int, error) {
+// and starts its worker. Model controls are resolved and validated here so
+// settings changes cannot alter a turn while it waits in the FIFO queue.
+func (c *ConversationCoordinator) Submit(ctx context.Context, sandboxID, prompt, mode, model, reasoningEffort, contextTier string) (*store.ConversationTurn, int, error) {
 	if c == nil || c.server == nil || c.server.Copilot == nil {
 		return nil, 0, errConversationUnavailable
 	}
@@ -219,6 +220,13 @@ func (c *ConversationCoordinator) Submit(ctx context.Context, sandboxID, prompt,
 		return nil, 0, errInvalidConversation
 	}
 	if _, err := c.server.Store.Get(ctx, sandboxID); err != nil {
+		return nil, 0, err
+	}
+	if model == "" && c.server.Live != nil {
+		model = c.server.Live.DefaultModel(githubCopilotAgentID)
+	}
+	selection, err := c.server.Copilot.ValidateModelSelection(ctx, model, reasoningEffort, contextTier)
+	if err != nil {
 		return nil, 0, err
 	}
 	conversation, err := c.server.Store.GetActiveConversation(ctx, sandboxID)
@@ -240,7 +248,11 @@ func (c *ConversationCoordinator) Submit(ctx context.Context, sandboxID, prompt,
 		return nil, 0, err
 	}
 	turn, position, err := c.server.Store.EnqueueConversationTurn(
-		ctx, conversation.ID, newULID(), newULID(), prompt, mode)
+		ctx, conversation.ID, newULID(), newULID(), prompt, mode,
+		store.ConversationTurnSettings{
+			Model: selection.Model, ReasoningEffort: selection.ReasoningEffort,
+			ContextTier: selection.ContextTier,
+		})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -381,16 +393,14 @@ func (c *ConversationCoordinator) execute(turn *store.ConversationTurn) {
 	}
 
 	run.setActive(c.server, true)
-	model := ""
-	if c.server.Live != nil {
-		model = c.server.Live.DefaultModel(githubCopilotAgentID)
-	}
 	err = c.server.Copilot.RunConversationTurn(run.budget.Context(), copilot.ConversationTurnRequest{
-		ConversationID: conversation.ID,
-		SandboxID:      run.sandboxID,
-		Prompt:         turn.Prompt,
-		Mode:           turn.Mode,
-		Model:          model,
+		ConversationID:  conversation.ID,
+		SandboxID:       run.sandboxID,
+		Prompt:          turn.Prompt,
+		Mode:            turn.Mode,
+		Model:           turn.Model,
+		ReasoningEffort: turn.ReasoningEffort,
+		ContextTier:     turn.ContextTier,
 		SystemPrompt: agentprompt.Render(agentprompt.Vars{
 			AppDir: "/home/sandbox/workspace/app", Port: webPortOfMust(c.server, run.sandboxID),
 			HealthPath: "/",

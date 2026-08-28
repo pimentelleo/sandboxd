@@ -30,15 +30,17 @@ instead and disclose it in the final response.`
 // accepted directly from a sandbox; the control-plane coordinator supplies the
 // sandbox ID, callbacks, and immutable selected mode.
 type ConversationTurnRequest struct {
-	ConversationID string
-	SandboxID      string
-	Prompt         string
-	Mode           string
-	Model          string
-	SystemPrompt   string
-	OnEvent        func(Envelope)
-	OnUserInput    func(RuntimeInputRequest) (RuntimeInputResponse, error)
-	OnPlan         func(RuntimePlanRequest) (RuntimePlanResponse, error)
+	ConversationID  string
+	SandboxID       string
+	Prompt          string
+	Mode            string
+	Model           string
+	ReasoningEffort string
+	ContextTier     string
+	SystemPrompt    string
+	OnEvent         func(Envelope)
+	OnUserInput     func(RuntimeInputRequest) (RuntimeInputResponse, error)
+	OnPlan          func(RuntimePlanRequest) (RuntimePlanResponse, error)
 }
 
 // RunConversationTurn runs exactly one native SDK turn and leaves its durable
@@ -47,7 +49,8 @@ type ConversationTurnRequest struct {
 func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationTurnRequest) error {
 	if !validIdentifier(request.ConversationID) || !validIdentifier(request.SandboxID) ||
 		len(request.Prompt) == 0 || len(request.Prompt) > maxPrompt ||
-		len(request.Model) > 256 || len(request.SystemPrompt) > maxSystem ||
+		len(request.Model) > 256 || len(request.ReasoningEffort) > 64 ||
+		len(request.ContextTier) > 64 || len(request.SystemPrompt) > maxSystem ||
 		!validConversationMode(request.Mode) {
 		return errors.New("invalid Copilot conversation turn")
 	}
@@ -94,7 +97,8 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 
 	gate := newMutationGate(request.Mode != ConversationModePlan)
 	runtimeConfig := RuntimeConfig{
-		Model: request.Model, Token: token, SystemPrompt: conversationSystemPrompt(request.SystemPrompt),
+		Model: request.Model, ReasoningEffort: request.ReasoningEffort, ContextTier: request.ContextTier,
+		Token: token, SystemPrompt: conversationSystemPrompt(request.SystemPrompt),
 		Workdir: m.runtimeWorkdir(), Tools: conversationTools(request.SandboxID, m.cfg.Executor, gate),
 		OnEvent: func(event RuntimeEvent) {
 			select {
