@@ -6,7 +6,7 @@ import { ConversationSnapshot } from './api'
 
 const sandbox = { id: 'sandbox-1', status: 'stopped' }
 const emptyConversation: ConversationSnapshot = {
-  conversation: null, turns: [], messages: [], interactions: [], event_cursor: 0, next_queue_slot: 0,
+  conversation: null, turns: [], messages: [], interactions: [], children: [], event_cursor: 0, next_queue_slot: 0,
 }
 const modelCatalog = [{
   id: 'gpt-5.3-codex',
@@ -63,6 +63,7 @@ describe('durable GitHub Copilot chat', () => {
         id: 'input-1', turn_id: 'turn-1', sequence: 2, type: 'user_input', status: 'pending',
         question: 'Which region?', choices: ['East US', 'West Europe'], allow_freeform: true, actions: [], created_at: '',
       }],
+      children: [],
       event_cursor: 5, next_queue_slot: 0,
     }
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -146,5 +147,46 @@ describe('durable GitHub Copilot chat', () => {
     fireEvent.click(screen.getByTestId('copilot-model-retry'))
     expect(await screen.findByRole('option', { name: 'GPT-5.3 Codex' })).toBeTruthy()
     expect(screen.queryByTestId('copilot-model-catalog-error')).toBeNull()
+  })
+
+  it('renders isolated delegated changes for review and can cancel active work', async () => {
+    const snapshot: ConversationSnapshot = {
+      conversation: {
+        id: 'conversation-1', sandbox_id: sandbox.id, agent: 'github-copilot', state: 'running',
+        default_mode: 'interactive', active_turn_id: 'turn-1', created_at: '', updated_at: '',
+      },
+      turns: [{ id: 'turn-1', task_id: 'task-1', sequence: 1, prompt: 'Build it', mode: 'interactive', context_tier: 'default', status: 'running', created_at: '' }],
+      messages: [], interactions: [], event_cursor: 5, next_queue_slot: 0,
+      children: [{
+        id: 'child-1', parent_turn_id: 'turn-1', label: 'Add tests', task: 'Add focused tests.',
+        model: 'gpt-5.3-codex', reasoning_effort: 'high', context_tier: 'long_context',
+        status: 'running', patch_state: 'available', changed_files: ['test/app.test.ts'], created_at: '',
+      }],
+    }
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/conversation')) return response(snapshot)
+      if (url.endsWith('/changes/test%2Fapp.test.ts')) {
+        return response({
+          task_id: 'child-1', path: 'test/app.test.ts', base_sha256: 'abc',
+          content: 'test("works", () => {})', deleted: false,
+        })
+      }
+      if (url.endsWith('/children/child-1/cancel')) return response({ ...snapshot.children[0], status: 'cancelling' })
+      return response({})
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', QuietEventSource)
+    render(<CopilotConversation sb={sandbox} agent="github-copilot" setAgent={vi.fn()} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+
+    expect(await screen.findByText('Add tests')).toBeTruthy()
+    expect(screen.getByText('Changes stay isolated until you review and apply them manually.')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('copilot-child-review-child-1-test/app.test.ts'))
+    expect(await screen.findByText('test("works", () => {})')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('copilot-child-cancel-child-1'))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      '/v1/sandboxes/sandbox-1/conversation/children/child-1/cancel',
+      expect.objectContaining({ method: 'POST' }),
+    ))
   })
 })

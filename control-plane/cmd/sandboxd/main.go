@@ -390,7 +390,7 @@ func main() {
 	copilotManager, err := copilot.New(copilot.Config{
 		StateDir: filepath.Join(stateDir, "copilot"),
 		Cipher:   secretsCipher,
-		Executor: copilotDockerExecutor{client: dockerClient},
+		Executor: copilotDockerExecutor{client: dockerClient, store: st},
 		Log:      log.With("component", "copilot"),
 	})
 	if err != nil {
@@ -987,15 +987,31 @@ func (a dockerExecAdapter) Exec(ctx context.Context, name string, cmd []string) 
 
 // copilotDockerExecutor constrains SDK tools to the current sandbox namespace,
 // unprivileged user, and application workspace before invoking docker exec.
-type copilotDockerExecutor struct{ client *docker.Client }
+type copilotDockerExecutor struct {
+	client *docker.Client
+	store  *store.Store
+}
 
 func (a copilotDockerExecutor) ExecScoped(ctx context.Context, request copilot.ScopedExecRequest) (copilot.ScopedExecResult, error) {
-	if a.client == nil {
+	if a.client == nil || a.store == nil {
 		return copilot.ScopedExecResult{}, errors.New("GitHub Copilot executor is unavailable")
 	}
-	if !strings.HasPrefix(request.Container, "s-") || len(request.Container) <= len("s-") ||
+	sandboxID, childID, isChild, validTarget := copilot.WorkspaceToolContainerTarget(request.Container)
+	if !validTarget ||
 		request.User != "sandbox" || request.Workdir != "/home/sandbox/workspace/app" {
 		return copilot.ScopedExecResult{}, errors.New("invalid GitHub Copilot sandbox scope")
+	}
+	if isChild {
+		child, err := a.store.GetConversationChild(ctx, childID)
+		if err != nil || child.Status != store.ConversationChildRunning ||
+			child.WorkerContainer != request.Container {
+			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot worker target is unavailable")
+		}
+	} else {
+		sandbox, err := a.store.Get(ctx, sandboxID)
+		if err != nil || sandbox.Status != "running" || "s-"+sandbox.ID != request.Container {
+			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot sandbox target is unavailable")
+		}
 	}
 	result, err := a.client.ExecScoped(ctx, docker.ScopedExecRequest{
 		Container:   request.Container,

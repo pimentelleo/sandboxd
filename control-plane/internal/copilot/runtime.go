@@ -169,12 +169,16 @@ func availableTools(config RuntimeConfig) []string {
 	if config.OnPlanRequest != nil {
 		tools.AddBuiltIn("exit_plan_mode")
 	}
-	return tools.
-		AddCustom("list_files").
-		AddCustom("read_file").
-		AddCustom("search_files").
-		AddCustom("write_file").
-		AddCustom("run_command").ToSlice()
+	if config.Tools == nil {
+		for _, name := range []string{"list_files", "read_file", "search_files", "write_file", "run_command"} {
+			tools.AddCustom(name)
+		}
+	} else {
+		for _, tool := range config.Tools {
+			tools.AddCustom(tool.Name)
+		}
+	}
+	return tools.ToSlice()
 }
 
 func systemMessage(content string) *sdk.SystemMessageConfig {

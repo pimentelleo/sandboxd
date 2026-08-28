@@ -147,6 +147,7 @@ type ConversationSnapshot struct {
 	Turns         []*ConversationTurn
 	Messages      []*ConversationMessage
 	Interactions  []*ConversationInteraction
+	Children      []*ConversationChild
 	EventCursor   int64
 	NextQueueSlot int
 }
@@ -1016,6 +1017,10 @@ func (s *Store) SnapshotActiveConversation(ctx context.Context, sandboxID string
 	if err != nil {
 		return nil, err
 	}
+	children, err := listConversationChildren(ctx, tx, conversation.ID, 100)
+	if err != nil {
+		return nil, err
+	}
 	cursor, err := latestConversationEventID(ctx, tx, conversation.ID)
 	if err != nil {
 		return nil, err
@@ -1028,7 +1033,8 @@ func (s *Store) SnapshotActiveConversation(ctx context.Context, sandboxID string
 	}
 	snapshot := &ConversationSnapshot{
 		Conversation: conversation, Turns: turns, Messages: messages,
-		Interactions: interactions, EventCursor: cursor, NextQueueSlot: next,
+		Interactions: interactions, Children: children,
+		EventCursor: cursor, NextQueueSlot: next,
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

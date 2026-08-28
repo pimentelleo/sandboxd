@@ -142,6 +142,30 @@ configured model. sandboxd validates and stores the normalized settings with
 the turn before it enters the FIFO queue, so every turn runs with the exact
 selection it was submitted with.
 
+### GitHub Copilot delegated workers
+
+A conversational Copilot parent can delegate independent work with its
+parent-only tools. sandboxd records the work durably, gives a worker a private
+copy of `workspace/app`, and runs it in a separate container on Docker's
+default bridge, not the sandbox/Traefik network. The worker inherits the
+parent turn's model, reasoning effort, and context tier, but it receives no
+provider credential, SDK session, Docker socket, parent workspace mount, or
+delegation tools.
+
+The private copy excludes repository/runtime metadata and common local
+credential files (`.git`, `.runtimed`, `.env*`, `.npmrc`, `.netrc`, and
+`.pypirc`). A worker may use normal outbound networking for package installs.
+When it finishes, sandboxd stores at most 100 bounded replacement/deletion
+records. `GET /v1/sandboxes/{id}/conversation/children` lists safe task
+metadata, and `GET .../children/{childId}/changes/{path}` retrieves one file
+for review. No public API or console action applies a delegated patch
+automatically: the parent must explicitly use its ordinary workspace tools.
+
+At most four delegated workers are active or queued for one conversation and
+16 across the control plane. Each worker has a 20-minute active execution
+budget, can be cancelled, and is interrupted when its parent conversation is
+reset, the sandbox is purged, or Copilot credentials change.
+
 ### OpenCode Zen: subscription vs pay-as-you-go
 
 OpenCode Zen has two gateways, and the same key behaves differently on each.

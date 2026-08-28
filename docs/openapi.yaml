@@ -1476,6 +1476,101 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
 
+  /v1/sandboxes/{id}/conversation/children:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get:
+      operationId: listCopilotConversationChildren
+      tags: [conversations]
+      summary: List isolated delegated Copilot tasks
+      description: >
+        Lists the active conversation's background tasks. Each task works in a
+        private workspace copy and its changes are review-only; this API never
+        applies a task's patch to the parent workspace.
+      responses:
+        "200":
+          description: Delegated task list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [children]
+                properties:
+                  children:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConversationChild" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/children/{childId}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+      - in: path
+        name: childId
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getCopilotConversationChild
+      tags: [conversations]
+      summary: Get an isolated delegated Copilot task
+      responses:
+        "200":
+          description: Delegated task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationChild" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/children/{childId}/changes/{path}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+      - in: path
+        name: childId
+        required: true
+        schema: { type: string }
+      - in: path
+        name: path
+        required: true
+        allowReserved: true
+        schema: { type: string }
+        description: Relative workspace path listed in the task's changed_files.
+    get:
+      operationId: getCopilotConversationChildChange
+      tags: [conversations]
+      summary: Read one reviewable delegated file change
+      description: >
+        Returns one bounded replacement or deletion record from a completed
+        delegated task. The caller must explicitly apply any desired change
+        with normal workspace operations.
+      responses:
+        "200":
+          description: Reviewable file change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationChildChange" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/sandboxes/{id}/conversation/children/{childId}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+      - in: path
+        name: childId
+        required: true
+        schema: { type: string }
+    post:
+      operationId: cancelCopilotConversationChild
+      tags: [conversations]
+      summary: Cancel an isolated delegated Copilot task
+      responses:
+        "200":
+          description: Cancellation requested
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationChild" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
   /v1/sandboxes/{id}/files:
     parameters: [ { $ref: "#/components/parameters/Id" } ]
     get:
@@ -2016,6 +2111,43 @@ components:
         feedback: { type: string }
         created_at: { type: string, format: date-time }
         resolved_at: { type: string, format: date-time }
+    ConversationChild:
+      type: object
+      description: >
+        A Copilot task delegated into an isolated workspace copy. Worker
+        container names, workspace paths, SDK state, and raw patch storage are
+        control-plane private and are never returned.
+      properties:
+        id: { type: string }
+        parent_turn_id: { type: string }
+        label: { type: string }
+        task: { type: string }
+        model: { type: string, description: Model inherited from the parent turn. }
+        reasoning_effort: { type: string, description: Reasoning effort inherited from the parent turn. }
+        context_tier: { type: string, enum: [default, long_context] }
+        status: { type: string, enum: [queued, preparing, running, cancelling, succeeded, failed, cancelled, interrupted] }
+        result: { type: string }
+        error_message: { type: string }
+        patch_state: { type: string, enum: [none, available, unavailable] }
+        changed_files:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+    ConversationChildChange:
+      type: object
+      description: >
+        One bounded file replacement or deletion produced by an isolated
+        delegated task. It is informational and never auto-applied.
+      required: [task_id, path, content, deleted]
+      properties:
+        task_id: { type: string }
+        path: { type: string }
+        base_sha256: { type: string, description: SHA-256 of the file before the delegated task ran; omitted for a new file. }
+        content: { type: string, description: Replacement content. Empty for a deletion or an empty file. }
+        deleted: { type: boolean }
+        mode: { type: integer, minimum: 0, description: POSIX file mode when available. }
     ConversationSnapshot:
       type: object
       properties:
@@ -2031,6 +2163,9 @@ components:
         interactions:
           type: array
           items: { $ref: "#/components/schemas/ConversationInteraction" }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/ConversationChild" }
         event_cursor: { type: integer, minimum: 0 }
         next_queue_slot: { type: integer, minimum: 0 }
     ConversationMessageRequest:

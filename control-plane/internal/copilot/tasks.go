@@ -255,7 +255,9 @@ func (s *streamState) handle(event RuntimeEvent, emit func(Envelope)) bool {
 
 func isBridgeTool(name string) bool {
 	switch name {
-	case "list_files", "read_file", "search_files", "write_file", "run_command":
+	case "list_files", "read_file", "search_files", "write_file", "run_command",
+		"delegate_task", "list_delegated_tasks", "get_delegated_task",
+		"read_delegated_change", "cancel_delegated_task":
 		return true
 	default:
 		return false

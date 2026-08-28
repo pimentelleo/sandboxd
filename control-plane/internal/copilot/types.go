@@ -177,6 +177,58 @@ type RuntimeConfig struct {
 	Tools               []RuntimeTool
 }
 
+// BackgroundTaskRequest is the immutable parent context supplied to the
+// control-plane delegation harness. The custom tool schema exposes only Task
+// and Label, never identifiers or workspace/container paths.
+type BackgroundTaskRequest struct {
+	ConversationID string
+	TurnID         string
+	SandboxID      string
+	Task           string
+	Label          string
+}
+
+// BackgroundTask is the safe, bounded projection a parent Copilot turn may
+// inspect. Worker workspace paths, container names, and SDK session IDs never
+// leave the control plane.
+type BackgroundTask struct {
+	ID              string   `json:"id"`
+	ParentTurnID    string   `json:"parent_turn_id"`
+	Label           string   `json:"label,omitempty"`
+	Task            string   `json:"task"`
+	Model           string   `json:"model,omitempty"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
+	ContextTier     string   `json:"context_tier"`
+	Status          string   `json:"status"`
+	Result          string   `json:"result,omitempty"`
+	ErrorMessage    string   `json:"error_message,omitempty"`
+	PatchState      string   `json:"patch_state"`
+	ChangedFiles    []string `json:"changed_files"`
+}
+
+// BackgroundTaskChange is read one file at a time so a large delegated patch
+// cannot flood a parent model context. The parent decides whether to use its
+// regular write_file tool to apply this content.
+type BackgroundTaskChange struct {
+	TaskID     string `json:"task_id"`
+	Path       string `json:"path"`
+	BaseSHA256 string `json:"base_sha256,omitempty"`
+	Content    string `json:"content,omitempty"`
+	Deleted    bool   `json:"deleted,omitempty"`
+	Mode       uint32 `json:"mode,omitempty"`
+}
+
+// BackgroundDelegate is implemented by the durable API coordinator. It keeps
+// isolated child execution out of the Copilot package while allowing the
+// parent-only tool surface to remain strongly typed and testable.
+type BackgroundDelegate interface {
+	SpawnBackgroundTask(context.Context, BackgroundTaskRequest) (BackgroundTask, error)
+	ListBackgroundTasks(context.Context, string) ([]BackgroundTask, error)
+	GetBackgroundTask(context.Context, string, string) (BackgroundTask, error)
+	ReadBackgroundTaskChange(context.Context, string, string, string) (BackgroundTaskChange, error)
+	CancelBackgroundTask(context.Context, string, string) (BackgroundTask, error)
+}
+
 // RuntimeMessage captures the selected native Copilot agent mode for one turn.
 // Mode is one of plan, interactive, or autopilot.
 type RuntimeMessage struct {

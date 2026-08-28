@@ -17,8 +17,8 @@ High level:
 - **Traefik** — edge router; publishes a preview URL per running sandbox.
 - **runtimed** — in-sandbox supervisor + task runner, baked into the base image.
 - **GitHub Copilot coordinator** — control-plane-owned durable conversations,
-  native input/plan callbacks, private model discovery, and per-turn
-  hosted-task finalization.
+  native input/plan callbacks, private model discovery, isolated delegated
+  workers, and per-turn hosted-task finalization.
 - **sandbox.yaml** — the per-app runtime manifest runtimed reads (web/workers/
   build/health/restart_after_task).
 - **Presets / templates / base image** — the create-time layering (see
@@ -103,7 +103,11 @@ apps, picks presets, drives sandbox lifecycle + preview, and runs the agent
 chat. GitHub Copilot uses a durable per-sandbox conversation with native
 questions, plan approval, FIFO follow-up messages, and replayable SSE events;
 each queued turn also snapshots its selected entitled model, reasoning effort,
-and context tier;
+and context tier. The coordinator can spawn bounded delegated workers on the
+default Docker bridge rather than the shared preview network. Each worker gets
+a private workspace copy and returns only a structured review patch; it cannot
+reach the parent mount, Docker socket, Traefik, or Copilot credentials, and its
+changes are never auto-applied;
 other providers retain **persistent task history + per-task revert**. It also
 **browses and edits workspace files** (a tree + an in-browser CodeMirror editor, lazy-loaded,
 with inline git status/diff), **reviews and pushes with Git** (diff viewer,

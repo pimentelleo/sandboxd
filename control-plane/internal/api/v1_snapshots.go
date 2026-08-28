@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -300,8 +301,11 @@ func copyTreeExcluding(src, dst string, ignore map[string]bool) error {
 		if rel == "." {
 			return nil // dst root already exists
 		}
-		if d.IsDir() && ignore[d.Name()] {
-			return filepath.SkipDir
+		if treeEntryIgnored(ignore, d.Name()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
@@ -335,6 +339,10 @@ func copyTreeExcluding(src, dst string, ignore map[string]bool) error {
 		}
 		return nil
 	})
+}
+
+func treeEntryIgnored(ignore map[string]bool, name string) bool {
+	return ignore[name] || (ignore[".env*"] && strings.HasPrefix(name, ".env"))
 }
 
 func copyFileMode(src, dst string, perm fs.FileMode) error {
