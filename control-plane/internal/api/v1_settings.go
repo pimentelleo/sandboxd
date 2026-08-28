@@ -78,6 +78,9 @@ type v1SettingsEgress struct {
 }
 type v1SettingsAgents struct {
 	Providers []string `json:"providers"`
+	// Provider is the persisted, instance-wide task provider. Console app chats
+	// omit an explicit task agent so the control plane always resolves this value.
+	Provider string `json:"provider"`
 	// SystemPrompt is the platform briefing appended to every agent run (read
 	// only). Rendered with default port/health for display; runtimed renders it
 	// with each sandbox's real values at task time. Single source: internal/agentprompt.
@@ -120,8 +123,11 @@ func (s *Server) v1GetSettings(w http.ResponseWriter, _ *http.Request) {
 		Runtime:   v1SettingsRuntime{StorageMode: storageMode, BaseImage: s.Image},
 		Lifecycle: s.lifecycleView(),
 		Egress:    v1SettingsEgress{Mode: egressMode},
-		Agents:    v1SettingsAgents{Providers: s.Instance.AgentProviders, SystemPrompt: agentprompt.Render(agentprompt.Vars{}), DefaultModels: s.agentDefaultModels()},
-		Presets:   presets,
+		Agents: v1SettingsAgents{
+			Providers: s.Instance.AgentProviders, Provider: s.defaultTaskAgent(),
+			SystemPrompt: agentprompt.Render(agentprompt.Vars{}), DefaultModels: s.agentDefaultModels(),
+		},
+		Presets: presets,
 		Capabilities: map[string]bool{
 			"snapshots":      s.Snapshot != nil,
 			"config_secrets": s.Secrets != nil,
@@ -134,6 +140,7 @@ func (s *Server) v1GetSettings(w http.ResponseWriter, _ *http.Request) {
 			"lifecycle.idle_reap_enabled",
 			"lifecycle.idle_threshold_seconds",
 			"lifecycle.keepalive_max_seconds",
+			"agents.provider",
 			"agents.default_models",
 		}
 	}
@@ -187,6 +194,9 @@ type v1SettingsPatch struct {
 		KeepaliveMaxSeconds  *int  `json:"keepalive_max_seconds"`
 	} `json:"lifecycle"`
 	Agents *struct {
+		// Provider is the instance-wide provider for console task chat and task
+		// requests that omit agent. It must be a provider runtimed can run.
+		Provider *string `json:"provider"`
 		// DefaultModels merges into the stored map: a non-empty value sets that
 		// agent's default model, an empty value clears it. Other agents untouched.
 		DefaultModels map[string]string `json:"default_models"`
@@ -196,9 +206,9 @@ type v1SettingsPatch struct {
 // maxAgentDefaultModels bounds how many per-agent defaults can be stored.
 const maxAgentDefaultModels = 32
 
-// v1PatchSettings — PATCH /v1/settings. Edits ONLY the lifecycle tunables; it
-// persists them, hot-applies via the shared Live config, and audits the change.
-// It never touches secrets/auth/egress/networking (those reject as unknown).
+// v1PatchSettings — PATCH /v1/settings. Edits only the allowlisted lifecycle
+// tunables and agent settings; it persists them, hot-applies via the shared Live
+// config, and audits the change. It never touches secrets/auth/egress/networking.
 func (s *Server) v1PatchSettings(w http.ResponseWriter, r *http.Request) {
 	if s.Live == nil || s.Store == nil {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "settings are not editable on this instance")
@@ -209,7 +219,7 @@ func (s *Server) v1PatchSettings(w http.ResponseWriter, r *http.Request) {
 	var req v1SettingsPatch
 	if err := dec.Decode(&req); err != nil {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request",
-			"editable: lifecycle tunables (idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds) and agents.default_models: "+err.Error())
+			"editable: lifecycle tunables (idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds), agents.provider, and agents.default_models: "+err.Error())
 		return
 	}
 	if req.Lifecycle == nil && req.Agents == nil {
@@ -241,40 +251,57 @@ func (s *Server) v1PatchSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.Agents != nil && req.Agents.DefaultModels != nil {
-		target = "agents.default_models"
-		merged := map[string]string{}
-		for k, v := range next.DefaultModels {
-			merged[k] = v
-		}
-		for agent, model := range req.Agents.DefaultModels {
-			if !isTaskAgent(agent) {
+	if req.Agents != nil {
+		if req.Agents.Provider != nil {
+			provider := strings.TrimSpace(*req.Agents.Provider)
+			if !isTaskAgent(provider) {
 				writeV1Err(w, http.StatusBadRequest, "invalid_request",
-					"unknown agent in default_models: "+agent)
+					"unsupported agent provider (supported: opencode, claude-code, codex, github-copilot)")
 				return
 			}
-			if len(model) > 200 {
-				writeV1Err(w, http.StatusBadRequest, "invalid_request", "model too long for agent "+agent)
-				return
-			}
-			if strings.TrimSpace(model) == "" {
-				delete(merged, agent) // empty clears the default
+			next.AgentProvider = provider
+			target = "agents.provider"
+		}
+		if req.Agents.DefaultModels != nil {
+			if target == "agents.provider" {
+				target = "agents"
 			} else {
-				merged[agent] = strings.TrimSpace(model)
+				target = "agents.default_models"
 			}
+			merged := map[string]string{}
+			for k, v := range next.DefaultModels {
+				merged[k] = v
+			}
+			for agent, model := range req.Agents.DefaultModels {
+				if !isTaskAgent(agent) {
+					writeV1Err(w, http.StatusBadRequest, "invalid_request",
+						"unknown agent in default_models: "+agent)
+					return
+				}
+				if len(model) > 200 {
+					writeV1Err(w, http.StatusBadRequest, "invalid_request", "model too long for agent "+agent)
+					return
+				}
+				if strings.TrimSpace(model) == "" {
+					delete(merged, agent) // empty clears the default
+				} else {
+					merged[agent] = strings.TrimSpace(model)
+				}
+			}
+			if len(merged) > maxAgentDefaultModels {
+				writeV1Err(w, http.StatusBadRequest, "invalid_request",
+					fmt.Sprintf("too many agent default models (max %d)", maxAgentDefaultModels))
+				return
+			}
+			next.DefaultModels = merged
 		}
-		if len(merged) > maxAgentDefaultModels {
-			writeV1Err(w, http.StatusBadRequest, "invalid_request",
-				fmt.Sprintf("too many agent default models (max %d)", maxAgentDefaultModels))
-			return
-		}
-		next.DefaultModels = merged
 	}
 
 	if err := s.Store.SaveInstanceSettings(r.Context(), store.InstanceSettings{
 		IdleReapEnabled:      next.IdleEnabled,
 		IdleThresholdSeconds: next.IdleThresholdSeconds,
 		KeepaliveMaxSeconds:  next.KeepaliveMaxSeconds,
+		AgentProvider:        next.AgentProvider,
 		AgentDefaultModels:   next.DefaultModels,
 	}); err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())

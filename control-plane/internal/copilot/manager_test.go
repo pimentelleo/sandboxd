@@ -309,23 +309,68 @@ func TestStreamRedactsKnownAndGitHubShapedSecrets(t *testing.T) {
 	}
 }
 
+func TestTaskFailsWhenRuntimeReportsSessionError(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	runtime := &fakeRuntime{eventsOnSend: []RuntimeEvent{
+		{Type: "error", Text: "provider failure"},
+		{Type: "idle"},
+	}}
+	manager := newTestManager(t, &now, runtime, nil)
+	manager.mu.Lock()
+	manager.credential = &credential{PersonalAccessToken: "token", Account: "octocat"}
+	manager.mu.Unlock()
+	capability, err := manager.IssueCapability("sandbox_9", "task_9", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.RunTask(ctx, TaskRequest{Capability: capability, Prompt: "work"}, nil); !errors.Is(err, ErrSessionError) {
+		t.Fatalf("task error = %v; want ErrSessionError", err)
+	}
+}
+
+func TestConversationTurnFailsWhenRuntimeReportsSessionError(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	runtime := &fakeRuntime{eventsOnSend: []RuntimeEvent{
+		{Type: "error", Text: "provider failure"},
+		{Type: "idle"},
+	}}
+	manager := newTestManager(t, &now, runtime, nil)
+	manager.mu.Lock()
+	manager.credential = &credential{PersonalAccessToken: "token", Account: "octocat"}
+	manager.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := manager.RunConversationTurn(ctx, ConversationTurnRequest{
+		ConversationID: "conversation-1",
+		SandboxID:      "sandbox-9",
+		Prompt:         "work",
+		Mode:           ConversationModeInteractive,
+	})
+	if !errors.Is(err, ErrSessionError) {
+		t.Fatalf("conversation error = %v; want ErrSessionError", err)
+	}
+}
+
 type fakeRuntime struct {
 	created, resumed int
 	deleted          string
 	disconnected     int
 	config           RuntimeConfig
+	eventsOnSend     []RuntimeEvent
 }
 
 func (r *fakeRuntime) Create(_ context.Context, config RuntimeConfig) (RuntimeSession, error) {
 	r.created++
 	r.config = config
-	return &fakeSession{id: "session-1", event: config.OnEvent, onDisconnect: func() { r.disconnected++ }}, nil
+	return &fakeSession{id: "session-1", event: config.OnEvent, onDisconnect: func() { r.disconnected++ }, eventsOnSend: r.eventsOnSend}, nil
 }
 
 func (r *fakeRuntime) Resume(_ context.Context, _ string, config RuntimeConfig) (RuntimeSession, error) {
 	r.resumed++
 	r.config = config
-	return &fakeSession{id: "session-1", event: config.OnEvent, onDisconnect: func() { r.disconnected++ }}, nil
+	return &fakeSession{id: "session-1", event: config.OnEvent, onDisconnect: func() { r.disconnected++ }, eventsOnSend: r.eventsOnSend}, nil
 }
 
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
@@ -337,17 +382,28 @@ type fakeSession struct {
 	id           string
 	event        func(RuntimeEvent)
 	onDisconnect func()
+	eventsOnSend []RuntimeEvent
 }
 
 func (s *fakeSession) ID() string { return s.id }
 
 func (s *fakeSession) Send(_ context.Context, _ string) error {
+	if len(s.eventsOnSend) > 0 {
+		for _, event := range s.eventsOnSend {
+			s.event(event)
+		}
+		return nil
+	}
 	s.event(RuntimeEvent{Type: "message_delta", Text: "safe response"})
 	s.event(RuntimeEvent{Type: "tool_start", ToolCallID: "tool-1", ToolName: "read_file"})
 	s.event(RuntimeEvent{Type: "tool_complete", ToolCallID: "tool-1", Success: true})
 	s.event(RuntimeEvent{Type: "usage", Input: 4, Output: 3})
 	s.event(RuntimeEvent{Type: "idle"})
 	return nil
+}
+
+func (s *fakeSession) SendMessage(ctx context.Context, message RuntimeMessage) error {
+	return s.Send(ctx, message.Prompt)
 }
 
 func (s *fakeSession) Abort(context.Context) error { return nil }

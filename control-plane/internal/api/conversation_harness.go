@@ -35,10 +35,13 @@ var (
 type ConversationCoordinator struct {
 	server *Server
 
-	mu      sync.Mutex
-	workers map[string]bool
-	runs    map[string]*conversationRun
-	updates map[string]chan struct{}
+	mu              sync.Mutex
+	workers         map[string]bool
+	runs            map[string]*conversationRun
+	childRuns       map[string]*conversationChildRun
+	updates         map[string]chan struct{}
+	childSlots      chan struct{}
+	childAdmissions sync.Mutex
 }
 
 type conversationRun struct {
@@ -163,10 +166,12 @@ func (b *turnBudget) Expired() bool {
 // The Server owns its lifecycle so all public routes share one callback map.
 func NewConversationCoordinator(server *Server) *ConversationCoordinator {
 	return &ConversationCoordinator{
-		server:  server,
-		workers: make(map[string]bool),
-		runs:    make(map[string]*conversationRun),
-		updates: make(map[string]chan struct{}),
+		server:     server,
+		workers:    make(map[string]bool),
+		runs:       make(map[string]*conversationRun),
+		childRuns:  make(map[string]*conversationChildRun),
+		updates:    make(map[string]chan struct{}),
+		childSlots: make(chan struct{}, maxConcurrentConversationChildren),
 	}
 }
 
@@ -193,6 +198,7 @@ func (s *Server) RecoverConversations(ctx context.Context) {
 // a response against a callback that no longer exists after process restart.
 // Queued turns are then started with the retained conversation session.
 func (c *ConversationCoordinator) Recover(ctx context.Context) {
+	c.recoverConversationChildren(ctx)
 	turns, err := c.server.Store.ListActiveConversationTurns(ctx)
 	if err != nil {
 		c.logError("list active conversations for recovery", err)
@@ -271,6 +277,12 @@ func (c *ConversationCoordinator) Reset(ctx context.Context, sandboxID, defaultM
 		return nil, errInvalidConversation
 	}
 	if _, err := c.server.Store.Get(ctx, sandboxID); err != nil {
+		return nil, err
+	}
+	if active, err := c.server.Store.GetActiveConversation(ctx, sandboxID); err == nil {
+		c.interruptConversationChildren(ctx, active.ID,
+			"Delegated Copilot work was interrupted because this conversation was reset.")
+	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
 	previous, err := c.server.Store.ArchiveActiveConversation(ctx, sandboxID)
@@ -396,6 +408,7 @@ func (c *ConversationCoordinator) execute(turn *store.ConversationTurn) {
 	err = c.server.Copilot.RunConversationTurn(run.budget.Context(), copilot.ConversationTurnRequest{
 		ConversationID:  conversation.ID,
 		SandboxID:       run.sandboxID,
+		TurnID:          turn.ID,
 		Prompt:          turn.Prompt,
 		Mode:            turn.Mode,
 		Model:           turn.Model,
@@ -412,6 +425,7 @@ func (c *ConversationCoordinator) execute(turn *store.ConversationTurn) {
 		OnPlan: func(plan copilot.RuntimePlanRequest) (copilot.RuntimePlanResponse, error) {
 			return c.waitForPlan(run, plan)
 		},
+		Delegation: c,
 	})
 	status, reason, message := c.classifyOutcome(run, err)
 	result := c.finalizeHostedTurn(turn, run, status, reason, message)
@@ -789,6 +803,7 @@ func (c *ConversationCoordinator) InterruptSandbox(ctx context.Context, sandboxI
 		return
 	}
 	for _, id := range ids {
+		c.interruptConversationChildren(ctx, id, message)
 		c.interruptConversation(ctx, id, message, false)
 	}
 }
@@ -799,6 +814,7 @@ func (c *ConversationCoordinator) InterruptAll(ctx context.Context, message stri
 	if c == nil || c.server == nil || c.server.Store == nil {
 		return
 	}
+	c.interruptAllConversationChildren(ctx, message)
 	turns, err := c.server.Store.ListActiveConversationTurns(ctx)
 	if err != nil {
 		c.logError("list active conversations", err)

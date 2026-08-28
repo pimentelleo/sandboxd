@@ -101,7 +101,7 @@ random, one-use capability bound to that sandbox and task and valid for two
 minutes. `runtimed` exchanges it only with the private
 `SANDBOXD_COPILOT_BRIDGE_URL`; the bridge is not published on a host port.
 
-The console's GitHub Copilot path instead uses
+When GitHub Copilot is the configured provider, the console uses
 `/v1/sandboxes/{id}/conversation`. It is a durable, per-sandbox conversation:
 messages are queued FIFO, native questions and plan approvals are persisted
 before display, and the console reconnects through a redacted SSE cursor. The
@@ -142,6 +142,30 @@ configured model. sandboxd validates and stores the normalized settings with
 the turn before it enters the FIFO queue, so every turn runs with the exact
 selection it was submitted with.
 
+### GitHub Copilot delegated workers
+
+A conversational Copilot parent can delegate independent work with its
+parent-only tools. sandboxd records the work durably, gives a worker a private
+copy of `workspace/app`, and runs it in a separate container on Docker's
+default bridge, not the sandbox/Traefik network. The worker inherits the
+parent turn's model, reasoning effort, and context tier, but it receives no
+provider credential, SDK session, Docker socket, parent workspace mount, or
+delegation tools.
+
+The private copy excludes repository/runtime metadata and common local
+credential files (`.git`, `.runtimed`, `.env*`, `.npmrc`, `.netrc`, and
+`.pypirc`). A worker may use normal outbound networking for package installs.
+When it finishes, sandboxd stores at most 100 bounded replacement/deletion
+records. `GET /v1/sandboxes/{id}/conversation/children` lists safe task
+metadata, and `GET .../children/{childId}/changes/{path}` retrieves one file
+for review. No public API or console action applies a delegated patch
+automatically: the parent must explicitly use its ordinary workspace tools.
+
+At most four delegated workers are active or queued for one conversation and
+16 across the control plane. Each worker has a 20-minute active execution
+budget, can be cancelled, and is interrupted when its parent conversation is
+reset, the sandbox is purged, or Copilot credentials change.
+
 ### OpenCode Zen: subscription vs pay-as-you-go
 
 OpenCode Zen has two gateways, and the same key behaves differently on each.
@@ -170,9 +194,26 @@ A connected OpenCode key always wins and enables its paid catalog. This free
 path is OpenCode-only. Other sandbox-resident agents require a connection;
 GitHub Copilot is separately admitted by its hosted provider.
 
-### Per-agent default model
+### Global provider and per-agent default model
 
-Set a default model in **Settings -> AI Agents -> Default model** or through
+Set the instance-wide provider in **Settings -> Agents -> Default provider** or
+with `PATCH /v1/settings`:
+
+```json
+{"agents":{"provider":"github-copilot"}}
+```
+
+Every console app chat uses that persisted provider. The console does not send
+an agent override for legacy task chats, so the control plane resolves the
+current provider at submit time. GitHub Copilot opens its durable conversation
+surface; OpenCode and Claude Code retain the existing one-shot task chat.
+Changing the provider does not change the selected model controls.
+
+`SANDBOXD_DEFAULT_AGENT` (default `opencode`) seeds this setting on a new
+instance and remains the fallback for older empty rows. An explicit `agent` in
+the public task API still overrides the global provider.
+
+Set a default model in **Settings -> Agents -> Default model** or through
 `PATCH /v1/settings` `agents.default_models`. A task's model precedence is:
 
 1. The task's own `model`.
@@ -249,10 +290,10 @@ model choices from `GET /v1/agents/github-copilot/models`. Modes are
 native input and plan cards only through their returned interaction endpoint.
 The full request and response contract is in `docs/openapi.yaml`.
 
-`SANDBOXD_DEFAULT_AGENT` (default `opencode`) chooses the agent when the task
-does not specify one. `continue` is tri-state and defaults to continuing the
-sandbox's most recent agent session. Claude Code and OpenCode use their CLI
-resume behavior; one-shot GitHub Copilot tasks use a sandbox-keyed
+When no explicit `agent` is supplied, tasks use the persisted global provider
+(or `SANDBOXD_DEFAULT_AGENT` when it has never been set). `continue` is
+tri-state and defaults to continuing the sandbox's most recent agent session.
+Claude Code and OpenCode use their CLI resume behavior; one-shot GitHub Copilot tasks use a sandbox-keyed
 control-plane mapping. Omit it to resume when a prior session exists and start
 fresh otherwise; set `true` or `false` to force the choice. Conversation turns
 always continue their active conversation until it is reset.

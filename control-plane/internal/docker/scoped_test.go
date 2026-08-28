@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -22,8 +23,8 @@ func TestScopedExecArgsPreserveNonInteractiveScope(t *testing.T) {
 	args := scopedExecArgs(request)
 	want := []string{
 		"exec", "--user", "sandbox", "--workdir", "/home/sandbox/workspace/app",
-		"s-sandbox_123", "timeout", "--signal=TERM", "--kill-after=5s", "2s",
-		"--", "sh", "-lc", "echo hello",
+		"s-sandbox_123", "timeout", "--signal=TERM", "--kill-after=5s", "--", "2s",
+		"sh", "-lc", "echo hello",
 	}
 	if got, expected := strings.Join(args, "\x00"), strings.Join(want, "\x00"); got != expected {
 		t.Fatalf("scoped args = %#v, want %#v", args, want)
@@ -39,6 +40,31 @@ func TestScopedExecArgsPreserveNonInteractiveScope(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(args, "\x00"), "-t") {
 		t.Fatalf("stdin request allocated a TTY: %#v", args)
+	}
+}
+
+func TestScopedExecArgsRunWithCoreutilsTimeout(t *testing.T) {
+	timeout, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("coreutils timeout is unavailable")
+	}
+	args := scopedExecArgs(scopedRequest())
+	timeoutIndex := -1
+	for i, arg := range args {
+		if arg == "timeout" {
+			timeoutIndex = i
+			break
+		}
+	}
+	if timeoutIndex == -1 {
+		t.Fatalf("timeout command missing from %#v", args)
+	}
+	output, err := exec.Command(timeout, args[timeoutIndex+1:]...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("timeout command failed: %v: %s", err, output)
+	}
+	if got, want := string(output), "hello\n"; got != want {
+		t.Fatalf("timeout output = %q, want %q", got, want)
 	}
 }
 

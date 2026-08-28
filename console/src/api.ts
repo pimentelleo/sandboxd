@@ -43,7 +43,7 @@ export interface Settings {
   runtime: { storage_mode: string; base_image: string }
   lifecycle: { idle_reap_enabled: boolean; idle_threshold_seconds: number; keepalive_max_seconds: number }
   egress: { mode: string }
-  agents: { providers: string[]; system_prompt?: string; default_models: Record<string, string> }
+  agents: { providers: string[]; provider: string; system_prompt?: string; default_models: Record<string, string> }
   presets: Preset[]
   capabilities: Record<string, boolean>
   editable?: string[] // field paths the client may PATCH (e.g. lifecycle.*)
@@ -73,8 +73,12 @@ export interface SettingsPatch {
     idle_threshold_seconds?: number
     keepalive_max_seconds?: number
   }
-  // Per-agent default model id (merges; empty value clears one).
-  agents?: { default_models?: Record<string, string> }
+  agents?: {
+    // Instance-wide provider used by app chats and tasks that omit an agent.
+    provider?: string
+    // Per-agent default model id (merges; empty value clears one).
+    default_models?: Record<string, string>
+  }
 }
 
 // Advisory runtime detection (GET /v1/apps/{id}/runtime-inspect). Suggestions
@@ -354,11 +358,39 @@ export interface ConversationInteraction {
   created_at: string
   resolved_at?: string
 }
+// Delegated tasks run in an isolated workspace. Their changes are review-only;
+// the console never applies them to the parent workspace.
+export interface ConversationChild {
+  id: string
+  parent_turn_id: string
+  label?: string
+  task: string
+  model?: string
+  reasoning_effort?: string
+  context_tier: ContextTier
+  status: string
+  result?: string
+  error_message?: string
+  patch_state: 'none' | 'available' | 'unavailable' | string
+  changed_files: string[]
+  created_at: string
+  started_at?: string
+  finished_at?: string
+}
+export interface ConversationChildChange {
+  task_id: string
+  path: string
+  base_sha256?: string
+  content: string
+  deleted: boolean
+  mode?: number
+}
 export interface ConversationSnapshot {
   conversation: Conversation | null
   turns: ConversationTurn[]
   messages: ConversationMessage[]
   interactions: ConversationInteraction[]
+  children: ConversationChild[]
   event_cursor: number
   next_queue_slot: number
 }
@@ -597,14 +629,18 @@ export const api = {
   stopSandbox: (id: string) => req<Sandbox>('POST', `/v1/sandboxes/${id}/stop`),
   deleteSandbox: (id: string) => req<unknown>('DELETE', `/v1/sandboxes/${id}`),
 
-  submitTask: (id: string, prompt: string, agent: string = 'opencode', model?: string, cont?: boolean) =>
+  submitTask: (
+    id: string,
+    prompt: string,
+    options: { agent?: string; model?: string; cont?: boolean } = {},
+  ) =>
     req<{ id: string }>('POST', `/v1/sandboxes/${id}/tasks`, {
       prompt,
-      agent,
-      ...(model && model.trim() ? { model: model.trim() } : {}),
+      ...(options.agent?.trim() ? { agent: options.agent.trim() } : {}),
+      ...(options.model?.trim() ? { model: options.model.trim() } : {}),
       // Send the choice explicitly so unchecking forces a fresh session; omitting
       // it would let the server fall back to its continue-by-default behavior.
-      ...(cont !== undefined ? { continue: cont } : {}),
+      ...(options.cont !== undefined ? { continue: options.cont } : {}),
     }),
   getTask: (id: string, taskId: string) =>
     req<TaskResult>('GET', `/v1/sandboxes/${id}/tasks/${taskId}`),
@@ -617,6 +653,17 @@ export const api = {
     `/v1/sandboxes/${id}/tasks/${taskId}/events`,
   getConversation: (sandboxId: string) =>
     req<ConversationSnapshot>('GET', `/v1/sandboxes/${sandboxId}/conversation`),
+  listConversationChildren: (sandboxId: string) =>
+    req<{ children: ConversationChild[] }>('GET', `/v1/sandboxes/${sandboxId}/conversation/children`).then((r) => r.children || []),
+  getConversationChild: (sandboxId: string, childId: string) =>
+    req<ConversationChild>('GET', `/v1/sandboxes/${sandboxId}/conversation/children/${encodeURIComponent(childId)}`),
+  getConversationChildChange: (sandboxId: string, childId: string, path: string) =>
+    req<ConversationChildChange>(
+      'GET',
+      `/v1/sandboxes/${sandboxId}/conversation/children/${encodeURIComponent(childId)}/changes/${encodeURIComponent(path)}`,
+    ),
+  cancelConversationChild: (sandboxId: string, childId: string) =>
+    req<ConversationChild>('POST', `/v1/sandboxes/${sandboxId}/conversation/children/${encodeURIComponent(childId)}/cancel`),
   sendConversationMessage: (sandboxId: string, prompt: string, mode: ConversationMode, settings: ConversationModelSettings) =>
     req<ConversationSubmission>(
       'POST', `/v1/sandboxes/${sandboxId}/conversation/messages`, { prompt, mode, ...settings },

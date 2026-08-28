@@ -208,6 +208,14 @@ standard or long context. Leaving model or effort at the default lets sandboxd
 or Copilot choose it. sandboxd validates the selection and snapshots it with
 the queued turn, so later default or UI changes cannot alter in-flight work.
 
+Copilot can also delegate independent work to isolated background workers. A
+worker gets a private copy of the app workspace, inherits the parent turn's
+model, effort, and context settings, and cannot access the parent workspace,
+Docker, Traefik, or the Copilot credential. Its result is a bounded,
+review-only file patch: the parent and console can inspect it, but sandboxd
+never applies it automatically. Up to four workers may be queued or active per
+conversation and 16 globally; each is limited to 20 minutes.
+
 **Full walkthrough → [sandboxd.io/quickstart](https://sandboxd.io/quickstart).**
 
 ## 🚀 Deploy to a VPS in one click

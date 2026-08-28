@@ -38,6 +38,21 @@ func isTaskAgent(agent string) bool {
 	return agent == githubCopilotAgentID || agentauth.Runnable(agent)
 }
 
+// defaultTaskAgent resolves the persisted global provider before the deployment
+// fallback. Console task chat intentionally omits agent so every app uses this
+// server-side source of truth.
+func (s *Server) defaultTaskAgent() string {
+	if s.Live != nil {
+		if agent := s.Live.AgentProvider(); agent != "" {
+			return agent
+		}
+	}
+	if s.DefaultAgent != "" {
+		return s.DefaultAgent
+	}
+	return "opencode"
+}
+
 // opencodeFreeModel is the model used when opencode runs with no connected
 // credential (its zero-friction free tier). Operator-overridable.
 func opencodeFreeModel() string {
@@ -127,10 +142,7 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 	}
 	agent := req.Agent
 	if agent == "" {
-		agent = s.DefaultAgent // operator default (SANDBOXD_DEFAULT_AGENT)
-	}
-	if agent == "" {
-		agent = "opencode"
+		agent = s.defaultTaskAgent()
 	}
 	// Only providers runtimed can actually run as a task agent are accepted.
 	// An explicit agent is honored regardless of the default; the provider's

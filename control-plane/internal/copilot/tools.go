@@ -21,12 +21,20 @@ func taskTools(sandboxID string, executor ScopedExecutor) []RuntimeTool {
 	return toolsForSandbox(sandboxID, executor, nil)
 }
 
-func conversationTools(sandboxID string, executor ScopedExecutor, gate *mutationGate) []RuntimeTool {
-	return toolsForSandbox(sandboxID, executor, gate)
+func conversationTools(container string, executor ScopedExecutor, gate *mutationGate, delegate BackgroundDelegate, parent BackgroundTaskRequest) []RuntimeTool {
+	tools := toolsForContainer(container, executor, gate)
+	if delegate == nil {
+		return tools
+	}
+	return append(tools, delegationTools(delegate, parent, gate)...)
 }
 
 func toolsForSandbox(sandboxID string, executor ScopedExecutor, gate *mutationGate) []RuntimeTool {
-	t := toolRunner{sandboxID: sandboxID, executor: executor, gate: gate}
+	return toolsForContainer(sandboxContainerName(sandboxID), executor, gate)
+}
+
+func toolsForContainer(container string, executor ScopedExecutor, gate *mutationGate) []RuntimeTool {
+	t := toolRunner{container: container, executor: fixedTargetExecutor{target: container, next: executor}, gate: gate}
 	return []RuntimeTool{
 		{Name: "list_files", Description: "List files beneath a workspace path.", Schema: objectSchema(map[string]any{"path": stringSchema(1024)}), Handler: t.list},
 		{Name: "read_file", Description: "Read a UTF-8 text file from the workspace.", Schema: strictSchema(map[string]any{"path": stringSchema(1024)}, "path"), Handler: t.read},
@@ -42,6 +50,9 @@ func objectSchema(properties map[string]any) map[string]any {
 
 func strictSchema(properties map[string]any, required ...string) map[string]any {
 	schema := objectSchema(properties)
+	if required == nil {
+		required = []string{}
+	}
 	schema["required"] = required
 	return schema
 }
@@ -51,7 +62,7 @@ func stringSchema(max int) map[string]any {
 }
 
 type toolRunner struct {
-	sandboxID string
+	container string
 	executor  ScopedExecutor
 	gate      *mutationGate
 }
@@ -163,13 +174,13 @@ func resolveScript(action string) string {
 }
 
 func (t toolRunner) exec(command []string) (string, error) {
-	if t.executor == nil || !validIdentifier(t.sandboxID) {
+	if t.executor == nil || !validWorkspaceContainer(t.container) {
 		return "", errors.New("executor unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), toolTimeout)
 	defer cancel()
 	result, err := t.executor.ExecScoped(ctx, ScopedExecRequest{
-		Container: "s-" + t.sandboxID, User: "sandbox", Workdir: workspaceDir,
+		Container: t.container, User: "sandbox", Workdir: workspaceDir,
 		Command: command, Timeout: toolTimeout, OutputLimit: outputLimit,
 	})
 	if err != nil || result.ExitCode != 0 {
@@ -183,6 +194,21 @@ func (t toolRunner) exec(command []string) (string, error) {
 		output = output[:outputLimit]
 	}
 	return output, nil
+}
+
+// fixedTargetExecutor turns a broad control-plane executor into a per-turn
+// capability. Tool schemas cannot provide a container name, and even an
+// internal caller cannot redirect this runner to another workspace.
+type fixedTargetExecutor struct {
+	target string
+	next   ScopedExecutor
+}
+
+func (e fixedTargetExecutor) ExecScoped(ctx context.Context, request ScopedExecRequest) (ScopedExecResult, error) {
+	if e.next == nil || request.Container != e.target {
+		return ScopedExecResult{}, errors.New("invalid workspace target")
+	}
+	return e.next.ExecScoped(ctx, request)
 }
 
 func workspacePath(value string) (string, error) {

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  api, ContextTier, ConversationEvent, ConversationInteraction, ConversationMessage,
-  ConversationMode, ConversationSnapshot, ConversationTurn, CopilotModel, Sandbox,
+  api, ContextTier, ConversationChild, ConversationChildChange, ConversationEvent,
+  ConversationInteraction, ConversationMessage, ConversationMode, ConversationSnapshot,
+  ConversationTurn, CopilotModel, Sandbox,
 } from './api'
 import { c, Card, Btn, H, Input, mono, Pill } from './design/kit'
 
 const ACTIVE_TURN_STATUSES = new Set(['running', 'waiting_input', 'waiting_plan', 'cancelling'])
+const ACTIVE_CHILD_STATUSES = new Set(['queued', 'preparing', 'running', 'cancelling'])
 type CatalogState = 'loading' | 'ready' | 'empty' | 'unavailable' | 'not_connected'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -16,6 +18,9 @@ function isString(value: unknown): value is string {
 }
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
+}
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isString)
 }
 
 export function parseConversationPrompt(prompt: string, selectedMode: ConversationMode): { prompt: string; mode: ConversationMode } {
@@ -101,8 +106,37 @@ export function applyConversationEvent(snapshot: ConversationSnapshot, event: Co
     if (!isString(payload.id) || !isString(payload.status) || !next.interactions.some((interaction) => interaction.id === payload.id)) return null
     return { ...next, interactions: next.interactions.map((interaction) => interaction.id === payload.id ? { ...interaction, status: payload.status } : interaction) }
   }
+  if (event.type === 'child.created' || event.type === 'child.updated') {
+    if (!isString(payload.id)) return null
+    const existing = (next.children || []).find((child) => child.id === payload.id)
+    const child = conversationChildFromEvent(payload, event, existing)
+    if (!child) return null
+    const children = existing
+      ? (next.children || []).map((candidate) => candidate.id === child.id ? child : candidate)
+      : [...(next.children || []), child]
+    return { ...next, children }
+  }
   if (event.type === 'tool' || event.type === 'usage') return next
   return null
+}
+
+function conversationChildFromEvent(payload: Record<string, unknown>, event: ConversationEvent, existing?: ConversationChild): ConversationChild | null {
+  const task = isString(payload.task) ? payload.task : payload.prompt
+  if (!isString(payload.id) || !isString(payload.parent_turn_id) || !isString(task) ||
+    !isString(payload.model) || !isString(payload.reasoning_effort) || !isString(payload.context_tier) ||
+    !isString(payload.status) || !isString(payload.result) || !isString(payload.patch_state) ||
+    !isStringArray(payload.changed_files)) return null
+  return {
+    id: payload.id, parent_turn_id: payload.parent_turn_id, task,
+    ...(isString(payload.label) ? { label: payload.label } : {}),
+    model: payload.model, reasoning_effort: payload.reasoning_effort,
+    context_tier: payload.context_tier as ContextTier, status: payload.status,
+    result: payload.result, patch_state: payload.patch_state, changed_files: payload.changed_files,
+    ...(isString(payload.error_message) ? { error_message: payload.error_message } : {}),
+    created_at: existing?.created_at || event.created_at,
+    ...(existing?.started_at ? { started_at: existing.started_at } : {}),
+    ...(existing?.finished_at ? { finished_at: existing.finished_at } : {}),
+  }
 }
 
 function conversationBubble(message: ConversationMessage) {
@@ -178,7 +212,82 @@ function PlanInteraction({ interaction, sandboxId, onDone, onError }: { interact
   )
 }
 
-export function CopilotConversation({ sb, agent, setAgent, onError, toast, refresh }: { sb: Sandbox | null; agent: string; setAgent: (agent: string) => void; onError: (message: string) => void; toast: (message: string) => void; refresh: () => void }) {
+function childStatusTone(status: string): 'good' | 'warn' | 'bad' | 'neutral' {
+  if (status === 'succeeded') return 'good'
+  if (status === 'failed' || status === 'interrupted') return 'bad'
+  if (ACTIVE_CHILD_STATUSES.has(status)) return 'warn'
+  return 'neutral'
+}
+
+function DelegatedTask({ child, sandboxId, onDone, onError }: {
+  child: ConversationChild
+  sandboxId: string
+  onDone: () => void
+  onError: (message: string) => void
+}) {
+  const [change, setChange] = useState<ConversationChildChange | null>(null)
+  const [reviewingPath, setReviewingPath] = useState('')
+  const [cancelling, setCancelling] = useState(false)
+  const active = ACTIVE_CHILD_STATUSES.has(child.status)
+  const review = async (path: string) => {
+    if (reviewingPath) return
+    setReviewingPath(path)
+    try {
+      setChange(await api.getConversationChildChange(sandboxId, child.id, path))
+    } catch (error) {
+      onError((error as Error).message)
+    } finally {
+      setReviewingPath('')
+    }
+  }
+  const cancel = async () => {
+    if (cancelling) return
+    setCancelling(true)
+    try {
+      await api.cancelConversationChild(sandboxId, child.id)
+      onDone()
+    } catch (error) {
+      onError((error as Error).message)
+    } finally {
+      setCancelling(false)
+    }
+  }
+  return (
+    <article data-testid={`copilot-child-${child.id}`} style={{ border: `1px solid ${c.border}`, borderRadius: 8, background: c.panel3, padding: 11 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <H size={13}>{child.label || 'Delegated task'}</H>
+        <Pill tone={childStatusTone(child.status)} dot={active}>{child.status.replace('_', ' ')}</Pill>
+        {active && <Btn sm variant="danger" disabled={cancelling} onClick={cancel} data-testid={`copilot-child-cancel-${child.id}`}>Cancel</Btn>}
+      </div>
+      <div style={{ marginTop: 6, color: c.fg2, fontSize: 12.5, whiteSpace: 'pre-wrap' }}>{child.task}</div>
+      <div style={{ marginTop: 7, color: c.muted, fontSize: 11.5 }}>
+        {child.model || 'Copilot default'} · {child.reasoning_effort || 'default effort'} · {child.context_tier.replace('_', ' ')}
+      </div>
+      <div role="note" style={{ marginTop: 8, color: c.muted2, fontSize: 11.5 }}>
+        Changes stay isolated until you review and apply them manually.
+      </div>
+      {child.result && <pre style={{ margin: '9px 0 0', maxHeight: 144, overflow: 'auto', padding: '8px 9px', border: `1px solid ${c.border}`, borderRadius: 6, background: c.bg, color: c.fg2, whiteSpace: 'pre-wrap', ...mono, fontSize: 11.25 }}>{child.result}</pre>}
+      {child.error_message && <div style={{ marginTop: 8, color: c.bad, fontSize: 12 }}>{child.error_message}</div>}
+      {child.changed_files.length > 0 && <div style={{ marginTop: 9 }}>
+        <div style={{ color: c.muted, fontSize: 11.5, marginBottom: 5 }}>Review changed files</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+          {child.changed_files.map((path) => <Btn key={path} sm variant="ghost" disabled={Boolean(reviewingPath)} onClick={() => review(path)} data-testid={`copilot-child-review-${child.id}-${path}`}>
+            {reviewingPath === path ? 'Loading…' : path}
+          </Btn>)}
+        </div>
+      </div>}
+      {change && <section data-testid={`copilot-child-change-${child.id}`} style={{ marginTop: 10, borderTop: `1px solid ${c.border}`, paddingTop: 9 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}><H size={12}>Review: {change.path}</H><Pill tone={change.deleted ? 'bad' : 'neutral'}>{change.deleted ? 'deleted' : 'replacement'}</Pill></div>
+        {change.base_sha256 && <div style={{ marginTop: 5, color: c.muted2, fontSize: 10.5, ...mono }}>Base {change.base_sha256}</div>}
+        <pre style={{ margin: '7px 0 0', maxHeight: 210, overflow: 'auto', padding: '8px 9px', border: `1px solid ${c.border}`, borderRadius: 6, background: c.bg, color: c.fg, whiteSpace: 'pre-wrap', ...mono, fontSize: 11.25 }}>
+          {change.deleted ? '(file deleted)' : change.content || '(empty file)'}
+        </pre>
+      </section>}
+    </article>
+  )
+}
+
+export function CopilotConversation({ sb, onError, toast, refresh }: { sb: Sandbox | null; onError: (message: string) => void; toast: (message: string) => void; refresh: () => void }) {
   const [snapshot, setSnapshot] = useState<ConversationSnapshot | null>(null)
   const [text, setText] = useState('')
   const [mode, setMode] = useState<ConversationMode>('interactive')
@@ -264,6 +373,7 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
   const active = turns.some((turn) => ACTIVE_TURN_STATUSES.has(turn.status))
   const queued = turns.filter((turn) => turn.status === 'queued')
   const pending = (snapshot?.interactions || []).filter((interaction) => interaction.status === 'pending')
+  const children = snapshot?.children || []
   const resetAllowed = !active && queued.length === 0
   const selectedModel = models.find((candidate) => candidate.id === model)
   const reasoningEfforts = selectedModel?.supported_reasoning_efforts || []
@@ -306,10 +416,7 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
         <H size={14}>GitHub Copilot</H>
         {active && <Pill tone="warn" dot>working</Pill>}
         {queued.length > 0 && <Pill tone="neutral">{queued.length} queued</Pill>}
-        <select value={agent} onChange={(event) => setAgent(event.target.value)} aria-label="Agent provider" data-testid="task-agent" style={{ marginLeft: 'auto', ...selectStyle }}>
-          <option value="claude-code">Claude Code</option><option value="opencode">OpenCode</option><option value="github-copilot">GitHub Copilot</option>
-        </select>
-        <Btn sm variant="ghost" disabled={!resetAllowed || !sandboxId} title={resetAllowed ? 'Archive this transcript and begin a new one' : 'Wait until active and queued work finishes'} onClick={reset} data-testid="copilot-reset">New conversation</Btn>
+        <Btn sm variant="ghost" disabled={!resetAllowed || !sandboxId} title={resetAllowed ? 'Archive this transcript and begin a new one' : 'Wait until active and queued work finishes'} onClick={reset} data-testid="copilot-reset" style={{ marginLeft: 'auto' }}>New conversation</Btn>
         {active && <Btn sm variant="danger" onClick={cancel} data-testid="copilot-cancel">Cancel</Btn>}
       </div>
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -320,6 +427,10 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
         {pending.map((interaction) => interaction.type === 'plan'
           ? <PlanInteraction key={interaction.id} interaction={interaction} sandboxId={sandboxId!} onDone={loadSnapshot} onError={onError} />
           : <InputInteraction key={interaction.id} interaction={interaction} sandboxId={sandboxId!} onDone={loadSnapshot} onError={onError} />)}
+        {children.length > 0 && <section aria-label="Delegated tasks" style={{ display: 'flex', flexDirection: 'column', gap: 7, marginTop: 2 }}>
+          <H size={13}>Delegated tasks</H>
+          {children.map((child) => <DelegatedTask key={child.id} child={child} sandboxId={sandboxId!} onDone={loadSnapshot} onError={onError} />)}
+        </section>}
         {snapshot?.conversation?.last_error && <div style={{ color: c.bad, fontSize: 12.5 }}>{snapshot.conversation.last_error}</div>}
       </div>
       <div style={{ borderTop: `1px solid ${c.border}`, background: c.panel3 }}>

@@ -13,6 +13,8 @@ patch** — each lands the meaningful changes merged since the last one — and 
   a compiled server, and advisory imported-project detection.
 - GitHub Copilot conversation controls for entitled models, model-specific
   reasoning effort, and context tier, with immutable per-turn settings.
+- Isolated GitHub Copilot background delegation with private workspaces,
+  review-only patches, and bounded parent-agent controls.
 
 ### Fixed
 - GitHub Copilot conversations now present native clarification and plan-approval

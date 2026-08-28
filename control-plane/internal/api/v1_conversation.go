@@ -75,11 +75,41 @@ type v1ConversationInteraction struct {
 	ResolvedAt        string   `json:"resolved_at,omitempty"`
 }
 
+// v1ConversationChild deliberately excludes the worker container, private
+// workspace path, and raw patch JSON held by the control plane.
+type v1ConversationChild struct {
+	ID              string   `json:"id"`
+	ParentTurnID    string   `json:"parent_turn_id"`
+	Label           string   `json:"label,omitempty"`
+	Task            string   `json:"task"`
+	Model           string   `json:"model,omitempty"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
+	ContextTier     string   `json:"context_tier"`
+	Status          string   `json:"status"`
+	Result          string   `json:"result,omitempty"`
+	ErrorMessage    string   `json:"error_message,omitempty"`
+	PatchState      string   `json:"patch_state"`
+	ChangedFiles    []string `json:"changed_files"`
+	CreatedAt       string   `json:"created_at"`
+	StartedAt       string   `json:"started_at,omitempty"`
+	FinishedAt      string   `json:"finished_at,omitempty"`
+}
+
+type v1ConversationChildChange struct {
+	TaskID     string `json:"task_id"`
+	Path       string `json:"path"`
+	BaseSHA256 string `json:"base_sha256,omitempty"`
+	Content    string `json:"content"`
+	Deleted    bool   `json:"deleted"`
+	Mode       uint32 `json:"mode,omitempty"`
+}
+
 type v1ConversationSnapshot struct {
 	Conversation  *v1Conversation             `json:"conversation"`
 	Turns         []v1ConversationTurn        `json:"turns"`
 	Messages      []v1ConversationMessage     `json:"messages"`
 	Interactions  []v1ConversationInteraction `json:"interactions"`
+	Children      []v1ConversationChild       `json:"children"`
 	EventCursor   int64                       `json:"event_cursor"`
 	NextQueueSlot int                         `json:"next_queue_slot"`
 }
@@ -142,6 +172,7 @@ func v1ConversationSnapshotFromStore(snapshot *store.ConversationSnapshot) v1Con
 		Turns:         make([]v1ConversationTurn, 0, len(snapshot.Turns)),
 		Messages:      make([]v1ConversationMessage, 0, len(snapshot.Messages)),
 		Interactions:  make([]v1ConversationInteraction, 0, len(snapshot.Interactions)),
+		Children:      make([]v1ConversationChild, 0, len(snapshot.Children)),
 		EventCursor:   snapshot.EventCursor,
 		NextQueueSlot: snapshot.NextQueueSlot,
 	}
@@ -197,7 +228,37 @@ func v1ConversationSnapshotFromStore(snapshot *store.ConversationSnapshot) v1Con
 		}
 		out.Interactions = append(out.Interactions, item)
 	}
+	for _, child := range snapshot.Children {
+		out.Children = append(out.Children, v1ConversationChildFromStore(child))
+	}
 	return out
+}
+
+func v1ConversationChildFromStore(child *store.ConversationChild) v1ConversationChild {
+	item := v1ConversationChild{
+		ID:              child.ID,
+		ParentTurnID:    child.ParentTurnID,
+		Label:           child.Label,
+		Task:            child.Prompt,
+		Model:           child.Model,
+		ReasoningEffort: child.ReasoningEffort,
+		ContextTier:     child.ContextTier,
+		Status:          child.Status,
+		Result:          child.Result,
+		PatchState:      child.PatchState,
+		ChangedFiles:    child.ChangedFiles(),
+		CreatedAt:       child.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if child.ErrorMessage.Valid {
+		item.ErrorMessage = child.ErrorMessage.String
+	}
+	if child.StartedAt.Valid {
+		item.StartedAt = time.Unix(child.StartedAt.Int64, 0).UTC().Format(time.RFC3339)
+	}
+	if child.FinishedAt.Valid {
+		item.FinishedAt = time.Unix(child.FinishedAt.Int64, 0).UTC().Format(time.RFC3339)
+	}
+	return item
 }
 
 // v1ConversationSnapshot returns durable state for the hosted Copilot chat.
@@ -213,6 +274,7 @@ func (s *Server) v1ConversationSnapshot(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, v1ConversationSnapshot{
 			Turns: []v1ConversationTurn{}, Messages: []v1ConversationMessage{},
 			Interactions: []v1ConversationInteraction{},
+			Children:     []v1ConversationChild{},
 		})
 		return
 	}

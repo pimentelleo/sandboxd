@@ -52,6 +52,7 @@ import (
 	nginxwatch "github.com/tastyeffectco/sandboxd/control-plane/internal/nginx"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reaper"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reconcile"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxspec"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
@@ -307,23 +308,31 @@ func main() {
 	wakeTCPReady := durationFromEnvSec("SANDBOXD_WAKE_TCP_READY_TIMEOUT_SECONDS", defaultWakeTCPReadySec)
 	wakeGrace := durationFromEnvSec("SANDBOXD_WAKE_GRACE_SECONDS", defaultWakeGraceSec)
 	keepaliveMax := durationFromEnvSec("SANDBOXD_KEEPALIVE_MAX_SECONDS", defaultKeepaliveMaxSec)
+	// The deployment value seeds the persisted global provider and remains the
+	// fallback for databases created before the provider setting existed.
+	defaultAgent := envDefault("SANDBOXD_DEFAULT_AGENT", "opencode")
 
-	// Phase 8B — live, runtime-editable lifecycle tunables. Start from env
-	// defaults, then overlay any persisted edits (PATCH /v1/settings) so they
-	// survive restart. The reaper + keepalive path read this live.
+	// Runtime-editable settings start from deployment defaults, then overlay
+	// persisted edits (PATCH /v1/settings) so they survive restart.
 	live := instancecfg.New(instancecfg.Snapshot{
 		IdleEnabled:          idleInterval > 0,
 		IdleThresholdSeconds: int(idleThreshold.Seconds()),
 		KeepaliveMaxSeconds:  int(keepaliveMax.Seconds()),
+		AgentProvider:        defaultAgent,
 	})
 	if persisted, perr := st.GetInstanceSettings(ctx); perr == nil {
+		agentProvider := persisted.AgentProvider
+		if agentProvider == "" {
+			agentProvider = defaultAgent
+		}
 		live.Set(instancecfg.Snapshot{
 			IdleEnabled:          persisted.IdleReapEnabled,
 			IdleThresholdSeconds: persisted.IdleThresholdSeconds,
 			KeepaliveMaxSeconds:  persisted.KeepaliveMaxSeconds,
+			AgentProvider:        agentProvider,
 			DefaultModels:        persisted.AgentDefaultModels,
 		})
-		log.Info("instance settings: loaded persisted lifecycle tunables + agent default models")
+		log.Info("instance settings: loaded persisted editable settings")
 	}
 
 	inflight := activity.NewInflightExec()
@@ -390,7 +399,7 @@ func main() {
 	copilotManager, err := copilot.New(copilot.Config{
 		StateDir: filepath.Join(stateDir, "copilot"),
 		Cipher:   secretsCipher,
-		Executor: copilotDockerExecutor{client: dockerClient},
+		Executor: copilotDockerExecutor{client: dockerClient, store: st},
 		Log:      log.With("component", "copilot"),
 	})
 	if err != nil {
@@ -417,10 +426,6 @@ func main() {
 	if err := agentAuth.EnsureRoot(); err != nil {
 		log.Warn("agent-auth: could not create store root", "err", err.Error())
 	}
-	// A1 — which provider's auth dir gets mounted into new sandboxes (as the
-	// agent's HOME) when connected. Must match the agent runtimed runs.
-	defaultAgent := envDefault("SANDBOXD_DEFAULT_AGENT", "opencode")
-
 	// Credential-injecting auth proxy for claude-code (internal/authproxy). The
 	// sandbox reaches it at SANDBOXD_AGENT_PROXY_URL (in-network name of THIS
 	// process); we listen on SANDBOXD_AGENT_PROXY_ADDR. The real credential stays
@@ -537,10 +542,17 @@ func main() {
 			OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
 			RuntimePreset:     runtimePresetForSandbox(ctx, st, sb),
 		})
-		// Remove any existing container first so the name is free; ignore a
-		// not-found (the common case) and let Run surface a real failure.
-		if err := dockerClient.Remove(ctx, spec.Name); err != nil && err != docker.ErrNotFound {
-			log.Warn("recreate: remove existing container failed (continuing)", "err", err.Error())
+		// Remove any existing container first so the canonical name is free.
+		// Retain the canonical fallback in case a manually recreated container
+		// outlived the persisted container ID.
+		containers := []string{sandboxname.Reference(sb.ID, sb.ContainerID.String)}
+		if spec.Name != containers[0] {
+			containers = append(containers, spec.Name)
+		}
+		for _, container := range containers {
+			if err := dockerClient.Remove(ctx, container); err != nil && err != docker.ErrNotFound {
+				log.Warn("recreate: remove existing container failed (continuing)", "err", err.Error())
+			}
 		}
 		_, err := dockerClient.Run(ctx, spec)
 		return err
@@ -987,18 +999,38 @@ func (a dockerExecAdapter) Exec(ctx context.Context, name string, cmd []string) 
 
 // copilotDockerExecutor constrains SDK tools to the current sandbox namespace,
 // unprivileged user, and application workspace before invoking docker exec.
-type copilotDockerExecutor struct{ client *docker.Client }
+type copilotDockerExecutor struct {
+	client *docker.Client
+	store  *store.Store
+}
 
 func (a copilotDockerExecutor) ExecScoped(ctx context.Context, request copilot.ScopedExecRequest) (copilot.ScopedExecResult, error) {
-	if a.client == nil {
+	if a.client == nil || a.store == nil {
 		return copilot.ScopedExecResult{}, errors.New("GitHub Copilot executor is unavailable")
 	}
-	if !strings.HasPrefix(request.Container, "s-") || len(request.Container) <= len("s-") ||
+	sandboxID, childID, isChild, validTarget := copilot.WorkspaceToolContainerTarget(request.Container)
+	if !validTarget ||
 		request.User != "sandbox" || request.Workdir != "/home/sandbox/workspace/app" {
 		return copilot.ScopedExecResult{}, errors.New("invalid GitHub Copilot sandbox scope")
 	}
+	container := request.Container
+	if isChild {
+		childID = strings.ToUpper(childID)
+		child, err := a.store.GetConversationChild(ctx, childID)
+		if err != nil || child.Status != store.ConversationChildRunning ||
+			child.WorkerContainer != request.Container {
+			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot worker target is unavailable")
+		}
+	} else {
+		sandboxID = strings.ToUpper(sandboxID)
+		sandbox, err := a.store.Get(ctx, sandboxID)
+		if err != nil || sandbox.Status != "running" || sandboxname.Container(sandbox.ID) != request.Container {
+			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot sandbox target is unavailable")
+		}
+		container = sandboxname.Reference(sandbox.ID, sandbox.ContainerID.String)
+	}
 	result, err := a.client.ExecScoped(ctx, docker.ScopedExecRequest{
-		Container:   request.Container,
+		Container:   container,
 		User:        request.User,
 		Workdir:     request.Workdir,
 		Command:     request.Command,

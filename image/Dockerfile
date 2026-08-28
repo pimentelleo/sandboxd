@@ -142,8 +142,10 @@ COPY image/templates/ /opt/templates/
 COPY image/verify-base.sh /opt/verify-base.sh
 
 # Docker build contexts from Windows can contain CRLF shell scripts even when
-# Git stores them as LF. Normalize scripts that execute inside this Linux image.
+# Git stores them as LF. Normalize scripts and the shell/config files copied
+# into persistent sandbox homes.
 RUN sed -i 's/\r$//' /etc/profile.d/sandbox-env.sh /opt/verify-base.sh \
+    /opt/sandbox-skel/.profile /opt/sandbox-skel/.bashrc /opt/sandbox-skel/.gitconfig \
  && find /opt/templates -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
 
 # Sandbox user (uid/gid 1000 inside the container; userns-remap offsets

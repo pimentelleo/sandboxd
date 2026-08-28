@@ -50,6 +50,7 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   const [keys, setKeys] = useState<ApiKey[]>([])
   const [keyName, setKeyName] = useState('')
   const [newKey, setNewKey] = useState('')
+  const [provider, setProvider] = useState('')
   const [models, setModels] = useState<Record<string, string>>({})
   const [githubCopilotPAT, setGithubCopilotPAT] = useState('')
   const [githubCopilotFormOpen, setGithubCopilotFormOpen] = useState(false)
@@ -59,11 +60,12 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
   const loadCreds = useCallback(() => api.listGitCredentials().then(setCreds).catch(() => {}), [])
   const loadKeys = useCallback(() => api.listApiKeys().then(setKeys).catch(() => {}), [])
   useEffect(() => {
-    api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds); setModels(d.agents.default_models || {}) }).catch((e) => onError((e as Error).message))
+    api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds); setProvider(d.agents.provider || 'opencode'); setModels(d.agents.default_models || {}) }).catch((e) => onError((e as Error).message))
     loadAgents(); loadCreds(); loadKeys()
   }, [onError, loadAgents, loadCreds, loadKeys])
   if (!s) return <div style={{ padding: 40, color: c.muted2 }}>Loading…</div>
   const lifecycleEditable = (s.editable || []).some((p) => p.startsWith('lifecycle.'))
+  const providerEditable = (s.editable || []).some((p) => p === 'agents.provider')
   const modelsEditable = (s.editable || []).some((p) => p === 'agents.default_models')
 
   const connectClaude = async () => {
@@ -95,6 +97,14 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
     setGithubCopilotFormOpen((open) => !open)
   }
   const saveLifecycle = async () => { try { await api.patchSettings({ lifecycle: { idle_reap_enabled: idle, idle_threshold_seconds: idleSec, keepalive_max_seconds: keepSec } }); toast('Lifecycle saved') } catch (e) { onError((e as Error).message) } }
+  const saveProvider = async () => {
+    try {
+      const d = await api.patchSettings({ agents: { provider } })
+      setS(d)
+      setProvider(d.agents.provider || 'opencode')
+      toast('Agent provider saved')
+    } catch (e) { onError((e as Error).message) }
+  }
   const saveModels = async () => { try { const d = await api.patchSettings({ agents: { default_models: models } }); setModels(d.agents.default_models || {}); toast('Default models saved') } catch (e) { onError((e as Error).message) } }
   const addCred = async () => { if (!gc.name || !gc.host || !gc.token) return; try { await api.createGitCredential(gc); setGc({ name: '', host: '', username: '', token: '' }); toast('Credential added'); loadCreds() } catch (e) { onError((e as Error).message) } }
   const changePw = async () => { if (!curPw || !newPw) return; try { await api.changePassword({ current_password: curPw, new_password: newPw }); setCurPw(''); setNewPw(''); toast('Password changed') } catch (e) { onError((e as Error).message) } }
@@ -123,6 +133,20 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
 
       <Card style={{ padding: 16, marginBottom: 12 }}>
         <H style={{ marginBottom: 10 }}>Agents</H>
+        <div style={{ marginBottom: 14, paddingBottom: 12, borderBottom: `1px solid ${c.border}` }} data-testid="settings-agent-provider">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <H style={{ fontSize: 13 }}>Default provider</H>
+            <Src kind={providerEditable ? 'editable' : undefined} env={providerEditable ? undefined : 'SANDBOXD_DEFAULT_AGENT'} />
+            <span style={{ marginLeft: 'auto', fontSize: 11.5, color: c.muted2 }}>used by every app chat</span>
+          </div>
+          <div style={{ color: c.muted2, fontSize: 12, lineHeight: 1.5, marginBottom: 10 }}>Choose the provider once for this sandboxd instance. Each app uses it automatically; choose a model per message in the app chat.</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <select value={provider} onChange={(e) => setProvider(e.target.value)} disabled={!providerEditable} aria-label="Default agent provider" data-testid="settings-agent-provider-select" style={{ background: c.bg, border: `1px solid ${c.border2}`, borderRadius: 7, padding: '5px 7px', color: c.fg, fontSize: 11.5, fontFamily: font.sans, minWidth: 190 }}>
+              {agents.filter((a) => a.id !== 'codex' && a.runnable).map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+            </select>
+            <Btn onClick={saveProvider} disabled={!providerEditable || !provider} data-testid="save-agent-provider">Save provider</Btn>
+          </div>
+        </div>
         <div data-testid="settings-agents-list">
           {agents.map((a) => {
             // Codex is disabled for now — its ChatGPT-subscription auth can't be

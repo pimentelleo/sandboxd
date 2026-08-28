@@ -23,10 +23,12 @@ func newSettingsServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { st.Close() })
 	return &Server{
-		Store: st,
-		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store:        st,
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DefaultAgent: "opencode",
 		Live: instancecfg.New(instancecfg.Snapshot{
 			IdleEnabled: true, IdleThresholdSeconds: 2100, KeepaliveMaxSeconds: 86400,
+			AgentProvider: "opencode",
 		}),
 		Instance: InstanceInfo{Version: "test", AgentProviders: []string{"opencode"}},
 	}
@@ -172,6 +174,49 @@ func TestPatchAgentDefaultModelsValidation(t *testing.T) {
 	}
 	if got := s.Live.DefaultModel("opencode"); got != "" {
 		t.Errorf("rejected patches must not persist: %q", got)
+	}
+}
+
+// The global provider survives a settings write and becomes the server-side
+// default for task requests that intentionally omit agent.
+func TestPatchAgentProvider(t *testing.T) {
+	s := newSettingsServer(t)
+	w := patchSettings(s, `{"agents":{"provider":"github-copilot"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set: got %d: %s", w.Code, w.Body)
+	}
+	if got := s.Live.AgentProvider(); got != "github-copilot" {
+		t.Errorf("live provider = %q; want github-copilot", got)
+	}
+	if got := s.defaultTaskAgent(); got != "github-copilot" {
+		t.Errorf("task default = %q; want github-copilot", got)
+	}
+	persisted, err := s.Store.GetInstanceSettings(context.Background())
+	if err != nil || persisted == nil || persisted.AgentProvider != "github-copilot" {
+		t.Errorf("provider not persisted: %+v err=%v", persisted, err)
+	}
+	var response struct {
+		Agents struct {
+			Provider string `json:"provider"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Agents.Provider != "github-copilot" {
+		t.Errorf("response provider = %q; want github-copilot", response.Agents.Provider)
+	}
+
+	for _, body := range []string{
+		`{"agents":{"provider":"bogus-agent"}}`,
+		`{"agents":{"provider":" "}}`,
+	} {
+		if w := patchSettings(s, body); w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: got %d, want 400", body, w.Code)
+		}
+	}
+	if got := s.Live.AgentProvider(); got != "github-copilot" {
+		t.Errorf("invalid provider patch changed live provider to %q", got)
 	}
 }
 

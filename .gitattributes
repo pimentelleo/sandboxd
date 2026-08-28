@@ -1,2 +1,6 @@
-# Shell entrypoints execute in Linux containers and must retain POSIX line endings.
+# Shell entrypoints and the managed login profile execute in Linux containers
+# and must retain POSIX line endings.
 *.sh text eol=lf
+image/skel/.profile text eol=lf
+image/skel/.bashrc text eol=lf
+image/skel/.gitconfig text eol=lf

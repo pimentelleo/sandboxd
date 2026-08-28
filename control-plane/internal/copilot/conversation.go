@@ -3,7 +3,10 @@ package copilot
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 )
 
 const (
@@ -24,23 +27,40 @@ Never present a blocking question only as normal assistant text. Use normal text
 for explanations and progress updates, not as a substitute for ask_user. Do not
 ask questions merely to defer low-impact work; make a reasonable assumption
 instead and disclose it in the final response.`
+
+	backgroundDelegationInstructions = `
+
+## Delegating background work
+
+Use delegate_task only for bounded, independent work that can safely happen in
+parallel with your primary task. The delegated agent receives an isolated copy
+of the workspace and can never change this workspace directly. Continue your
+own work after delegating. Use list_delegated_tasks or get_delegated_task to
+inspect completion, then use read_delegated_change to review individual changes
+before deciding whether to apply them yourself with the normal workspace tools.
+Never assume a delegated change has already been applied.`
 )
 
 // ConversationTurnRequest is a hosted, durable conversation turn. It is never
 // accepted directly from a sandbox; the control-plane coordinator supplies the
 // sandbox ID, callbacks, and immutable selected mode.
 type ConversationTurnRequest struct {
-	ConversationID  string
-	SandboxID       string
-	Prompt          string
-	Mode            string
-	Model           string
-	ReasoningEffort string
-	ContextTier     string
-	SystemPrompt    string
-	OnEvent         func(Envelope)
-	OnUserInput     func(RuntimeInputRequest) (RuntimeInputResponse, error)
-	OnPlan          func(RuntimePlanRequest) (RuntimePlanResponse, error)
+	ConversationID string
+	SandboxID      string
+	TurnID         string
+	// WorkspaceContainer is a control-plane selected target for restricted
+	// workspace tools. Empty uses the sandbox associated with SandboxID.
+	WorkspaceContainer string
+	Prompt             string
+	Mode               string
+	Model              string
+	ReasoningEffort    string
+	ContextTier        string
+	SystemPrompt       string
+	OnEvent            func(Envelope)
+	OnUserInput        func(RuntimeInputRequest) (RuntimeInputResponse, error)
+	OnPlan             func(RuntimePlanRequest) (RuntimePlanResponse, error)
+	Delegation         BackgroundDelegate
 }
 
 // RunConversationTurn runs exactly one native SDK turn and leaves its durable
@@ -53,6 +73,16 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 		len(request.ContextTier) > 64 || len(request.SystemPrompt) > maxSystem ||
 		!validConversationMode(request.Mode) {
 		return errors.New("invalid Copilot conversation turn")
+	}
+	if request.Delegation != nil && !validIdentifier(request.TurnID) {
+		return errors.New("invalid Copilot conversation delegation")
+	}
+	workspaceContainer := request.WorkspaceContainer
+	if workspaceContainer == "" {
+		workspaceContainer = sandboxContainerName(request.SandboxID)
+	}
+	if !validWorkspaceContainer(workspaceContainer) {
+		return errors.New("invalid Copilot workspace target")
 	}
 
 	taskCtx, cancel := context.WithCancel(ctx)
@@ -68,8 +98,10 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 	}
 	events := make(chan RuntimeEvent, 64)
 	idleEvents := make(chan struct{}, 1)
+	sessionError := make(chan struct{})
+	var sessionErrorOnce sync.Once
 	eventPumpDone := make(chan struct{})
-	stream := streamState{redact: redactText(request.ConversationID, request.SandboxID, "s-"+request.SandboxID, token)}
+	stream := streamState{redact: redactText(request.ConversationID, request.SandboxID, workspaceContainer, token)}
 	var stopEventsOnce sync.Once
 	stopEvents := func() {
 		stopEventsOnce.Do(func() {
@@ -83,6 +115,10 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 		for {
 			select {
 			case event := <-events:
+				if event.Type == "error" {
+					sessionErrorOnce.Do(func() { close(sessionError) })
+					continue
+				}
 				if stream.handle(event, request.OnEvent) {
 					select {
 					case idleEvents <- struct{}{}:
@@ -98,8 +134,11 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 	gate := newMutationGate(request.Mode != ConversationModePlan)
 	runtimeConfig := RuntimeConfig{
 		Model: request.Model, ReasoningEffort: request.ReasoningEffort, ContextTier: request.ContextTier,
-		Token: token, SystemPrompt: conversationSystemPrompt(request.SystemPrompt),
-		Workdir: m.runtimeWorkdir(), Tools: conversationTools(request.SandboxID, m.cfg.Executor, gate),
+		Token: token, SystemPrompt: conversationSystemPrompt(request.SystemPrompt, request.Delegation != nil),
+		Workdir: m.runtimeWorkdir(), Tools: conversationTools(workspaceContainer, m.cfg.Executor, gate,
+			request.Delegation, BackgroundTaskRequest{
+				ConversationID: request.ConversationID, TurnID: request.TurnID, SandboxID: request.SandboxID,
+			}),
 		OnEvent: func(event RuntimeEvent) {
 			select {
 			case events <- event:
@@ -160,6 +199,8 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 	)
 	for {
 		select {
+		case <-sessionError:
+			return ErrSessionError
 		case err := <-sendResult:
 			if err != nil {
 				if taskCtx.Err() != nil {
@@ -169,11 +210,17 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 			}
 			sendComplete = true
 			if idle {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-idleEvents:
 			idle = true
 			if sendComplete {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-taskCtx.Done():
@@ -288,6 +335,51 @@ func allowsMutation(action string) bool {
 	return action == ConversationModeInteractive || action == ConversationModeAutopilot
 }
 
-func conversationSystemPrompt(base string) string {
-	return base + conversationInteractionInstructions
+func conversationSystemPrompt(base string, delegationEnabled ...bool) string {
+	prompt := base + conversationInteractionInstructions
+	if len(delegationEnabled) != 0 && delegationEnabled[0] {
+		prompt += backgroundDelegationInstructions
+	}
+	return prompt
+}
+
+const backgroundWorkerContainerPrefix = "sandboxd-child-"
+
+// BackgroundWorkerContainerName returns the opaque, non-preview container name
+// for one isolated child. It remains in this package so the executor can accept
+// only targets the hosted Copilot tool layer knows how to name.
+func BackgroundWorkerContainerName(id string) string {
+	return backgroundWorkerContainerPrefix + strings.ToLower(id)
+}
+
+func sandboxContainerName(id string) string {
+	return sandboxname.Container(id)
+}
+
+// IsWorkspaceToolContainer identifies the only container name families the
+// hosted-Copilot executor may service. Per-turn fixed-target wrappers still
+// prevent one conversation from selecting another sandbox or child.
+func IsWorkspaceToolContainer(name string) bool {
+	return validWorkspaceContainer(name)
+}
+
+// WorkspaceToolContainerTarget parses a valid hosted-Copilot tool target. The
+// control plane uses it to confirm the name still belongs to a live sandbox or
+// delegated worker before invoking Docker.
+func WorkspaceToolContainerTarget(name string) (sandboxID, childID string, isChild, ok bool) {
+	switch {
+	case strings.HasPrefix(name, "s-"):
+		sandboxID = strings.TrimPrefix(name, "s-")
+		return sandboxID, "", false, validIdentifier(sandboxID) && name == sandboxContainerName(sandboxID)
+	case strings.HasPrefix(name, backgroundWorkerContainerPrefix):
+		childID = strings.TrimPrefix(name, backgroundWorkerContainerPrefix)
+		return "", childID, true, validIdentifier(childID) && name == BackgroundWorkerContainerName(childID)
+	default:
+		return "", "", false, false
+	}
+}
+
+func validWorkspaceContainer(name string) bool {
+	_, _, _, ok := WorkspaceToolContainerTarget(name)
+	return ok
 }

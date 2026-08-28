@@ -236,8 +236,8 @@ func isNotFoundStderr(stderr []byte) bool {
 		strings.Contains(low, "no such container")
 }
 
-// Start runs `docker start <name>`. Idempotent — a no-op when the
-// container is already running. Required by Phase 5's wake path.
+// Start runs `docker start <name>`. The caller must not use it for an already
+// running container, which Docker and Podman report as an error.
 func (c *Client) Start(ctx context.Context, name string) error {
 	_, err := c.run(ctx, "start", name)
 	return err
@@ -264,6 +264,34 @@ func (c *Client) Stop(ctx context.Context, name string, timeoutSec int) error {
 		if isNotFoundStderr(exitErr.Stderr) {
 			return ErrNotFound
 		}
+	}
+	return err
+}
+
+// Pause freezes all processes in a running container without changing its
+// lifecycle state. Callers use it only while taking a short, host-side copy of
+// a live workspace and must always follow with Unpause.
+func (c *Client) Pause(ctx context.Context, name string) error {
+	_, err := c.run(ctx, "pause", name)
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && isNotFoundStderr(exitErr.Stderr) {
+		return ErrNotFound
+	}
+	return err
+}
+
+// Unpause resumes a container previously frozen with Pause.
+func (c *Client) Unpause(ctx context.Context, name string) error {
+	_, err := c.run(ctx, "unpause", name)
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && isNotFoundStderr(exitErr.Stderr) {
+		return ErrNotFound
 	}
 	return err
 }

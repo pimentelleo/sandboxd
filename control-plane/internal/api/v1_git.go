@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -117,7 +118,7 @@ func (s *Server) v1GitStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false, "reason": reason})
 		return
 	}
-	writeJSON(w, http.StatusOK, gitStatus(r.Context(), s.gitExec(), sb.ID))
+	writeJSON(w, http.StatusOK, gitStatusInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String)))
 }
 
 // GET /v1/apps/{id}/git/diff?path=<optional relative path>
@@ -139,7 +140,7 @@ func (s *Server) v1GitDiff(w http.ResponseWriter, r *http.Request) {
 		path = filepath.Clean(path)
 	}
 	// NOTE: do not log the diff body — it can contain secrets.
-	writeJSON(w, http.StatusOK, gitDiff(r.Context(), s.gitExec(), sb.ID, path))
+	writeJSON(w, http.StatusOK, gitDiffInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String), path))
 }
 
 // --- commit (B1) ------------------------------------------------------
@@ -208,7 +209,7 @@ func (s *Server) v1GitCommit(w http.ResponseWriter, r *http.Request) {
 	s.Locks.Lock(gitLockKey(sb.ID))
 	defer s.Locks.Unlock(gitLockKey(sb.ID))
 	// NOTE: do not log the message or path contents — they can carry secrets.
-	writeJSON(w, http.StatusOK, gitCommit(r.Context(), s.gitExec(), sb.ID, req))
+	writeJSON(w, http.StatusOK, gitCommitInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String), req))
 }
 
 // gitLockKey namespaces the per-workspace git mutation lock so it never collides
@@ -228,14 +229,18 @@ func (s *Server) gitExec() sandboxExecer {
 // path-scoped commit — never more than selected, never `git add -A`. Creds-free,
 // --no-verify, ephemeral author via -c (never written to .git/config).
 func gitCommit(ctx context.Context, ex sandboxExecer, sbID string, req v1GitCommitReq) v1GitCommitResp {
+	return gitCommitInContainer(ctx, ex, sandboxname.Container(sbID), req)
+}
+
+func gitCommitInContainer(ctx context.Context, ex sandboxExecer, container string, req v1GitCommitReq) v1GitCommitResp {
 	// 1. Resolve the actual change set (and the default user selection).
-	st := gitStatus(ctx, ex, sbID)
+	st := gitStatusInContainer(ctx, ex, container)
 	if !st.Available {
 		return v1GitCommitResp{Committed: false, Reason: st.Reason}
 	}
 	// B1 does not support an empty repo (no HEAD) — a path-scoped partial commit
 	// needs HEAD, and we must never widen to commit more than selected.
-	if h, err := ex.Exec(ctx, "s-"+sbID, gitArgs("rev-parse", "--verify", "HEAD")); err != nil || h.ExitCode != 0 {
+	if h, err := ex.Exec(ctx, container, gitArgs("rev-parse", "--verify", "HEAD")); err != nil || h.ExitCode != 0 {
 		return v1GitCommitResp{Committed: false, Reason: "empty_repo_unsupported"}
 	}
 
@@ -271,7 +276,7 @@ func gitCommit(ctx context.Context, ex sandboxExecer, sbID string, req v1GitComm
 
 	// 3. Stage exactly toStage (explicit pathspecs; NEVER -A/.).
 	addArgs := append(gitArgs("add", "--"), toStage...)
-	if a, err := ex.Exec(ctx, "s-"+sbID, addArgs); err != nil || a.ExitCode != 0 {
+	if a, err := ex.Exec(ctx, container, addArgs); err != nil || a.ExitCode != 0 {
 		return v1GitCommitResp{Committed: false, Reason: gitErrReasonOf(a, err)}
 	}
 
@@ -288,16 +293,16 @@ func gitCommit(ctx context.Context, ex sandboxExecer, sbID string, req v1GitComm
 	commitArgs := gitArgs("-c", "user.name="+name, "-c", "user.email="+email,
 		"commit", "--no-verify", "-m", req.Message, "--")
 	commitArgs = append(commitArgs, toStage...)
-	if c, err := ex.Exec(ctx, "s-"+sbID, commitArgs); err != nil || c.ExitCode != 0 {
+	if c, err := ex.Exec(ctx, container, commitArgs); err != nil || c.ExitCode != 0 {
 		return v1GitCommitResp{Committed: false, Reason: gitErrReasonOf(c, err)}
 	}
 
 	// 5. Resolve sha + branch.
 	sha, branch := "", ""
-	if o, err := ex.Exec(ctx, "s-"+sbID, gitArgs("rev-parse", "HEAD")); err == nil && o.ExitCode == 0 {
+	if o, err := ex.Exec(ctx, container, gitArgs("rev-parse", "HEAD")); err == nil && o.ExitCode == 0 {
 		sha = strings.TrimSpace(o.Stdout)
 	}
-	if o, err := ex.Exec(ctx, "s-"+sbID, gitArgs("rev-parse", "--abbrev-ref", "HEAD")); err == nil && o.ExitCode == 0 {
+	if o, err := ex.Exec(ctx, container, gitArgs("rev-parse", "--abbrev-ref", "HEAD")); err == nil && o.ExitCode == 0 {
 		branch = strings.TrimSpace(o.Stdout)
 	}
 	return v1GitCommitResp{Committed: true, SHA: sha, Branch: branch, FilesCommitted: toStage}
@@ -345,7 +350,11 @@ func validAuthorField(v string) bool {
 // --- git logic (testable with a fake execer) --------------------------
 
 func gitStatus(ctx context.Context, ex sandboxExecer, sbID string) v1GitStatusResp {
-	st, err := ex.Exec(ctx, "s-"+sbID, gitArgs("status", "--porcelain=v1", "--branch", "-z"))
+	return gitStatusInContainer(ctx, ex, sandboxname.Container(sbID))
+}
+
+func gitStatusInContainer(ctx context.Context, ex sandboxExecer, container string) v1GitStatusResp {
+	st, err := ex.Exec(ctx, container, gitArgs("status", "--porcelain=v1", "--branch", "-z"))
 	if err != nil {
 		return v1GitStatusResp{Available: false, Reason: "exec_failed", Files: []v1GitFile{}}
 	}
@@ -355,7 +364,7 @@ func gitStatus(ctx context.Context, ex sandboxExecer, sbID string) v1GitStatusRe
 	branch, ahead, behind, allFiles := parsePorcelainZ(st.Stdout)
 	user, runtime := splitRuntimeFiles(allFiles)
 	head := ""
-	if h, err := ex.Exec(ctx, "s-"+sbID, gitArgs("rev-parse", "HEAD")); err == nil && h.ExitCode == 0 {
+	if h, err := ex.Exec(ctx, container, gitArgs("rev-parse", "HEAD")); err == nil && h.ExitCode == 0 {
 		head = strings.TrimSpace(h.Stdout)
 	}
 	return v1GitStatusResp{
@@ -408,13 +417,17 @@ func splitRuntimeFiles(all []v1GitFile) (user, runtime []v1GitFile) {
 }
 
 func gitDiff(ctx context.Context, ex sandboxExecer, sbID, path string) v1GitDiffResp {
+	return gitDiffInContainer(ctx, ex, sandboxname.Container(sbID), path)
+}
+
+func gitDiffInContainer(ctx context.Context, ex sandboxExecer, container, path string) v1GitDiffResp {
 	// --no-ext-diff / --no-textconv are `git diff` options, NOT top-level git
 	// options — they must come AFTER the `diff` subcommand or git errors out.
 	args := []string{"diff", "--no-ext-diff", "--no-textconv", "HEAD"}
 	if path != "" {
 		args = append(args, "--", path)
 	}
-	d, err := ex.Exec(ctx, "s-"+sbID, gitArgs(args...))
+	d, err := ex.Exec(ctx, container, gitArgs(args...))
 	if err != nil {
 		return v1GitDiffResp{Available: false, Reason: "exec_failed"}
 	}

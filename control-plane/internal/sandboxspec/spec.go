@@ -11,10 +11,12 @@
 package sandboxspec
 
 import (
+	"strings"
+
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/traefik"
-	"strings"
 )
 
 // Env carries the instance-level settings a sandbox container needs. These
@@ -41,7 +43,7 @@ type Env struct {
 // read-only rootfs, all capabilities dropped, no-new-privileges, tmpfs /tmp,
 // the workspace bind mount, and the Traefik preview labels.
 func Build(sb *store.Sandbox, e Env) docker.RunSpec {
-	name := "s-" + sb.ID
+	name := sandboxname.Container(sb.ID)
 
 	env := []string{}
 	if e.RuntimePreset != "" {

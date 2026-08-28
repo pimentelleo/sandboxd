@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
@@ -97,5 +98,104 @@ func TestSnapshotActiveConversationIncludesSingleCursorForStoredState(t *testing
 	if len(snapshot.Turns) != 1 || snapshot.Turns[0].Model != "gpt-5.3-codex" ||
 		snapshot.Turns[0].ReasoningEffort != "high" || snapshot.Turns[0].ContextTier != "long_context" {
 		t.Fatalf("snapshot model settings = %#v", snapshot.Turns)
+	}
+}
+
+func TestConversationChildInheritsTurnSettingsAndExposesBoundedPatch(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	const sandboxID = "01CHILDLIFECYCLETESTSANDBOX"
+	if err := st.Create(ctx, minimalSandbox(sandboxID, "sleep")); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	conversation := &Conversation{
+		ID: "conversation-child", SandboxID: sandboxID, Agent: ConversationAgentGitHubCopilot,
+		DefaultMode: ConversationModeInteractive,
+	}
+	if err := st.CreateConversation(ctx, conversation); err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+	turn, _, err := st.EnqueueConversationTurn(ctx, conversation.ID, "turn-child", "task-child",
+		"coordinate the work", ConversationModeInteractive, ConversationTurnSettings{
+			Model: "gpt-5.6-terra", ReasoningEffort: "max", ContextTier: "long_context",
+		})
+	if err != nil {
+		t.Fatalf("enqueue turn: %v", err)
+	}
+	if _, err := st.ClaimNextConversationTurn(ctx, conversation.ID); err != nil {
+		t.Fatalf("claim turn: %v", err)
+	}
+
+	child := &ConversationChild{
+		ID: "child-1", ConversationID: conversation.ID, ParentTurnID: turn.ID,
+		Label: "Add tests", Prompt: "Write focused tests.", WorkspacePath: "/private/child-1",
+	}
+	if err := st.CreateConversationChild(ctx, child); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if child.Model != "gpt-5.6-terra" || child.ReasoningEffort != "max" || child.ContextTier != "long_context" {
+		t.Fatalf("child settings = %#v", child)
+	}
+	if _, err := st.ClaimConversationChild(ctx, child.ID); err != nil {
+		t.Fatalf("claim child: %v", err)
+	}
+	if _, err := st.StartConversationChild(ctx, child.ID, "sandboxd-child-child-1"); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	if _, err := st.FinishConversationChild(ctx, child.ID, ConversationChildSucceeded, "done", "",
+		ConversationChildPatchAvailable, &ConversationChildPatch{Changes: []ConversationChildChange{{
+			Path: "../secret", Content: "no",
+		}}}); err == nil {
+		t.Fatal("unsafe delegated patch was accepted")
+	}
+	finished, err := st.FinishConversationChild(ctx, child.ID, ConversationChildSucceeded, "done", "",
+		ConversationChildPatchAvailable, &ConversationChildPatch{Changes: []ConversationChildChange{{
+			Path: "test/app_test.go", BaseSHA256: "abc", Content: "package app",
+		}}})
+	if err != nil {
+		t.Fatalf("finish child: %v", err)
+	}
+	if finished.Status != ConversationChildSucceeded || finished.PatchState != ConversationChildPatchAvailable {
+		t.Fatalf("finished child = %#v", finished)
+	}
+	if _, err := st.RequestConversationChildCancellation(ctx, conversation.ID, child.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("cancel terminal child error = %v; want conflict", err)
+	}
+
+	cancelling := &ConversationChild{
+		ID: "child-cancelling", ConversationID: conversation.ID, ParentTurnID: turn.ID,
+		Label: "Cancelled work", Prompt: "This result must not be retained.", WorkspacePath: "/private/child-cancelling",
+	}
+	if err := st.CreateConversationChild(ctx, cancelling); err != nil {
+		t.Fatalf("create cancelling child: %v", err)
+	}
+	if _, err := st.ClaimConversationChild(ctx, cancelling.ID); err != nil {
+		t.Fatalf("claim cancelling child: %v", err)
+	}
+	if _, err := st.StartConversationChild(ctx, cancelling.ID, "sandboxd-child-child-cancelling"); err != nil {
+		t.Fatalf("start cancelling child: %v", err)
+	}
+	if _, err := st.RequestConversationChildCancellation(ctx, conversation.ID, cancelling.ID); err != nil {
+		t.Fatalf("request child cancellation: %v", err)
+	}
+	cancelled, err := st.FinishConversationChild(ctx, cancelling.ID, ConversationChildSucceeded, "late result", "",
+		ConversationChildPatchAvailable, &ConversationChildPatch{Changes: []ConversationChildChange{{
+			Path: "should-not-survive.txt", BaseSHA256: "abc", Content: "late patch",
+		}}})
+	if err != nil {
+		t.Fatalf("finish cancelling child: %v", err)
+	}
+	if cancelled.Status != ConversationChildCancelled || cancelled.Result != "" ||
+		cancelled.PatchState != ConversationChildPatchNone || cancelled.PatchJSON != "" {
+		t.Fatalf("cancelled child retained completion data: %#v", cancelled)
+	}
+
+	snapshot, err := st.SnapshotActiveConversation(ctx, sandboxID)
+	if err != nil {
+		t.Fatalf("snapshot conversation: %v", err)
+	}
+	if len(snapshot.Children) != 2 || snapshot.Children[0].ID != child.ID ||
+		snapshot.Children[0].ChangedFiles()[0] != "test/app_test.go" {
+		t.Fatalf("snapshot children = %#v", snapshot.Children)
 	}
 }

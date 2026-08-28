@@ -25,6 +25,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/loopback"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
@@ -101,7 +102,10 @@ func Once(ctx context.Context, d Deps) (Result, error) {
 		d.Log.Warn("reconcile: list orphan-candidate containers failed", "err", err.Error())
 	} else {
 		for _, name := range names {
-			id := strings.TrimPrefix(name, "s-")
+			id, ok := sandboxname.IDFromContainer(name)
+			if !ok {
+				continue
+			}
 			if knownIDs[id] {
 				continue
 			}
@@ -188,7 +192,7 @@ func (d *Deps) reconcileRow(ctx context.Context, sb *store.Sandbox, res *Result)
 		return
 	}
 
-	name := "s-" + sb.ID
+	name := sandboxname.Reference(sb.ID, sb.ContainerID.String)
 	cj, err := d.Docker.Inspect(ctx, name)
 	if err != nil {
 		// Not found → mark stopped (do NOT auto-recreate).

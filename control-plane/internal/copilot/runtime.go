@@ -169,12 +169,16 @@ func availableTools(config RuntimeConfig) []string {
 	if config.OnPlanRequest != nil {
 		tools.AddBuiltIn("exit_plan_mode")
 	}
-	return tools.
-		AddCustom("list_files").
-		AddCustom("read_file").
-		AddCustom("search_files").
-		AddCustom("write_file").
-		AddCustom("run_command").ToSlice()
+	if config.Tools == nil {
+		for _, name := range []string{"list_files", "read_file", "search_files", "write_file", "run_command"} {
+			tools.AddCustom(name)
+		}
+	} else {
+		for _, tool := range config.Tools {
+			tools.AddCustom(tool.Name)
+		}
+	}
+	return tools.ToSlice()
 }
 
 func systemMessage(content string) *sdk.SystemMessageConfig {
@@ -222,6 +226,10 @@ func eventAdapter(send func(RuntimeEvent), correlation *interactionCorrelator) s
 			emitRuntimeEvent(send, RuntimeEvent{Type: "tool_complete", ToolCallID: data.ToolCallID, Success: data.Success})
 		case *sdk.AssistantIdleData:
 			emitRuntimeEvent(send, RuntimeEvent{Type: "idle"})
+		case *sdk.SessionErrorData:
+			// Session errors are handled by the manager, which exposes only a
+			// generic failure to callers and keeps provider diagnostics private.
+			emitRuntimeEvent(send, RuntimeEvent{Type: "error", Text: data.Message})
 		case *sdk.UserInputRequestedData:
 			if correlation != nil {
 				correlation.pushInput(data.RequestID)

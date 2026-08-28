@@ -76,6 +76,9 @@ func TestV1SettingsShapeAndNoSecretLeak(t *testing.T) {
 	if caps["snapshots"] != false {
 		t.Error("capabilities.snapshots should be false (Snapshot nil)")
 	}
+	if got := m["agents"].(map[string]any)["provider"]; got != "opencode" {
+		t.Errorf("agents.provider = %v; want opencode", got)
+	}
 	// Presets include the accepted ids (not an exact count).
 	ids := map[string]bool{}
 	for _, p := range m["presets"].([]any) {

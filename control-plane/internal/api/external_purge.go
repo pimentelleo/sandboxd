@@ -12,6 +12,8 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
 // purgeOne is the irreversible per-sandbox teardown shared by all
@@ -65,7 +67,12 @@ func (s *Server) purgeOne(ctx context.Context, id string) (freedBytes int64, ext
 	}
 
 	// Container teardown if one exists.
-	name := "s-" + id
+	name := sandboxname.Container(id)
+	if sb, e := s.Store.Get(ctx, id); e == nil {
+		name = sandboxname.Reference(sb.ID, sb.ContainerID.String)
+	} else if !errors.Is(e, store.ErrNotFound) {
+		return 0, externalUserID, fmt.Errorf("get sandbox: %w", e)
+	}
 	if _, e := s.Docker.Inspect(ctx, name); e == nil {
 		_ = s.Docker.Stop(ctx, name, 10)
 		if e := s.Docker.Remove(ctx, name); e != nil {

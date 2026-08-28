@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 )
 
 // RunTask validates and consumes a task capability, then forwards only safe
@@ -37,8 +39,10 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 
 	taskCtx, cancel := context.WithCancel(ctx)
 	events := make(chan RuntimeEvent, 64)
-	stream := streamState{redact: redactText(request.Capability, cap.sandboxID, "s-"+cap.sandboxID, token)}
+	stream := streamState{redact: redactText(request.Capability, cap.sandboxID, sandboxname.Container(cap.sandboxID), token)}
 	idleEvents := make(chan struct{}, 1)
+	sessionError := make(chan struct{})
+	var sessionErrorOnce sync.Once
 	eventPumpDone := make(chan struct{})
 	var stopEventsOnce sync.Once
 	stopEvents := func() {
@@ -53,6 +57,10 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 		for {
 			select {
 			case event := <-events:
+				if event.Type == "error" {
+					sessionErrorOnce.Do(func() { close(sessionError) })
+					continue
+				}
 				if stream.handle(event, emit) {
 					select {
 					case idleEvents <- struct{}{}:
@@ -111,17 +119,25 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 	)
 	for {
 		select {
+		case <-sessionError:
+			return ErrSessionError
 		case err := <-sendResult:
 			if err != nil {
 				return errors.New("unable to start Copilot task")
 			}
 			sendComplete = true
 			if idle {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-idleEvents:
 			idle = true
 			if sendComplete {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-taskCtx.Done():
@@ -129,6 +145,15 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 			_ = session.Abort(context.Background())
 			return nil
 		}
+	}
+}
+
+func providerErrorReported(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -255,7 +280,9 @@ func (s *streamState) handle(event RuntimeEvent, emit func(Envelope)) bool {
 
 func isBridgeTool(name string) bool {
 	switch name {
-	case "list_files", "read_file", "search_files", "write_file", "run_command":
+	case "list_files", "read_file", "search_files", "write_file", "run_command",
+		"delegate_task", "list_delegated_tasks", "get_delegated_task",
+		"read_delegated_change", "cancel_delegated_task":
 		return true
 	default:
 		return false
