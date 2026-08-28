@@ -118,6 +118,19 @@ func TestWorkspaceToolContainerTargetRejectsUnknownNames(t *testing.T) {
 	}
 }
 
+func TestWorkspaceToolContainerNamesAreLowercase(t *testing.T) {
+	id := "01M14B2Z6T97D5ZBCQRVZ1463E"
+	if got, want := sandboxContainerName(id), "s-01m14b2z6t97d5zbcqrvz1463e"; got != want {
+		t.Fatalf("sandbox container name = %q, want %q", got, want)
+	}
+	if _, _, _, ok := WorkspaceToolContainerTarget("s-" + id); ok {
+		t.Fatal("uppercase sandbox target was accepted")
+	}
+	if got, want := BackgroundWorkerContainerName(id), "sandboxd-child-01m14b2z6t97d5zbcqrvz1463e"; got != want {
+		t.Fatalf("worker container name = %q, want %q", got, want)
+	}
+}
+
 func TestDelegationToolResponsesRemainBounded(t *testing.T) {
 	task := BackgroundTask{
 		ID: "child-1", ParentTurnID: "turn-1", Label: strings.Repeat("l", 512),

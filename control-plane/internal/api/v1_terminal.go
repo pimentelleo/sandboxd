@@ -17,6 +17,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -78,7 +79,7 @@ func (s *Server) v1Terminal(w http.ResponseWriter, r *http.Request) {
 
 	// Interactive login shell as uid 1000 in the app workspace. Prefer bash,
 	// fall back to sh for a minimal base image.
-	ptmx, cmd, err := s.Docker.ExecTTY("s-"+id, "sandbox", "/home/sandbox/workspace/app",
+	ptmx, cmd, err := s.Docker.ExecTTY(sandboxname.Reference(sb.ID, sb.ContainerID.String), "sandbox", "/home/sandbox/workspace/app",
 		[]string{"/bin/sh", "-c", "command -v bash >/dev/null && exec bash -l || exec sh"})
 	if err != nil {
 		_ = conn.WriteMessage(websocket.TextMessage, []byte("\r\n[sandboxd] could not open terminal: "+err.Error()+"\r\n"))

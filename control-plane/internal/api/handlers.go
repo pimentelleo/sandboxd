@@ -27,6 +27,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/traefik"
@@ -554,7 +555,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// attempts best-effort cleanup of the half-built state.
 	abort := func(msg string) {
 		log.Error("create: aborting", "reason", msg)
-		_ = s.Docker.Remove(context.Background(), "s-"+req.ID)
+		_ = s.Docker.Remove(context.Background(), sandboxname.Container(req.ID))
 		_ = s.Loopback.Release(context.Background(), req.ID)
 		_ = s.Store.MarkError(r.Context(), req.ID, msg)
 		_ = metrics.RefreshSandboxGauge(r.Context(), s.Store)
@@ -746,9 +747,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	startRun := time.Now()
 	var runErr error
+	containerName := sandboxname.Container(req.ID)
 	containerID, runErr := s.Docker.Run(r.Context(), docker.RunSpec{
-		Name:        "s-" + req.ID,
-		Hostname:    "s-" + req.ID,
+		Name:        containerName,
+		Hostname:    containerName,
 		Network:     s.Network,
 		Userns:      s.Userns,
 		Runtime:     s.Runtime,
@@ -774,7 +776,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Inspect for PID, then write memory.high.
-	cj, err := s.Docker.Inspect(r.Context(), "s-"+req.ID)
+	cj, err := s.Docker.Inspect(r.Context(), containerName)
 	if err != nil {
 		abort("docker.Inspect post-run: " + err.Error())
 		writeErr(w, http.StatusInternalServerError, "inspect: "+err.Error())
@@ -872,7 +874,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	resp := getResp{Row: toRespRow(sb), LiveState: nil}
 	startInspect := time.Now()
 	var inspectErr error
-	cj, inspectErr := s.Docker.Inspect(r.Context(), "s-"+id)
+	cj, inspectErr := s.Docker.Inspect(r.Context(), sandboxname.Reference(sb.ID, sb.ContainerID.String))
 	metrics.ObserveDocker("inspect", startInspect, &inspectErr)
 	if inspectErr == nil {
 		resp.LiveState = cj
@@ -960,9 +962,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	startRm := time.Now()
 	var rmErr error
-	rmErr = s.Docker.Remove(r.Context(), "s-"+id)
+	rmErr = s.Docker.Remove(r.Context(), sandboxname.Reference(sb.ID, sb.ContainerID.String))
 	metrics.ObserveDocker("rm", startRm, &rmErr)
-	if rmErr != nil {
+	if rmErr != nil && !errors.Is(rmErr, docker.ErrNotFound) {
 		writeErr(w, http.StatusInternalServerError, "docker rm: "+rmErr.Error())
 		return
 	}
@@ -1002,6 +1004,16 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "cmd required")
 		return
 	}
+	sb, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "no sandbox row for that id")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get: "+err.Error())
+		return
+	}
+	containerName := sandboxname.Reference(sb.ID, sb.ContainerID.String)
 	// Phase 8 — audit the exec recording ONLY the first argument
 	// (never log full command lines).
 	s.auditAction(r, audit.Entry{
@@ -1031,7 +1043,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		flusher, _ := w.(http.Flusher)
 		startExec := time.Now()
 		var execErr error
-		res, execErr := s.Docker.Exec(r.Context(), "s-"+id, req.Cmd)
+		res, execErr := s.Docker.Exec(r.Context(), containerName, req.Cmd)
 		metrics.ObserveDocker("exec", startExec, &execErr)
 		if execErr != nil {
 			_, _ = w.Write([]byte("internal-error: " + execErr.Error() + "\n"))
@@ -1053,7 +1065,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	startExec := time.Now()
 	var execErr error
-	res, execErr := s.Docker.Exec(r.Context(), "s-"+id, req.Cmd)
+	res, execErr := s.Docker.Exec(r.Context(), containerName, req.Cmd)
 	metrics.ObserveDocker("exec", startExec, &execErr)
 	if execErr != nil {
 		writeErr(w, http.StatusInternalServerError, "docker exec: "+execErr.Error())

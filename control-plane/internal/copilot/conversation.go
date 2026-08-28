@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"sync"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 )
 
 const (
@@ -347,11 +349,11 @@ const backgroundWorkerContainerPrefix = "sandboxd-child-"
 // for one isolated child. It remains in this package so the executor can accept
 // only targets the hosted Copilot tool layer knows how to name.
 func BackgroundWorkerContainerName(id string) string {
-	return backgroundWorkerContainerPrefix + id
+	return backgroundWorkerContainerPrefix + strings.ToLower(id)
 }
 
 func sandboxContainerName(id string) string {
-	return "s-" + id
+	return sandboxname.Container(id)
 }
 
 // IsWorkspaceToolContainer identifies the only container name families the
@@ -368,10 +370,10 @@ func WorkspaceToolContainerTarget(name string) (sandboxID, childID string, isChi
 	switch {
 	case strings.HasPrefix(name, "s-"):
 		sandboxID = strings.TrimPrefix(name, "s-")
-		return sandboxID, "", false, validIdentifier(sandboxID)
+		return sandboxID, "", false, validIdentifier(sandboxID) && name == sandboxContainerName(sandboxID)
 	case strings.HasPrefix(name, backgroundWorkerContainerPrefix):
 		childID = strings.TrimPrefix(name, backgroundWorkerContainerPrefix)
-		return "", childID, true, validIdentifier(childID)
+		return "", childID, true, validIdentifier(childID) && name == BackgroundWorkerContainerName(childID)
 	default:
 		return "", "", false, false
 	}

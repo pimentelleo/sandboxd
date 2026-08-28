@@ -20,6 +20,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -389,7 +390,7 @@ func (s *Server) v1StopSandbox(w http.ResponseWriter, r *http.Request) {
 			"a task is in progress; cancel it before stopping")
 		return
 	}
-	if err := s.Docker.Stop(r.Context(), "s-"+id, 10); err != nil {
+	if err := s.Docker.Stop(r.Context(), sandboxname.Reference(sb.ID, sb.ContainerID.String), 10); err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", "docker stop: "+err.Error())
 		return
 	}

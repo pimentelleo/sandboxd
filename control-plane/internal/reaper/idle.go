@@ -29,6 +29,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -154,7 +155,7 @@ func (i *Idle) tick(ctx context.Context) error {
 		log.Info("idle reaper: stopping sandbox")
 
 		stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := i.Docker.Stop(stopCtx, "s-"+sb.ID, 10)
+		err := i.Docker.Stop(stopCtx, sandboxname.Reference(sb.ID, sb.ContainerID.String), 10)
 		cancel()
 		if err != nil {
 			log.Warn("idle reaper: docker stop failed", "err", err.Error())

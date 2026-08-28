@@ -23,7 +23,7 @@ func row() *store.Sandbox {
 func TestBuildReproducesTheHardenedCreateFlags(t *testing.T) {
 	s := Build(row(), Env{Image: "sandboxd-base:0.4.0", Network: "sandboxd_net", PreviewDomain: "example.test", PreviewEntrypoint: "web"})
 
-	if s.Name != "s-01TEST" || s.Hostname != "s-01TEST" {
+	if s.Name != "s-01test" || s.Hostname != "s-01test" {
 		t.Errorf("name/hostname = %q/%q", s.Name, s.Hostname)
 	}
 	// The point of recreation: the CURRENT image, not the row's old one.

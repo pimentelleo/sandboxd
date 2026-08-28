@@ -19,6 +19,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentprompt"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/copilot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -335,6 +336,11 @@ func (c *ConversationCoordinator) provisionConversationChildWorkspace(ctx contex
 	if err := c.ensureSandboxRunning(ctx, conversation.SandboxID); err != nil {
 		return err
 	}
+	sandbox, err := c.server.Store.Get(ctx, conversation.SandboxID)
+	if err != nil {
+		return err
+	}
+	parentContainer := sandboxname.Reference(sandbox.ID, sandbox.ContainerID.String)
 	_, sourceRoot := c.server.Loopback.Paths(conversation.SandboxID)
 	sourceApp := filepath.Join(sourceRoot, "workspace", "app")
 	workerRoot, baselineRoot, err := c.conversationChildWorkspacePaths(child.ID)
@@ -357,7 +363,7 @@ func (c *ConversationCoordinator) provisionConversationChildWorkspace(ctx contex
 		defer c.server.Locks.Unlock(conversation.SandboxID)
 	}
 	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := c.server.Docker.Pause(pauseCtx, "s-"+conversation.SandboxID); err != nil {
+	if err := c.server.Docker.Pause(pauseCtx, parentContainer); err != nil {
 		pauseCancel()
 		return fmt.Errorf("pause parent sandbox: %w", err)
 	}
@@ -368,7 +374,7 @@ func (c *ConversationCoordinator) provisionConversationChildWorkspace(ctx contex
 			return
 		}
 		unpauseCtx, unpauseCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		unpauseErr := c.server.Docker.Unpause(unpauseCtx, "s-"+conversation.SandboxID)
+		unpauseErr := c.server.Docker.Unpause(unpauseCtx, parentContainer)
 		unpauseCancel()
 		if unpauseErr != nil {
 			c.logError("unpause parent sandbox after delegated copy", unpauseErr)

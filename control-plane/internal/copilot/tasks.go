@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 )
 
 // RunTask validates and consumes a task capability, then forwards only safe
@@ -37,7 +39,7 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 
 	taskCtx, cancel := context.WithCancel(ctx)
 	events := make(chan RuntimeEvent, 64)
-	stream := streamState{redact: redactText(request.Capability, cap.sandboxID, "s-"+cap.sandboxID, token)}
+	stream := streamState{redact: redactText(request.Capability, cap.sandboxID, sandboxname.Container(cap.sandboxID), token)}
 	idleEvents := make(chan struct{}, 1)
 	sessionError := make(chan struct{})
 	var sessionErrorOnce sync.Once

@@ -10,6 +10,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -152,7 +153,7 @@ func (p *Pressure) stopOldestIdle(ctx context.Context, band string, availPct flo
 		log.Info("pressure reaper: stopping oldest idle")
 
 		stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := p.Docker.Stop(stopCtx, "s-"+sb.ID, 10)
+		err := p.Docker.Stop(stopCtx, sandboxname.Reference(sb.ID, sb.ContainerID.String), 10)
 		cancel()
 		if err != nil {
 			log.Warn("pressure reaper: docker stop failed", "err", err.Error())
@@ -191,8 +192,8 @@ func (p *Pressure) stopHeaviestRSS(ctx context.Context, band string, availPct fl
 		return
 	}
 	var heaviest *struct {
-		id, cgroup string
-		rss        uint64
+		id, container, cgroup string
+		rss                   uint64
 	}
 	for _, sb := range runs {
 		if !sb.CgroupPath.Valid {
@@ -209,9 +210,9 @@ func (p *Pressure) stopHeaviestRSS(ctx context.Context, band string, availPct fl
 		}
 		if heaviest == nil || rss > heaviest.rss {
 			heaviest = &struct {
-				id, cgroup string
-				rss        uint64
-			}{sb.ID, sb.CgroupPath.String, rss}
+				id, container, cgroup string
+				rss                   uint64
+			}{sb.ID, sandboxname.Reference(sb.ID, sb.ContainerID.String), sb.CgroupPath.String, rss}
 		}
 	}
 	if heaviest == nil {
@@ -230,7 +231,7 @@ func (p *Pressure) stopHeaviestRSS(ctx context.Context, band string, availPct fl
 	log.Error("pressure reaper: EMERGENCY stopping heaviest-RSS sandbox")
 
 	stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	err = p.Docker.Stop(stopCtx, "s-"+heaviest.id, 10)
+	err = p.Docker.Stop(stopCtx, heaviest.container, 10)
 	cancel()
 	if err != nil {
 		log.Error("pressure reaper: emergency docker stop failed", "err", err.Error())

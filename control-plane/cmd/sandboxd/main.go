@@ -52,6 +52,7 @@ import (
 	nginxwatch "github.com/tastyeffectco/sandboxd/control-plane/internal/nginx"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reaper"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/reconcile"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxspec"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
@@ -537,10 +538,17 @@ func main() {
 			OpencodeZenPath:   envDefault("SANDBOXD_OPENCODE_ZEN_PATH", ""),
 			RuntimePreset:     runtimePresetForSandbox(ctx, st, sb),
 		})
-		// Remove any existing container first so the name is free; ignore a
-		// not-found (the common case) and let Run surface a real failure.
-		if err := dockerClient.Remove(ctx, spec.Name); err != nil && err != docker.ErrNotFound {
-			log.Warn("recreate: remove existing container failed (continuing)", "err", err.Error())
+		// Remove any existing container first so the canonical name is free.
+		// Retain the canonical fallback in case a manually recreated container
+		// outlived the persisted container ID.
+		containers := []string{sandboxname.Reference(sb.ID, sb.ContainerID.String)}
+		if spec.Name != containers[0] {
+			containers = append(containers, spec.Name)
+		}
+		for _, container := range containers {
+			if err := dockerClient.Remove(ctx, container); err != nil && err != docker.ErrNotFound {
+				log.Warn("recreate: remove existing container failed (continuing)", "err", err.Error())
+			}
 		}
 		_, err := dockerClient.Run(ctx, spec)
 		return err
@@ -1001,20 +1009,24 @@ func (a copilotDockerExecutor) ExecScoped(ctx context.Context, request copilot.S
 		request.User != "sandbox" || request.Workdir != "/home/sandbox/workspace/app" {
 		return copilot.ScopedExecResult{}, errors.New("invalid GitHub Copilot sandbox scope")
 	}
+	container := request.Container
 	if isChild {
+		childID = strings.ToUpper(childID)
 		child, err := a.store.GetConversationChild(ctx, childID)
 		if err != nil || child.Status != store.ConversationChildRunning ||
 			child.WorkerContainer != request.Container {
 			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot worker target is unavailable")
 		}
 	} else {
+		sandboxID = strings.ToUpper(sandboxID)
 		sandbox, err := a.store.Get(ctx, sandboxID)
-		if err != nil || sandbox.Status != "running" || "s-"+sandbox.ID != request.Container {
+		if err != nil || sandbox.Status != "running" || sandboxname.Container(sandbox.ID) != request.Container {
 			return copilot.ScopedExecResult{}, errors.New("GitHub Copilot sandbox target is unavailable")
 		}
+		container = sandboxname.Reference(sandbox.ID, sandbox.ContainerID.String)
 	}
 	result, err := a.client.ExecScoped(ctx, docker.ScopedExecRequest{
-		Container:   request.Container,
+		Container:   container,
 		User:        request.User,
 		Workdir:     request.Workdir,
 		Command:     request.Command,

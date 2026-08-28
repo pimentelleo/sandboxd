@@ -21,6 +21,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/egress"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/idlock"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxspec"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
@@ -83,8 +84,8 @@ type Handler struct {
 	inflight map[string]*inflightWake
 }
 
-// RecreateFunc rebuilds the container for a sandbox row (workspace preserved)
-// and returns nil when the container is ready to start.
+// RecreateFunc rebuilds and starts the container for a sandbox row (workspace
+// preserved).
 type RecreateFunc func(ctx context.Context, sb *store.Sandbox) error
 
 // Config holds the env-tunable knobs the handler needs.
@@ -305,9 +306,11 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 	//     support ("Model X is not supported" on an up-to-date install).
 	//   - PREVIEW_DOMAIN changed since it was created: its Traefik routers
 	//     still answer to the old host, so the new preview URL never resolves.
+	containerName := sandboxname.Reference(sb.ID, sb.ContainerID.String)
+	recreated := false
 	if h.Recreate != nil {
 		stale := false
-		cur, ierr := h.Docker.Inspect(ctx, "s-"+id)
+		cur, ierr := h.Docker.Inspect(ctx, containerName)
 		switch {
 		case ierr == docker.ErrNotFound:
 			stale = true
@@ -334,22 +337,27 @@ func (h *Handler) serve(r *http.Request, w http.ResponseWriter, id, port string,
 				metrics.Wakes.WithLabelValues("recreate_failed").Inc()
 				return
 			}
+			containerName = sandboxname.Container(sb.ID)
+			recreated = true
 		}
 	}
 
-	// 3. docker start (idempotent).
-	startCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := h.Docker.Start(startCtx, "s-"+id); err != nil {
-		wf.err = err
-		log.Warn("wake: docker start failed", "err", err.Error())
-		h.respondError(w, id, "start_failed", isHTML)
-		metrics.Wakes.WithLabelValues("start_failed").Inc()
-		return
+	// 3. docker start. RecreateFunc uses docker run -d, which already starts
+	// its replacement; starting it again would fail on Docker and Podman.
+	if !recreated {
+		startCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := h.Docker.Start(startCtx, containerName); err != nil {
+			wf.err = err
+			log.Warn("wake: docker start failed", "err", err.Error())
+			h.respondError(w, id, "start_failed", isHTML)
+			metrics.Wakes.WithLabelValues("start_failed").Inc()
+			return
+		}
 	}
 
 	// 4. Inspect and re-apply memory.high.
-	cj, err := h.Docker.Inspect(ctx, "s-"+id)
+	cj, err := h.Docker.Inspect(ctx, containerName)
 	if err != nil {
 		wf.err = err
 		log.Warn("wake: inspect after start failed", "err", err.Error())

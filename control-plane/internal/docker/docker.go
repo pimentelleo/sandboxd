@@ -236,8 +236,8 @@ func isNotFoundStderr(stderr []byte) bool {
 		strings.Contains(low, "no such container")
 }
 
-// Start runs `docker start <name>`. Idempotent — a no-op when the
-// container is already running. Required by Phase 5's wake path.
+// Start runs `docker start <name>`. The caller must not use it for an already
+// running container, which Docker and Podman report as an error.
 func (c *Client) Start(ctx context.Context, name string) error {
 	_, err := c.run(ctx, "start", name)
 	return err
