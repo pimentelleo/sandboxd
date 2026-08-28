@@ -81,6 +81,9 @@ func main() {
 		log.Error("mkdir runtime dir", "dir", runtimeDir, "err", err.Error())
 		os.Exit(1)
 	}
+	if err := normalizeShellStartupFiles(envOr("HOME", "/home/sandbox")); err != nil {
+		log.Warn("normalize shell startup files", "err", err.Error())
+	}
 	// Ensure the app working directory exists. A fresh workspace ships
 	// with only ~/workspace, so ~/workspace/app may not exist yet. Both
 	// the managed dev server and the coding-agent runner chdir into
