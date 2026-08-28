@@ -43,7 +43,7 @@ export interface Settings {
   runtime: { storage_mode: string; base_image: string }
   lifecycle: { idle_reap_enabled: boolean; idle_threshold_seconds: number; keepalive_max_seconds: number }
   egress: { mode: string }
-  agents: { providers: string[]; system_prompt?: string; default_models: Record<string, string> }
+  agents: { providers: string[]; provider: string; system_prompt?: string; default_models: Record<string, string> }
   presets: Preset[]
   capabilities: Record<string, boolean>
   editable?: string[] // field paths the client may PATCH (e.g. lifecycle.*)
@@ -73,8 +73,12 @@ export interface SettingsPatch {
     idle_threshold_seconds?: number
     keepalive_max_seconds?: number
   }
-  // Per-agent default model id (merges; empty value clears one).
-  agents?: { default_models?: Record<string, string> }
+  agents?: {
+    // Instance-wide provider used by app chats and tasks that omit an agent.
+    provider?: string
+    // Per-agent default model id (merges; empty value clears one).
+    default_models?: Record<string, string>
+  }
 }
 
 // Advisory runtime detection (GET /v1/apps/{id}/runtime-inspect). Suggestions
@@ -625,14 +629,18 @@ export const api = {
   stopSandbox: (id: string) => req<Sandbox>('POST', `/v1/sandboxes/${id}/stop`),
   deleteSandbox: (id: string) => req<unknown>('DELETE', `/v1/sandboxes/${id}`),
 
-  submitTask: (id: string, prompt: string, agent: string = 'opencode', model?: string, cont?: boolean) =>
+  submitTask: (
+    id: string,
+    prompt: string,
+    options: { agent?: string; model?: string; cont?: boolean } = {},
+  ) =>
     req<{ id: string }>('POST', `/v1/sandboxes/${id}/tasks`, {
       prompt,
-      agent,
-      ...(model && model.trim() ? { model: model.trim() } : {}),
+      ...(options.agent?.trim() ? { agent: options.agent.trim() } : {}),
+      ...(options.model?.trim() ? { model: options.model.trim() } : {}),
       // Send the choice explicitly so unchecking forces a fresh session; omitting
       // it would let the server fall back to its continue-by-default behavior.
-      ...(cont !== undefined ? { continue: cont } : {}),
+      ...(options.cont !== undefined ? { continue: options.cont } : {}),
     }),
   getTask: (id: string, taskId: string) =>
     req<TaskResult>('GET', `/v1/sandboxes/${id}/tasks/${taskId}`),

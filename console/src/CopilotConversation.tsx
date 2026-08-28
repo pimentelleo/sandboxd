@@ -287,7 +287,7 @@ function DelegatedTask({ child, sandboxId, onDone, onError }: {
   )
 }
 
-export function CopilotConversation({ sb, agent, setAgent, onError, toast, refresh }: { sb: Sandbox | null; agent: string; setAgent: (agent: string) => void; onError: (message: string) => void; toast: (message: string) => void; refresh: () => void }) {
+export function CopilotConversation({ sb, onError, toast, refresh }: { sb: Sandbox | null; onError: (message: string) => void; toast: (message: string) => void; refresh: () => void }) {
   const [snapshot, setSnapshot] = useState<ConversationSnapshot | null>(null)
   const [text, setText] = useState('')
   const [mode, setMode] = useState<ConversationMode>('interactive')
@@ -416,10 +416,7 @@ export function CopilotConversation({ sb, agent, setAgent, onError, toast, refre
         <H size={14}>GitHub Copilot</H>
         {active && <Pill tone="warn" dot>working</Pill>}
         {queued.length > 0 && <Pill tone="neutral">{queued.length} queued</Pill>}
-        <select value={agent} onChange={(event) => setAgent(event.target.value)} aria-label="Agent provider" data-testid="task-agent" style={{ marginLeft: 'auto', ...selectStyle }}>
-          <option value="claude-code">Claude Code</option><option value="opencode">OpenCode</option><option value="github-copilot">GitHub Copilot</option>
-        </select>
-        <Btn sm variant="ghost" disabled={!resetAllowed || !sandboxId} title={resetAllowed ? 'Archive this transcript and begin a new one' : 'Wait until active and queued work finishes'} onClick={reset} data-testid="copilot-reset">New conversation</Btn>
+        <Btn sm variant="ghost" disabled={!resetAllowed || !sandboxId} title={resetAllowed ? 'Archive this transcript and begin a new one' : 'Wait until active and queued work finishes'} onClick={reset} data-testid="copilot-reset" style={{ marginLeft: 'auto' }}>New conversation</Btn>
         {active && <Btn sm variant="danger" onClick={cancel} data-testid="copilot-cancel">Cancel</Btn>}
       </div>
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>

@@ -9,12 +9,16 @@ import (
 )
 
 // InstanceSettings is the persisted, runtime-editable instance config: lifecycle
-// tuning (Phase 8B) plus per-agent default models. Only safe operational values —
-// never secrets.
+// tuning plus the global task-agent provider and per-agent default models. Only
+// safe operational values — never secrets.
 type InstanceSettings struct {
 	IdleReapEnabled      bool
 	IdleThresholdSeconds int
 	KeepaliveMaxSeconds  int
+	// AgentProvider is the instance-wide provider used when a task does not
+	// explicitly select one. Empty rows from older installs fall back to the
+	// deployment default during startup.
+	AgentProvider string
 	// AgentDefaultModels maps an agent id (e.g. "opencode") to the default model
 	// id used when a task doesn't specify one. Opaque, operator-supplied. Never nil
 	// on read (empty map when unset).
@@ -25,12 +29,12 @@ type InstanceSettings struct {
 // caller then falls back to env defaults).
 func (s *Store) GetInstanceSettings(ctx context.Context) (*InstanceSettings, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds, agent_default_models
+		`SELECT idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds, agent_provider, agent_default_models
 		   FROM instance_settings WHERE id = 1`)
 	var enabled int
 	var modelsJSON string
 	out := &InstanceSettings{}
-	err := row.Scan(&enabled, &out.IdleThresholdSeconds, &out.KeepaliveMaxSeconds, &modelsJSON)
+	err := row.Scan(&enabled, &out.IdleThresholdSeconds, &out.KeepaliveMaxSeconds, &out.AgentProvider, &modelsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -62,15 +66,16 @@ func (s *Store) SaveInstanceSettings(ctx context.Context, v InstanceSettings) er
 			return err
 		}
 		_, err = db.ExecContext(ctx, `
-			INSERT INTO instance_settings (id, idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds, agent_default_models, updated_at)
-			VALUES (1, ?, ?, ?, ?, ?)
+			INSERT INTO instance_settings (id, idle_reap_enabled, idle_threshold_seconds, keepalive_max_seconds, agent_provider, agent_default_models, updated_at)
+			VALUES (1, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 			  idle_reap_enabled = excluded.idle_reap_enabled,
 			  idle_threshold_seconds = excluded.idle_threshold_seconds,
 			  keepalive_max_seconds = excluded.keepalive_max_seconds,
+			  agent_provider = excluded.agent_provider,
 			  agent_default_models = excluded.agent_default_models,
 			  updated_at = excluded.updated_at`,
-			enabled, v.IdleThresholdSeconds, v.KeepaliveMaxSeconds, string(modelsJSON), time.Now().Unix())
+			enabled, v.IdleThresholdSeconds, v.KeepaliveMaxSeconds, v.AgentProvider, string(modelsJSON), time.Now().Unix())
 		return err
 	})
 }

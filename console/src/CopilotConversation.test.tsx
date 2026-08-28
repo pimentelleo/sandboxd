@@ -33,9 +33,10 @@ function response(body: unknown) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('durable GitHub Copilot chat', () => {
-  it('replaces the legacy task chat only after GitHub Copilot is selected', async () => {
+  it('uses the persisted global provider to choose the GitHub Copilot chat', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input)
+      if (url.endsWith('/settings')) return response({ agents: { provider: 'github-copilot' } })
       if (url.endsWith('/conversation')) return response(emptyConversation)
       if (url.endsWith('/agents')) return response({ providers: [] })
       if (url.endsWith('/tasks')) return response({ tasks: [] })
@@ -43,12 +44,25 @@ describe('durable GitHub Copilot chat', () => {
     }))
     render(<AgentChat sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
 
-    expect(screen.getByTestId('task-prompt')).toBeTruthy()
-    fireEvent.change(screen.getByTestId('task-agent'), { target: { value: 'github-copilot' } })
-
     expect(await screen.findByTestId('copilot-conversation')).toBeTruthy()
     expect(screen.queryByTestId('task-prompt')).toBeNull()
     expect(screen.getByTestId('copilot-prompt')).toBeTruthy()
+    expect(screen.queryByTestId('task-agent')).toBeNull()
+  })
+
+  it('does not expose a provider picker for a global OpenCode chat', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/settings')) return response({ agents: { provider: 'opencode' } })
+      if (url.endsWith('/agents')) return response({ providers: [] })
+      if (url.endsWith('/tasks')) return response({ tasks: [] })
+      return response({})
+    }))
+    render(<AgentChat sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+
+    expect(await screen.findByTestId('task-prompt')).toBeTruthy()
+    expect(screen.queryByTestId('task-agent')).toBeNull()
+    expect(screen.getByTestId('task-model')).toBeTruthy()
   })
 
   it('renders and answers a pending provider input interaction', async () => {
@@ -74,7 +88,7 @@ describe('durable GitHub Copilot chat', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('EventSource', QuietEventSource)
-    render(<CopilotConversation sb={sandbox} agent="github-copilot" setAgent={vi.fn()} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+    render(<CopilotConversation sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
 
     expect(await screen.findByText('Which region?')).toBeTruthy()
     fireEvent.click(screen.getByTestId('copilot-choice-input-1-0'))
@@ -99,7 +113,7 @@ describe('durable GitHub Copilot chat', () => {
       return response({})
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<CopilotConversation sb={sandbox} agent="github-copilot" setAgent={vi.fn()} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+    render(<CopilotConversation sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
 
     expect(await screen.findByRole('option', { name: 'GPT-5.3 Codex' })).toBeTruthy()
     fireEvent.change(screen.getByTestId('copilot-model'), { target: { value: 'gpt-5.3-codex' } })
@@ -140,7 +154,7 @@ describe('durable GitHub Copilot chat', () => {
       return response({})
     })
     vi.stubGlobal('fetch', fetchMock)
-    render(<CopilotConversation sb={sandbox} agent="github-copilot" setAgent={vi.fn()} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+    render(<CopilotConversation sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
 
     expect((await screen.findByTestId('copilot-model-catalog-error')).textContent).toContain('Models are temporarily unavailable.')
     expect((screen.getByTestId('copilot-model') as HTMLSelectElement).disabled).toBe(true)
@@ -177,7 +191,7 @@ describe('durable GitHub Copilot chat', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('EventSource', QuietEventSource)
-    render(<CopilotConversation sb={sandbox} agent="github-copilot" setAgent={vi.fn()} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
+    render(<CopilotConversation sb={sandbox} onError={vi.fn()} toast={vi.fn()} refresh={vi.fn()} />)
 
     expect(await screen.findByText('Add tests')).toBeTruthy()
     expect(screen.getByText('Changes stay isolated until you review and apply them manually.')).toBeTruthy()

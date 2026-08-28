@@ -45,10 +45,10 @@ const settings = {
   runtime: { storage_mode: 'directory', base_image: 'sandboxd-base:0.3.0' },
   lifecycle: { idle_reap_enabled: true, idle_threshold_seconds: 2100, keepalive_max_seconds: 86400 },
   egress: { mode: 'disabled' },
-  agents: { providers: ['opencode', 'claude-code', 'github-copilot'], default_models: {} },
+  agents: { providers: ['opencode', 'claude-code', 'github-copilot'], provider: 'opencode', default_models: {} },
   presets,
   capabilities: { snapshots: true, config_secrets: true, templates: false, forward_auth: true },
-  editable: ['lifecycle.idle_reap_enabled', 'lifecycle.idle_threshold_seconds', 'lifecycle.keepalive_max_seconds'],
+  editable: ['lifecycle.idle_reap_enabled', 'lifecycle.idle_threshold_seconds', 'lifecycle.keepalive_max_seconds', 'agents.provider', 'agents.default_models'],
 }
 
 const tasks = [

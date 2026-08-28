@@ -9,13 +9,15 @@ import (
 	"time"
 )
 
-// Snapshot is a plain copy of the editable lifecycle settings plus the per-agent
-// default models. DefaultModels is treated as immutable once stored — readers must
-// not mutate it; writers pass a fresh map (Set/New clone it defensively).
+// Snapshot is a plain copy of the editable lifecycle settings, the global
+// task-agent provider, and per-agent default models. DefaultModels is treated as
+// immutable once stored — readers must not mutate it; writers pass a fresh map
+// (Set/New clone it defensively).
 type Snapshot struct {
 	IdleEnabled          bool
 	IdleThresholdSeconds int
 	KeepaliveMaxSeconds  int
+	AgentProvider        string
 	DefaultModels        map[string]string // agent id -> default model id
 }
 
@@ -46,6 +48,14 @@ func (l *Live) DefaultModel(agent string) string {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.snap.DefaultModels[agent]
+}
+
+// AgentProvider returns the instance-wide task provider, or "" when the
+// deployment default should be used.
+func (l *Live) AgentProvider() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.snap.AgentProvider
 }
 
 // cloneSnap deep-copies the map so a stored Snapshot never shares mutable state

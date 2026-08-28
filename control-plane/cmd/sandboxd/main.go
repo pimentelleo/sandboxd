@@ -308,23 +308,31 @@ func main() {
 	wakeTCPReady := durationFromEnvSec("SANDBOXD_WAKE_TCP_READY_TIMEOUT_SECONDS", defaultWakeTCPReadySec)
 	wakeGrace := durationFromEnvSec("SANDBOXD_WAKE_GRACE_SECONDS", defaultWakeGraceSec)
 	keepaliveMax := durationFromEnvSec("SANDBOXD_KEEPALIVE_MAX_SECONDS", defaultKeepaliveMaxSec)
+	// The deployment value seeds the persisted global provider and remains the
+	// fallback for databases created before the provider setting existed.
+	defaultAgent := envDefault("SANDBOXD_DEFAULT_AGENT", "opencode")
 
-	// Phase 8B — live, runtime-editable lifecycle tunables. Start from env
-	// defaults, then overlay any persisted edits (PATCH /v1/settings) so they
-	// survive restart. The reaper + keepalive path read this live.
+	// Runtime-editable settings start from deployment defaults, then overlay
+	// persisted edits (PATCH /v1/settings) so they survive restart.
 	live := instancecfg.New(instancecfg.Snapshot{
 		IdleEnabled:          idleInterval > 0,
 		IdleThresholdSeconds: int(idleThreshold.Seconds()),
 		KeepaliveMaxSeconds:  int(keepaliveMax.Seconds()),
+		AgentProvider:        defaultAgent,
 	})
 	if persisted, perr := st.GetInstanceSettings(ctx); perr == nil {
+		agentProvider := persisted.AgentProvider
+		if agentProvider == "" {
+			agentProvider = defaultAgent
+		}
 		live.Set(instancecfg.Snapshot{
 			IdleEnabled:          persisted.IdleReapEnabled,
 			IdleThresholdSeconds: persisted.IdleThresholdSeconds,
 			KeepaliveMaxSeconds:  persisted.KeepaliveMaxSeconds,
+			AgentProvider:        agentProvider,
 			DefaultModels:        persisted.AgentDefaultModels,
 		})
-		log.Info("instance settings: loaded persisted lifecycle tunables + agent default models")
+		log.Info("instance settings: loaded persisted editable settings")
 	}
 
 	inflight := activity.NewInflightExec()
@@ -418,10 +426,6 @@ func main() {
 	if err := agentAuth.EnsureRoot(); err != nil {
 		log.Warn("agent-auth: could not create store root", "err", err.Error())
 	}
-	// A1 — which provider's auth dir gets mounted into new sandboxes (as the
-	// agent's HOME) when connected. Must match the agent runtimed runs.
-	defaultAgent := envDefault("SANDBOXD_DEFAULT_AGENT", "opencode")
-
 	// Credential-injecting auth proxy for claude-code (internal/authproxy). The
 	// sandbox reaches it at SANDBOXD_AGENT_PROXY_URL (in-network name of THIS
 	// process); we listen on SANDBOXD_AGENT_PROXY_ADDR. The real credential stays

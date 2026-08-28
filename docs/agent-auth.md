@@ -101,7 +101,7 @@ random, one-use capability bound to that sandbox and task and valid for two
 minutes. `runtimed` exchanges it only with the private
 `SANDBOXD_COPILOT_BRIDGE_URL`; the bridge is not published on a host port.
 
-The console's GitHub Copilot path instead uses
+When GitHub Copilot is the configured provider, the console uses
 `/v1/sandboxes/{id}/conversation`. It is a durable, per-sandbox conversation:
 messages are queued FIFO, native questions and plan approvals are persisted
 before display, and the console reconnects through a redacted SSE cursor. The
@@ -194,9 +194,26 @@ A connected OpenCode key always wins and enables its paid catalog. This free
 path is OpenCode-only. Other sandbox-resident agents require a connection;
 GitHub Copilot is separately admitted by its hosted provider.
 
-### Per-agent default model
+### Global provider and per-agent default model
 
-Set a default model in **Settings -> AI Agents -> Default model** or through
+Set the instance-wide provider in **Settings -> Agents -> Default provider** or
+with `PATCH /v1/settings`:
+
+```json
+{"agents":{"provider":"github-copilot"}}
+```
+
+Every console app chat uses that persisted provider. The console does not send
+an agent override for legacy task chats, so the control plane resolves the
+current provider at submit time. GitHub Copilot opens its durable conversation
+surface; OpenCode and Claude Code retain the existing one-shot task chat.
+Changing the provider does not change the selected model controls.
+
+`SANDBOXD_DEFAULT_AGENT` (default `opencode`) seeds this setting on a new
+instance and remains the fallback for older empty rows. An explicit `agent` in
+the public task API still overrides the global provider.
+
+Set a default model in **Settings -> Agents -> Default model** or through
 `PATCH /v1/settings` `agents.default_models`. A task's model precedence is:
 
 1. The task's own `model`.
@@ -273,10 +290,10 @@ model choices from `GET /v1/agents/github-copilot/models`. Modes are
 native input and plan cards only through their returned interaction endpoint.
 The full request and response contract is in `docs/openapi.yaml`.
 
-`SANDBOXD_DEFAULT_AGENT` (default `opencode`) chooses the agent when the task
-does not specify one. `continue` is tri-state and defaults to continuing the
-sandbox's most recent agent session. Claude Code and OpenCode use their CLI
-resume behavior; one-shot GitHub Copilot tasks use a sandbox-keyed
+When no explicit `agent` is supplied, tasks use the persisted global provider
+(or `SANDBOXD_DEFAULT_AGENT` when it has never been set). `continue` is
+tri-state and defaults to continuing the sandbox's most recent agent session.
+Claude Code and OpenCode use their CLI resume behavior; one-shot GitHub Copilot tasks use a sandbox-keyed
 control-plane mapping. Omit it to resume when a prior session exists and start
 fresh otherwise; set `true` or `false` to force the choice. Conversation turns
 always continue their active conversation until it is reset.
