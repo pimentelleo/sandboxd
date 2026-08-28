@@ -137,7 +137,7 @@ func scopedExecArgs(request ScopedExecRequest) []string {
 	// coreutils `timeout` is available in sandboxd's Debian base image. It
 	// terminates an in-container command even if the control-plane client exits.
 	args = append(args, request.Container, "timeout", "--signal=TERM",
-		"--kill-after=5s", fmt.Sprintf("%ds", seconds), "--")
+		"--kill-after=5s", "--", fmt.Sprintf("%ds", seconds))
 	return append(args, request.Command...)
 }
 
