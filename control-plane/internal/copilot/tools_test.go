@@ -51,6 +51,22 @@ func TestToolSchemasAreStrictAndOutputIsBounded(t *testing.T) {
 	}
 }
 
+func TestStrictSchemaSerializesEmptyRequiredArray(t *testing.T) {
+	encoded, err := json.Marshal(strictSchema(map[string]any{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Required []string `json:"required"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Required == nil || len(decoded.Required) != 0 {
+		t.Fatalf("required = %#v; want non-nil empty array", decoded.Required)
+	}
+}
+
 func TestDelegationToolsFollowPlanMutationGate(t *testing.T) {
 	delegate := &fakeBackgroundDelegate{}
 	gate := newMutationGate(false)

@@ -67,6 +67,20 @@ func TestConversationSystemPromptRequiresNativeClarification(t *testing.T) {
 	}
 }
 
+func TestEventAdapterForwardsSessionErrors(t *testing.T) {
+	var got []RuntimeEvent
+	handler := eventAdapter(func(event RuntimeEvent) {
+		got = append(got, event)
+	}, nil)
+	handler(sdk.SessionEvent{Data: &sdk.SessionErrorData{
+		ErrorType: "query",
+		Message:   "provider rejected the request",
+	}})
+	if len(got) != 1 || got[0].Type != "error" || got[0].Text != "provider rejected the request" {
+		t.Fatalf("session error events = %#v", got)
+	}
+}
+
 func TestSDKSessionConfigsForwardModelControls(t *testing.T) {
 	config := RuntimeConfig{
 		Model:           "gpt-5.3-codex",

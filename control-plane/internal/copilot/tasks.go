@@ -39,6 +39,8 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 	events := make(chan RuntimeEvent, 64)
 	stream := streamState{redact: redactText(request.Capability, cap.sandboxID, "s-"+cap.sandboxID, token)}
 	idleEvents := make(chan struct{}, 1)
+	sessionError := make(chan struct{})
+	var sessionErrorOnce sync.Once
 	eventPumpDone := make(chan struct{})
 	var stopEventsOnce sync.Once
 	stopEvents := func() {
@@ -53,6 +55,10 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 		for {
 			select {
 			case event := <-events:
+				if event.Type == "error" {
+					sessionErrorOnce.Do(func() { close(sessionError) })
+					continue
+				}
 				if stream.handle(event, emit) {
 					select {
 					case idleEvents <- struct{}{}:
@@ -111,17 +117,25 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 	)
 	for {
 		select {
+		case <-sessionError:
+			return ErrSessionError
 		case err := <-sendResult:
 			if err != nil {
 				return errors.New("unable to start Copilot task")
 			}
 			sendComplete = true
 			if idle {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-idleEvents:
 			idle = true
 			if sendComplete {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-taskCtx.Done():
@@ -129,6 +143,15 @@ func (m *Manager) RunTask(ctx context.Context, request TaskRequest, emit func(En
 			_ = session.Abort(context.Background())
 			return nil
 		}
+	}
+}
+
+func providerErrorReported(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
 	}
 }
 

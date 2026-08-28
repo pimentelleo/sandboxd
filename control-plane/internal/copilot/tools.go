@@ -50,6 +50,9 @@ func objectSchema(properties map[string]any) map[string]any {
 
 func strictSchema(properties map[string]any, required ...string) map[string]any {
 	schema := objectSchema(properties)
+	if required == nil {
+		required = []string{}
+	}
 	schema["required"] = required
 	return schema
 }

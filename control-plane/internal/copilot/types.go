@@ -28,6 +28,7 @@ var (
 	ErrCapability              = errors.New("invalid or expired task capability")
 	ErrInvalidModelSelection   = errors.New("invalid GitHub Copilot model selection")
 	ErrModelCatalogUnavailable = errors.New("GitHub Copilot model catalog is unavailable")
+	ErrSessionError            = errors.New("Copilot session reported an error")
 )
 
 // Config configures the hosted Copilot provider. StateDir must be a private

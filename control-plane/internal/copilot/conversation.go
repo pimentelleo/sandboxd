@@ -96,6 +96,8 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 	}
 	events := make(chan RuntimeEvent, 64)
 	idleEvents := make(chan struct{}, 1)
+	sessionError := make(chan struct{})
+	var sessionErrorOnce sync.Once
 	eventPumpDone := make(chan struct{})
 	stream := streamState{redact: redactText(request.ConversationID, request.SandboxID, workspaceContainer, token)}
 	var stopEventsOnce sync.Once
@@ -111,6 +113,10 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 		for {
 			select {
 			case event := <-events:
+				if event.Type == "error" {
+					sessionErrorOnce.Do(func() { close(sessionError) })
+					continue
+				}
 				if stream.handle(event, request.OnEvent) {
 					select {
 					case idleEvents <- struct{}{}:
@@ -191,6 +197,8 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 	)
 	for {
 		select {
+		case <-sessionError:
+			return ErrSessionError
 		case err := <-sendResult:
 			if err != nil {
 				if taskCtx.Err() != nil {
@@ -200,11 +208,17 @@ func (m *Manager) RunConversationTurn(ctx context.Context, request ConversationT
 			}
 			sendComplete = true
 			if idle {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-idleEvents:
 			idle = true
 			if sendComplete {
+				if providerErrorReported(sessionError) {
+					return ErrSessionError
+				}
 				return nil
 			}
 		case <-taskCtx.Done():
