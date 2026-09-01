@@ -58,7 +58,7 @@ func Labels(id string, ports []int, domain, visibility, entrypoint string, tls b
 	out := []string{"traefik.enable=true", "sandboxd.managed=true"}
 	for _, p := range ports {
 		router := fmt.Sprintf("s-%s-%d", id, p)
-		host := fmt.Sprintf("s-%s-%d.preview.%s", id, p, domain)
+		host := fmt.Sprintf("s-%s-%d.preview.%s", strings.ToLower(id), p, strings.ToLower(domain))
 		out = append(out,
 			fmt.Sprintf("traefik.http.routers.%s.rule=Host(`%s`)", router, host),
 			fmt.Sprintf("traefik.http.routers.%s.entrypoints=%s", router, entrypoint),

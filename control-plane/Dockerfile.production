@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.6
+#
+# Production control-plane image for AKS.  This is intentionally separate from
+# Dockerfile: the local image retains its Docker CLI and host-socket workflow.
+# Build it with control-plane/ as the build context.
+
+# --- Stage 1: build sandboxd (CGO) -----------------------------------
+FROM golang:1.24-bookworm AS builder
+
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go run github.com/github/copilot-sdk/go/cmd/bundler --output ./cmd/sandboxd
+RUN CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.buildVersion=${VERSION} -X main.buildCommit=${GIT_COMMIT}" \
+      -o /sandboxd ./cmd/sandboxd
+
+# --- Stage 2: restricted runtime -------------------------------------
+FROM debian:stable-slim
+
+# git supports sandboxd's repository-import API.  No Docker CLI, socket client,
+# curl, shell entrypoint, or host-management utility is installed in this image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --gid 10001 sandboxd \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin sandboxd \
+ && install -d --owner=10001 --group=10001 --mode=0750 \
+      /var/lib/sandboxd /var/log/sandboxd
+
+COPY --from=builder /sandboxd /usr/local/bin/sandboxd
+COPY migrations/ /usr/local/share/sandboxd/migrations/
+
+# The root filesystem is intended to be read-only.  The deployment must mount
+# writable volumes at both paths and use runAsUser/runAsGroup/fsGroup 10001,
+# runAsNonRoot: true, allowPrivilegeEscalation: false, and dropped capabilities.
+# Do not mount a Docker socket or host paths into this production image.
+#
+# `sandboxd migrate` is a dedicated PostgreSQL-only command. The production
+# migration Job invokes it before rolling out the control plane.
+USER 10001:10001
+
+EXPOSE 9000
+ENTRYPOINT ["/usr/local/bin/sandboxd"]

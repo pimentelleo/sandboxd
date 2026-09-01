@@ -50,7 +50,7 @@ type conversationChildRun struct {
 // session ID.
 func (c *ConversationCoordinator) SpawnBackgroundTask(ctx context.Context, request copilot.BackgroundTaskRequest) (copilot.BackgroundTask, error) {
 	if c == nil || c.server == nil || c.server.Store == nil || c.server.Copilot == nil ||
-		c.server.Docker == nil || c.server.Loopback == nil || request.ConversationID == "" ||
+		c.server.usesRuntimeProvider() || c.server.Docker == nil || c.server.Loopback == nil || request.ConversationID == "" ||
 		request.TurnID == "" || request.SandboxID == "" || strings.TrimSpace(request.Task) == "" {
 		return copilot.BackgroundTask{}, errConversationChildUnavailable
 	}
@@ -192,7 +192,7 @@ func (c *ConversationCoordinator) CancelBackgroundTask(ctx context.Context, conv
 }
 
 func (c *ConversationCoordinator) startConversationChild(id string) {
-	if c == nil || id == "" {
+	if c == nil || c.server == nil || c.server.usesRuntimeProvider() || id == "" {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,6 +216,12 @@ func (c *ConversationCoordinator) executeConversationChild(run *conversationChil
 		return
 	}
 	defer c.clearConversationChildRun(run)
+	if c.server.usesRuntimeProvider() {
+		c.finishConversationChild(run.id, store.ConversationChildFailed, "",
+			"Delegated Copilot workers are unavailable with the runtime provider.",
+			store.ConversationChildPatchNone, nil)
+		return
+	}
 
 	slots := c.conversationChildSlots()
 	select {
@@ -326,7 +332,7 @@ func (c *ConversationCoordinator) classifyConversationChildOutcome(ctx context.C
 }
 
 func (c *ConversationCoordinator) provisionConversationChildWorkspace(ctx context.Context, child *store.ConversationChild) (err error) {
-	if c.server.Loopback == nil || c.server.Docker == nil {
+	if c.server.usesRuntimeProvider() || c.server.Loopback == nil || c.server.Docker == nil {
 		return errConversationChildUnavailable
 	}
 	conversation, err := c.server.Store.GetConversation(ctx, child.ConversationID)
@@ -408,6 +414,9 @@ func (c *ConversationCoordinator) provisionConversationChildWorkspace(ctx contex
 }
 
 func (c *ConversationCoordinator) startConversationChildWorker(ctx context.Context, child *store.ConversationChild, workerName string) error {
+	if c.server == nil || c.server.usesRuntimeProvider() || c.server.Docker == nil {
+		return errConversationChildUnavailable
+	}
 	conversation, err := c.server.Store.GetConversation(ctx, child.ConversationID)
 	if err != nil {
 		return err
@@ -453,6 +462,9 @@ func (c *ConversationCoordinator) startConversationChildWorker(ctx context.Conte
 }
 
 func (c *ConversationCoordinator) captureConversationChildPatch(child *store.ConversationChild) (string, *store.ConversationChildPatch) {
+	if c == nil || c.server == nil || c.server.usesRuntimeProvider() {
+		return store.ConversationChildPatchUnavailable, nil
+	}
 	workerRoot, baselineRoot, err := c.conversationChildWorkspacePaths(child.ID)
 	if err != nil || filepath.Clean(workerRoot) != filepath.Clean(child.WorkspacePath) {
 		return store.ConversationChildPatchUnavailable, nil
@@ -506,6 +518,9 @@ func (c *ConversationCoordinator) cleanupConversationChild(child *store.Conversa
 	if c == nil || child == nil {
 		return
 	}
+	if c.server != nil && c.server.usesRuntimeProvider() {
+		return
+	}
 	if c.server != nil && c.server.Docker != nil {
 		name := child.WorkerContainer
 		if name == "" {
@@ -528,7 +543,7 @@ func (c *ConversationCoordinator) cleanupConversationChild(child *store.Conversa
 }
 
 func (c *ConversationCoordinator) conversationChildWorkspacePaths(id string) (workerRoot, baselineRoot string, err error) {
-	if c == nil || c.server == nil || c.server.Loopback == nil || !isULID(id) ||
+	if c == nil || c.server == nil || c.server.usesRuntimeProvider() || c.server.Loopback == nil || !isULID(id) ||
 		c.server.Loopback.Root == "" {
 		return "", "", errConversationChildUnavailable
 	}
@@ -545,6 +560,9 @@ func (c *ConversationCoordinator) conversationChildWorkspacePaths(id string) (wo
 
 func (c *ConversationCoordinator) removeConversationChildWorkspace(child *store.ConversationChild) error {
 	if child == nil {
+		return nil
+	}
+	if c != nil && c.server != nil && c.server.usesRuntimeProvider() {
 		return nil
 	}
 	workerRoot, baselineRoot, err := c.conversationChildWorkspacePaths(child.ID)
@@ -565,6 +583,18 @@ func (c *ConversationCoordinator) removeConversationChildWorkspace(child *store.
 
 func (c *ConversationCoordinator) recoverConversationChildren(ctx context.Context) {
 	if c == nil || c.server == nil || c.server.Store == nil {
+		return
+	}
+	if c.server.usesRuntimeProvider() {
+		children, err := c.server.Store.InterruptAllActiveConversationChildren(ctx,
+			"Delegated Copilot work is unavailable with the runtime provider.")
+		if err != nil {
+			c.logError("recover delegated Copilot tasks", err)
+			return
+		}
+		for _, child := range children {
+			c.notify(child.ConversationID)
+		}
 		return
 	}
 	children, err := c.server.Store.InterruptAllActiveConversationChildren(ctx,
@@ -610,6 +640,18 @@ func (c *ConversationCoordinator) interruptAllConversationChildren(ctx context.C
 }
 
 func (c *ConversationCoordinator) stopConversationChild(child *store.ConversationChild) {
+	if c != nil && c.server != nil && c.server.usesRuntimeProvider() {
+		c.mu.Lock()
+		run := c.childRuns[child.ID]
+		c.mu.Unlock()
+		if run != nil {
+			run.cancel()
+			if c.server.Copilot != nil {
+				c.server.Copilot.CancelConversation(child.ID)
+			}
+		}
+		return
+	}
 	c.mu.Lock()
 	run := c.childRuns[child.ID]
 	c.mu.Unlock()

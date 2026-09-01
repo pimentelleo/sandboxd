@@ -32,7 +32,12 @@ func (s *Server) v1ListAppSnapshots(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := s.Store.ListSnapshotsByApp(r.Context(), tenantToken(r), app.ID)
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
+	rows, err := s.appSnapshotsForRequest(r, app.ID)
 	if err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -95,6 +100,11 @@ func (s *Server) v1RestoreApp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
 	var req v1RestoreReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid json: "+err.Error())
@@ -148,6 +158,11 @@ func (s *Server) v1ForkApp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
 	var req v1ForkReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid json: "+err.Error())
@@ -164,9 +179,10 @@ func (s *Server) v1ForkApp(w http.ResponseWriter, r *http.Request) {
 
 	newApp := &store.App{
 		ID:                newULID(),
-		OwnerToken:        tenantToken(r),
+		OwnerToken:        actorOwnerToken(r),
+		OwnerPrincipalID:  nullStr(principalID(r)),
 		Name:              name,
-		ExternalUserID:    srcApp.ExternalUserID,
+		ExternalUserID:    nullStr(s.creationExternalUserID(r, srcApp.ExternalUserID.String)),
 		ExternalProjectID: srcApp.ExternalProjectID,
 	}
 	if err := s.Store.CreateApp(r.Context(), newApp); err != nil {

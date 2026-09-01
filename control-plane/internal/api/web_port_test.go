@@ -60,7 +60,7 @@ func TestEnsurePortAndWebPortOf(t *testing.T) {
 func TestRuntimeViewUsesResolvedPort(t *testing.T) {
 	s := &Server{PreviewDomain: "ex.localhost"}
 	prev, _ := s.v1RuntimeView("01ABC", "running", nil, 4321)
-	if !strings.Contains(prev.URL, "s-01ABC-4321.preview.ex.localhost") {
+	if !strings.Contains(prev.URL, "s-01abc-4321.preview.ex.localhost") {
 		t.Errorf("preview URL = %q; want the 4321 host", prev.URL)
 	}
 }
@@ -70,7 +70,7 @@ func TestTraefikLabelsForResolvedPort(t *testing.T) {
 	labels := traefik.Labels("01ABC", []int{3000, 4321}, "ex.localhost", "public", "web", false)
 	joined := strings.Join(labels, "\n")
 	for _, want := range []string{
-		"s-01ABC-4321.preview.ex.localhost",
+		"s-01abc-4321.preview.ex.localhost",
 		"routers.s-01ABC-4321",
 		"services.s-01ABC-4321.loadbalancer.server.port=4321",
 	} {

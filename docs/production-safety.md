@@ -1,47 +1,64 @@
-## Production Safety Checklist
+# Production safety
 
-sandboxd is beta infrastructure for authenticated users running agent-built apps.
+Production is a separate, multi-user profile for one Entra tenant. The default
+Compose install is local Docker/SQLite and is not a production security
+baseline. Read [`isolation.md`](isolation.md) before choosing a profile.
 
-It is not a VM security boundary for anonymous hostile code. If you run untrusted public workloads, use stronger isolation such as VM-per-tenant, gVisor, Kata, or Firecracker.
+## Local profile checklist
 
-Before production use:
+Use this for a single operator or trusted team on a host you control:
 
-- [ ] Run sandboxd on a dedicated host or VM.
-- [ ] Do not expose the control-plane API without auth.
-- [ ] Set `SANDBOXD_API_AUTH_DISABLED=false`.
-- [ ] Configure `SANDBOXD_API_TOKENS`.
-- [ ] Use HTTPS with a real wildcard preview domain.
-- [ ] Understand that preview URLs may be public unless protected.
-- [ ] Keep the host kernel and Docker Engine patched.
+- [ ] Keep the API on loopback or enable `SANDBOXD_API_AUTH_DISABLED=false`.
+- [ ] If the API is authenticated, configure local `SANDBOXD_API_TOKENS`;
+      password-backed console sessions remain supported.
+- [ ] Use a real HTTPS reverse proxy before exposing previews.
+- [ ] Patch the host kernel and Docker Engine.
 - [ ] Back up workspaces and SQLite state under `SANDBOXD_DATA_DIR`.
-- [ ] Monitor disk usage; per-sandbox disk quotas are not included yet.
-- [ ] Monitor memory and active sandbox count.
-- [ ] Review egress needs; outbound network access is open by default.
-- [ ] Do not keep unrelated production secrets on the same host.
+- [ ] Treat egress as open by default; do not keep unrelated secrets on the host.
 
-## Trust boundaries to understand
+These controls do not turn shared-kernel Docker into hostile multi-tenancy.
 
-These are **intentional** design choices, not bugs — but you must understand
-them before exposing sandboxd:
+## Production AKS checklist
 
-- **The control plane mounts the host Docker socket** (`/var/run/docker.sock`)
-  to orchestrate sibling sandbox containers. That makes it effectively
-  **host-root**. Run it only on a host you fully control; never expose the
-  control-plane API to untrusted callers.
-- **Previews are framable by any origin.** The edge deliberately forwards a
-  trusted upstream `Host` (so dev servers like Vite stop returning 403) and
-  **strips `X-Frame-Options`** on preview routes so the console can embed apps
-  in an iframe. Consequently every preview — including `visibility:"public"`
-  ones — can be embedded anywhere (clickjacking surface). Gate sensitive apps
-  with `visibility:"private"` (per-sandbox forward-auth), and don't serve
-  anything you wouldn't put on the open web from a public preview.
-- **`passHostHeader=false`** on preview routes means an app that derives absolute
-  URLs or cookies from the `Host` header sees the backend address, not the public
-  preview host. Fine for dev previews; be aware if your app depends on it.
-- **Agents run with `--dangerously-skip-permissions`.** The containment boundary
-  is the throwaway sandbox container, not the agent — a task can run arbitrary
-  commands inside its own sandbox by design.
-- **Egress is unrestricted by default.** The nftables egress policy (block cloud
-  metadata, RFC1918, cross-sandbox, SMTP, abuse lists) is disabled in the
-  portable build; enable it (or front sandboxes with an egress proxy) for
-  multi-tenant hardening.
+The production deployment artifacts and their exact parameters are documented
+in [`../infra/README.md`](../infra/README.md). They are not applied
+automatically, and cloning this repository does not provision Azure resources.
+Before a gated deployment:
+
+- [ ] Use an AKS cluster with Kata Pod Sandboxing on supported Azure Linux/Gen2
+      nodes; validate nested virtualization, SKU capacity, and quota.
+- [ ] Use PostgreSQL Flexible Server for control-plane state and Azure Disk PVCs
+      for workspaces. Configure backups, restore drills, and retained
+      Kubernetes VolumeSnapshots.
+- [ ] Use Key Vault with workload identity for secrets and ACR for images.
+- [ ] Use Azure CNI Cilium policies with default deny. Allow only required
+      control-plane traffic and public HTTPS DNS egress from sandboxes; block
+      Azure metadata and internal/private network access.
+- [ ] Publish only HTTPS ingress: `console.<domain>` and
+      `*.preview.<domain>`, with certificates and DNS under operator control.
+- [ ] Configure one Entra tenant and assign only `sandboxd.user` or
+      `sandboxd.admin`. Ownership must use the immutable Entra OID; admins have
+      full access.
+- [ ] Verify OIDC authorization-code PKCE and server-side session behavior.
+      Production has no password or API-key login.
+- [ ] Verify preview authorization: owner/admin access uses a secure one-time
+      bootstrap ticket and host-only cookies. Preview requests must arrive through
+      the TLS gateway; the gateway rejects client-supplied forwarded-proto headers,
+      removes tickets from the URL, and never forwards identities, credentials, or
+      gateway cookies to the sandbox. Do not put secrets in previews.
+- [ ] Confirm provider credentials never enter sandbox pods. Hosted GitHub
+      Copilot remains trusted control-plane infrastructure. The only permitted
+      sandbox-to-control-plane flow is the port 9100 credential-injecting agent proxy.
+- [ ] Test Kata workload behavior, Azure Disk performance, and Defender for
+      Containers support for the selected configuration.
+
+There is no automatic migration from local directory/SQLite state to
+PostgreSQL/PVCs. Treat any export/import as a separate, reviewed data migration.
+
+## Trust boundaries
+
+The control plane is privileged orchestration infrastructure. In local Docker it
+can control the host Docker daemon. In production, Kubernetes RBAC and network
+policy constrain the control plane, while Kata provides a VM-backed workload
+boundary. Neither profile removes the need to patch nodes, restrict ingress,
+review images, monitor audit logs, and test recovery.

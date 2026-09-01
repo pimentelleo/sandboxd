@@ -27,6 +27,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
@@ -289,7 +290,7 @@ func (s *Server) recordEvent(r *http.Request, e events.Event) {
 		return
 	}
 	if e.OwnerToken == "" {
-		e.OwnerToken = auth.ActorFrom(r.Context()).Name
+		e.OwnerToken = tenantToken(r)
 	}
 	s.Events.Record(r.Context(), e)
 }
@@ -379,9 +380,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Image != nil {
-		writeErr(w, http.StatusBadRequest, errPerAppImage)
+		if s.usesRuntimeProvider() {
+			writeErr(w, http.StatusNotImplemented, "per-app image selection is unavailable with the configured runtime provider")
+		} else {
+			writeErr(w, http.StatusBadRequest, errPerAppImage)
+		}
 		return
 	}
+	requestedMemoryHigh := req.MemoryHigh != ""
 	if req.MemoryHigh == "" {
 		req.MemoryHigh = "4G"
 	}
@@ -407,6 +413,20 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if req.External.UserID == "" {
 		req.External.UserID = "local"
 	}
+	ownerPrincipalID := ""
+	if s.productionAuthorization() {
+		var ownerToken string
+		var err error
+		ownerPrincipalID, ownerToken, err = s.creationOwner(r, req.AppID)
+		if err != nil {
+			s.writeCreationAuthorizationError(w, r, err)
+			return
+		}
+		req.External.UserID = ownerToken
+		if req.Git != nil {
+			req.Git.Owner = req.External.UserID
+		}
+	}
 	for _, f := range []struct{ label, val string }{
 		{"external.user_id", req.External.UserID},
 		{"external.project_id", req.External.ProjectID},
@@ -421,6 +441,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	visibility := req.Visibility
 	if visibility == "" {
 		visibility = "public"
+		if s.usesRuntimeProvider() {
+			visibility = "private"
+		}
 	}
 	if visibility != "public" && visibility != "private" {
 		writeErr(w, http.StatusBadRequest, "visibility must be 'public' or 'private'")
@@ -432,6 +455,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if idlePolicy != "sleep" && idlePolicy != "always_on" {
 		writeErr(w, http.StatusBadRequest, "idle_policy must be 'sleep' or 'always_on'")
+		return
+	}
+	if s.usesRuntimeProvider() {
+		s.handleProviderCreate(w, r, req, ownerPrincipalID, visibility, idlePolicy, requestedMemoryHigh)
 		return
 	}
 
@@ -458,6 +485,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		clean := filepath.Clean(req.TemplatePath)
 		if !pathUnderRoot(clean, s.LibraryRoot) && !pathUnderRoot(clean, s.TemplatesDir) {
 			writeErr(w, http.StatusBadRequest, "template_path outside allowed roots")
+			return
+		}
+		if err := s.authorizeSnapshotTemplate(r, clean); errors.Is(err, store.ErrNotFound) {
+			s.writeAuthorizationNotFound(w, r)
+			return
+		} else if err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "authorization unavailable")
 			return
 		}
 		if _, err := os.Stat(clean); err != nil {
@@ -506,6 +540,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// workspace_owner row exists for this id (the .img is being
 	// reattached), the caller's external.user_id MUST match it. This
 	// prevents accidental cross-user resurrection of a recycled id.
+	if s.productionAuthorization() {
+		if owner, err := s.Store.GetWorkspacePrincipalOwner(r.Context(), req.ID); err == nil && owner != ownerPrincipalID {
+			s.writeAuthorizationNotFound(w, r)
+			return
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusServiceUnavailable, "authorization unavailable")
+			return
+		}
+	}
 	if wo, err := s.Store.GetWorkspaceOwner(r.Context(), req.ID); err == nil {
 		if wo.ExternalUserID != req.External.UserID {
 			writeJSON(w, http.StatusConflict, map[string]any{
@@ -518,7 +561,6 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "workspace_owner lookup: "+err.Error())
 		return
 	}
-
 	imgPath, mntPath := s.Loopback.Paths(req.ID)
 	// A1.5a — resolve the preview web port. Start from the selected preset's
 	// manifest (or 3000); a cloned repo sandbox.yaml may override it post-clone.
@@ -538,6 +580,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		ExternalProjectID:   nullStr(req.External.ProjectID),
 		ExternalWorkspaceID: nullStr(req.External.WorkspaceID),
 		AppID:               nullStr(req.AppID),
+		OwnerPrincipalID:    nullStr(ownerPrincipalID),
 	}
 	if err := s.Store.Create(r.Context(), sb); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -858,6 +901,145 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toRespRow(fresh))
 }
 
+func (s *Server) providerWebPort() int {
+	if s.ProviderWebPort > 0 && s.ProviderWebPort <= 65535 {
+		return s.ProviderWebPort
+	}
+	return 3000
+}
+
+// handleProviderCreate is intentionally separate from the local create path.
+// A provider owns its image, workspace, command, and preview service, so this
+// path must not initialize or use host workspace or Docker facilities.
+func (s *Server) handleProviderCreate(
+	w http.ResponseWriter,
+	r *http.Request,
+	req createReq,
+	ownerPrincipalID, visibility, idlePolicy string,
+	requestedMemoryHigh bool,
+) {
+	if requestedMemoryHigh {
+		writeErr(w, http.StatusNotImplemented, "memory_high is unavailable with the configured runtime provider")
+		return
+	}
+	if req.Template != "" || req.TemplatePath != "" || req.RuntimePreset != "" {
+		writeErr(w, http.StatusNotImplemented, "templates, snapshots, and runtime presets are unavailable with the configured runtime provider")
+		return
+	}
+	if len(req.Env) != 0 {
+		writeErr(w, http.StatusNotImplemented, "per-sandbox environment injection is unavailable with the configured runtime provider")
+		return
+	}
+	if req.Git != nil {
+		writeErr(w, http.StatusNotImplemented, "host-side git import is unavailable with the configured runtime provider")
+		return
+	}
+	if visibility != "private" {
+		writeErr(w, http.StatusNotImplemented, "public sandbox visibility is unavailable with the configured runtime provider")
+		return
+	}
+	webPort := s.providerWebPort()
+	if len(req.Ports) != 0 && (len(req.Ports) != 1 || req.Ports[0] != webPort) {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("ports are policy-controlled by the runtime provider (use %d)", webPort))
+		return
+	}
+	if _, err := s.Store.Get(r.Context(), req.ID); err == nil {
+		writeErr(w, http.StatusConflict, "sandbox row already exists for this id; DELETE first")
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, "get: "+err.Error())
+		return
+	}
+	if s.productionAuthorization() {
+		if owner, err := s.Store.GetWorkspacePrincipalOwner(r.Context(), req.ID); err == nil && owner != ownerPrincipalID {
+			s.writeAuthorizationNotFound(w, r)
+			return
+		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusServiceUnavailable, "authorization unavailable")
+			return
+		}
+	}
+	if owner, err := s.Store.GetWorkspaceOwner(r.Context(), req.ID); err == nil && owner.ExternalUserID != req.External.UserID {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":                     "workspace_owner_mismatch",
+			"expected_external_user_id": owner.ExternalUserID,
+		})
+		return
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, "workspace_owner lookup: "+err.Error())
+		return
+	}
+
+	sb := &store.Sandbox{
+		ID:                  req.ID,
+		Status:              "creating",
+		Image:               s.Image,
+		Ports:               []int{webPort},
+		WebPort:             sql.NullInt64{Int64: int64(webPort), Valid: true},
+		Visibility:          visibility,
+		IdlePolicy:          idlePolicy,
+		ExternalUserID:      nullStr(req.External.UserID),
+		ExternalProjectID:   nullStr(req.External.ProjectID),
+		ExternalWorkspaceID: nullStr(req.External.WorkspaceID),
+		AppID:               nullStr(req.AppID),
+		OwnerPrincipalID:    nullStr(ownerPrincipalID),
+	}
+	if err := s.Store.Create(r.Context(), sb); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeErr(w, http.StatusConflict, "id collision (race)")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "store.Create: "+err.Error())
+		return
+	}
+	_ = metrics.RefreshSandboxGauge(r.Context(), s.Store)
+	s.recordEvent(r, events.Event{Type: events.SandboxCreateStarted, Severity: events.SeverityInfo,
+		Message: "Creating sandbox", AppID: req.AppID, SandboxID: req.ID})
+
+	err := s.withRuntimeLease(r.Context(), req.ID, func(ctx context.Context) error {
+		created, err := s.RuntimeLifecycle.Create(ctx, runtimebackend.SandboxSpec{
+			Ref:    runtimebackend.SandboxRef{ID: req.ID},
+			Labels: []string{"sandboxd.io/owner=" + req.External.UserID},
+		})
+		if err == nil {
+			err = s.persistRuntimeState(ctx, req.ID, created)
+		}
+		if err == nil {
+			return nil
+		}
+		if stateErr := s.Store.MarkError(ctx, req.ID, "runtime create: "+err.Error()); stateErr != nil {
+			return fmt.Errorf("%w; persist failure state: %v", err, stateErr)
+		}
+		return err
+	})
+	if err != nil {
+		_ = metrics.RefreshSandboxGauge(r.Context(), s.Store)
+		s.recordEvent(r, events.Event{Type: events.SandboxCreateFailed, Severity: events.SeverityError,
+			Message: "Sandbox create failed", AppID: req.AppID, SandboxID: req.ID,
+			Payload: map[string]any{"reason": "runtime provider create failed"}})
+		writeRuntimeProviderError(w, err)
+		return
+	}
+	_ = s.Store.BumpLastActive(r.Context(), req.ID, time.Now().UTC())
+	_ = metrics.RefreshSandboxGauge(r.Context(), s.Store)
+	fresh, err := s.Store.Get(r.Context(), req.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "post-create get: "+err.Error())
+		return
+	}
+	s.auditAction(r, audit.Entry{
+		Action:         "sandbox.create",
+		Target:         req.ID,
+		ExternalUserID: req.External.UserID,
+		Detail:         map[string]any{"visibility": visibility, "ports": []int{webPort}, "runtime_provider": true},
+	})
+	if fresh.Status == "running" {
+		s.recordEvent(r, events.Event{Type: events.SandboxStarted, Severity: events.SeverityInfo,
+			Message: "Sandbox started", AppID: req.AppID, SandboxID: req.ID})
+	}
+	writeJSON(w, http.StatusCreated, toRespRow(fresh))
+}
+
 // --- GET /sandbox/{id} ----------------------------------------------
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -872,6 +1054,25 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := getResp{Row: toRespRow(sb), LiveState: nil}
+	if s.usesRuntimeProvider() {
+		live, inspectErr := s.RuntimeLifecycle.Inspect(r.Context(), s.runtimeRef(sb))
+		if inspectErr == nil {
+			resp.LiveState = map[string]any{
+				"provider":   "runtime",
+				"runtime_id": live.Ref.RuntimeID,
+				"state":      live.State,
+			}
+		}
+		if taskRuntime, err := s.providerTaskRuntime(sb); err == nil {
+			rctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			defer cancel()
+			if status, err := taskRuntime.Status(rctx); err == nil {
+				resp.Runtime = status
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	startInspect := time.Now()
 	var inspectErr error
 	cj, inspectErr := s.Docker.Inspect(r.Context(), sandboxname.Reference(sb.ID, sb.ContainerID.String))
@@ -907,7 +1108,19 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	epid := r.URL.Query().Get("external_project_id")
 	var rows []*store.Sandbox
 	var err error
-	if euid != "" || epid != "" {
+	if s.productionAuthorization() && !requestIsAdmin(r) {
+		rows, err = s.Store.ListSandboxesForPrincipal(r.Context(), principalID(r))
+		if err == nil && (euid != "" || epid != "") {
+			filtered := make([]*store.Sandbox, 0, len(rows))
+			for _, sb := range rows {
+				if (euid == "" || (sb.ExternalUserID.Valid && sb.ExternalUserID.String == euid)) &&
+					(epid == "" || (sb.ExternalProjectID.Valid && sb.ExternalProjectID.String == epid)) {
+					filtered = append(filtered, sb)
+				}
+			}
+			rows = filtered
+		}
+	} else if euid != "" || epid != "" {
 		rows, err = s.Store.ListFiltered(r.Context(), euid, epid)
 	} else {
 		rows, err = s.Store.List(r.Context())
@@ -933,6 +1146,37 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if s.Locks != nil {
 		s.Locks.Lock(id)
 		defer s.Locks.Unlock(id)
+	}
+	if s.usesRuntimeProvider() {
+		var deleted *store.Sandbox
+		err := s.withRuntimeLease(r.Context(), id, func(ctx context.Context) error {
+			current, err := s.Store.Get(ctx, id)
+			if err != nil {
+				return err
+			}
+			if err := s.RuntimeLifecycle.Remove(ctx, s.runtimeRef(current)); err != nil {
+				return err
+			}
+			if err := s.Store.Delete(ctx, id); err != nil {
+				return err
+			}
+			deleted = current
+			return nil
+		})
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "no sandbox row for that id")
+			return
+		}
+		if err != nil {
+			writeRuntimeProviderError(w, err)
+			return
+		}
+		_ = metrics.RefreshSandboxGauge(r.Context(), s.Store)
+		s.auditAction(r, audit.Entry{Action: "sandbox.destroy", Target: id})
+		s.recordEvent(r, events.Event{Type: events.SandboxDeleted, Severity: events.SeverityInfo,
+			Message: "Sandbox deleted", AppID: deleted.AppID.String, SandboxID: id})
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	sb, err := s.Store.Get(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -1034,6 +1278,34 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		_ = s.Store.BumpLastActive(r.Context(), id, time.Now().UTC())
 	}()
+	if s.usesRuntimeProvider() {
+		if s.RuntimeExec == nil {
+			writeRuntimeProviderError(w, ErrRuntimeUnavailable)
+			return
+		}
+		res, execErr := s.RuntimeExec.Exec(r.Context(), s.runtimeRef(sb), runtimebackend.Command{Args: req.Cmd})
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			if execErr != nil {
+				_, _ = w.Write([]byte("runtime-error: " + execErr.Error() + "\n"))
+				return
+			}
+			_, _ = w.Write([]byte(res.Stdout))
+			if strings.TrimSpace(res.Stderr) != "" {
+				_, _ = w.Write([]byte("---stderr---\n"))
+				_, _ = w.Write([]byte(res.Stderr))
+			}
+			_, _ = fmt.Fprintf(w, "exit_code: %d\n", res.ExitCode)
+			return
+		}
+		if execErr != nil {
+			writeRuntimeProviderError(w, execErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, execResp{Stdout: res.Stdout, Stderr: res.Stderr, ExitCode: res.ExitCode})
+		return
+	}
 	if req.Stream {
 		// Streaming path: 200 + chunked. We invoke docker exec with
 		// stdout/stderr piped to the response writer.
@@ -1121,6 +1393,10 @@ func (s *Server) handleKeepalive(w http.ResponseWriter, r *http.Request) {
 // --- POST /wake/{id} (JSON) -----------------------------------------
 
 func (s *Server) handleWakeJSON(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		s.handleProviderWakeJSON(w, r)
+		return
+	}
 	if s.Wake == nil {
 		writeErr(w, http.StatusServiceUnavailable, "wake handler not wired")
 		return
@@ -1134,6 +1410,10 @@ func (s *Server) handleWakeJSON(w http.ResponseWriter, r *http.Request) {
 // whenever the on-disk .img exists, regardless of whether a DB row
 // exists; the only rejection is a row with status='running' (409).
 func (s *Server) handleSnapshotTake(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeErr(w, http.StatusNotImplemented, "snapshots are unavailable with the configured runtime provider")
+		return
+	}
 	if s.Snapshot == nil {
 		writeErr(w, http.StatusServiceUnavailable, "snapshot subsystem not wired")
 		return
@@ -1169,6 +1449,10 @@ func (s *Server) handleSnapshotTake(w http.ResponseWriter, r *http.Request) {
 // against the snapshot directory directly, does NOT require a row,
 // returns an empty array if the directory is absent or empty.
 func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeErr(w, http.StatusNotImplemented, "snapshots are unavailable with the configured runtime provider")
+		return
+	}
 	if s.Snapshot == nil {
 		writeErr(w, http.StatusServiceUnavailable, "snapshot subsystem not wired")
 		return
@@ -1189,6 +1473,10 @@ type restoreReq struct {
 }
 
 func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeErr(w, http.StatusNotImplemented, "snapshots are unavailable with the configured runtime provider")
+		return
+	}
 	if s.Snapshot == nil {
 		writeErr(w, http.StatusServiceUnavailable, "snapshot subsystem not wired")
 		return
@@ -1239,6 +1527,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.DB().PingContext(r.Context()); err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "sqlite ping: "+err.Error())
+		return
+	}
+	if s.usesRuntimeProvider() {
+		// Kubernetes connectivity is validated while constructing the in-cluster
+		// adapter. Do not probe Docker here: it is deliberately absent in this
+		// deployment mode.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
 		return
 	}
 	startInfo := time.Now()

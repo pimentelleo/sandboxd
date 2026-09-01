@@ -5,13 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // writeOp is the union of all write requests sent to the single
 // writer goroutine.
 type writeOp struct {
-	fn   func(*sql.DB) error // closure that performs the SQL
-	done chan error          // closed by the writer after fn returns
+	fn   func(*dialectDB) error // closure that performs the SQL
+	done chan error             // closed by the writer after fn returns
 }
 
 // writeLoop is the single writer goroutine. It serializes all writes
@@ -40,7 +42,10 @@ func (s *Store) writeLoop() {
 }
 
 // submit posts a write op to the writer goroutine and waits for it.
-func (s *Store) submit(ctx context.Context, fn func(*sql.DB) error) error {
+func (s *Store) submit(ctx context.Context, fn func(*dialectDB) error) error {
+	if s.provider == ProviderPostgres {
+		return fn(s.db)
+	}
 	op := writeOp{fn: fn, done: make(chan error, 1)}
 	select {
 	case s.writes <- op:
@@ -58,7 +63,7 @@ func (s *Store) submit(ctx context.Context, fn func(*sql.DB) error) error {
 // SetWebPort updates a sandbox's resolved preview web port (A1.5a). Used after a
 // Git clone reveals the repo's sandbox.yaml web.port.
 func (s *Store) SetWebPort(ctx context.Context, id string, port int) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `UPDATE sandbox SET web_port = ? WHERE id = ?`, port, id)
 		return err
 	})
@@ -74,7 +79,7 @@ func (s *Store) SetWebPort(ctx context.Context, id string, port int) error {
 // matches the caller's external.user_id).
 // Returns ErrConflict if a sandbox row with the same id already exists.
 func (s *Store) Create(ctx context.Context, sb *Sandbox) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -89,18 +94,37 @@ func (s *Store) Create(ctx context.Context, sb *Sandbox) error {
 		if idlePolicy == "" {
 			idlePolicy = "sleep"
 		}
+		ownerPrincipalID := sb.OwnerPrincipalID
+		if ownerPrincipalID.Valid {
+			if _, err := scanPrincipal(tx.QueryRowContext(ctx,
+				`SELECT `+principalCols+` FROM principal WHERE id=?`, ownerPrincipalID.String)); err != nil {
+				return err
+			}
+		}
+		var durableOwner string
+		err = tx.QueryRowContext(ctx,
+			`SELECT principal_id FROM workspace_principal_owner WHERE sandbox_id=?`, sb.ID).Scan(&durableOwner)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return err
+		case ownerPrincipalID.Valid && durableOwner != ownerPrincipalID.String:
+			return ErrConflict
+		default:
+			ownerPrincipalID = sql.NullString{String: durableOwner, Valid: true}
+		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO sandbox (id, status, image, workspace_img, workspace_mnt,
 			                    container_id, cgroup_path, memory_high, error_message,
 			                    created_at, updated_at,
 			                    external_user_id, external_project_id,
 			                    external_workspace_id, visibility,
-			                    idle_policy, app_id, web_port)
-			VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			                    idle_policy, app_id, web_port, owner_principal_id)
+			VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			sb.ID, sb.Status, sb.Image, sb.WorkspaceImg, sb.WorkspaceMnt,
 			sb.MemoryHigh, now, now,
 			sb.ExternalUserID, sb.ExternalProjectID, sb.ExternalWorkspaceID, visibility, idlePolicy,
-			sb.AppID, sb.WebPort)
+			sb.AppID, sb.WebPort, ownerPrincipalID)
 
 		if err != nil {
 			if isUniqueViolation(err) {
@@ -129,7 +153,20 @@ func (s *Store) Create(ctx context.Context, sb *Sandbox) error {
 				return err
 			}
 		}
-		return tx.Commit()
+		if ownerPrincipalID.Valid {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO workspace_principal_owner (sandbox_id, principal_id, created_at)
+				VALUES (?, ?, ?)
+				ON CONFLICT(sandbox_id) DO NOTHING`,
+				sb.ID, ownerPrincipalID.String, now); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		sb.OwnerPrincipalID = ownerPrincipalID
+		return nil
 	})
 }
 
@@ -139,7 +176,7 @@ func (s *Store) Create(ctx context.Context, sb *Sandbox) error {
 // they were on the workspace_owner row, and sets the sandbox column
 // to that same value). Returns ErrNotFound if no sandbox row exists.
 func (s *Store) Claim(ctx context.Context, sandboxID, externalUserID, externalProjectID, externalWorkspaceID string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -185,13 +222,12 @@ func (s *Store) Claim(ctx context.Context, sandboxID, externalUserID, externalPr
 	})
 }
 
-// PurgeSandbox removes the sandbox row AND the durable workspace_owner
-// row for an id, in one transaction. Ports cascade via the FK. This is
-// the only path that deletes a workspace_owner row. The caller is
+// PurgeSandbox removes the sandbox row and durable workspace ownership
+// bindings for an id in one transaction. Ports cascade via the FK. The caller is
 // responsible for the container / loopback / .img / snapshot teardown
 // before calling this.
 func (s *Store) PurgeSandbox(ctx context.Context, id string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -209,6 +245,9 @@ func (s *Store) PurgeSandbox(ctx context.Context, id string) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM workspace_owner WHERE sandbox_id=?`, id); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM workspace_principal_owner WHERE sandbox_id=?`, id); err != nil {
+			return err
+		}
 		return tx.Commit()
 	})
 }
@@ -217,7 +256,7 @@ func (s *Store) PurgeSandbox(ctx context.Context, id string) error {
 // pre-encoded JSON string ("" allowed). Best-effort callers ignore
 // the error after logging it; the audit package wraps this.
 func (s *Store) InsertAudit(ctx context.Context, at int64, actorKind, actorName, actorIP, externalUserID, action, target, detail string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO audit_log
 			    (at, actor_kind, actor_name, actor_ip,
@@ -234,7 +273,7 @@ func (s *Store) InsertAudit(ctx context.Context, at int64, actorKind, actorName,
 // affects zero rows. Returns the number of rows updated.
 func (s *Store) BackfillLegacySandboxes(ctx context.Context, sentinel string) (int, error) {
 	var n int
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `
 			UPDATE sandbox
 			   SET external_user_id = ?, updated_at = ?
@@ -257,7 +296,7 @@ func (s *Store) BackfillLegacySandboxes(ctx context.Context, sentinel string) (i
 // durable ownership binding.
 func (s *Store) EnsureWorkspaceOwner(ctx context.Context, sandboxID, externalUserID string) (bool, error) {
 	var inserted bool
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `
 			INSERT INTO workspace_owner
 			    (sandbox_id, external_user_id, external_project_id,
@@ -289,7 +328,7 @@ func nullIfEmpty(s string) sql.NullString {
 // MarkRunning transitions a sandbox to status='running' and records
 // container_id + cgroup_path. Clears error_message.
 func (s *Store) MarkRunning(ctx context.Context, id, containerID, cgroupPath string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		now := time.Now().Unix()
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox
@@ -300,11 +339,36 @@ func (s *Store) MarkRunning(ctx context.Context, id, containerID, cgroupPath str
 	})
 }
 
+// SetRuntimeState persists the provider runtime handle before the workload is
+// ready. Kubernetes creates a Deployment asynchronously, so its namespace must
+// be durable while the row remains in the existing "creating" state.
+func (s *Store) SetRuntimeState(ctx context.Context, id, status, runtimeID string) error {
+	switch status {
+	case "creating", "running", "stopped", "error":
+	default:
+		return errors.New("invalid sandbox runtime state")
+	}
+	if runtimeID == "" {
+		return errors.New("sandbox runtime ID is required")
+	}
+	return s.submit(ctx, func(db *dialectDB) error {
+		now := time.Now().Unix()
+		_, err := db.ExecContext(ctx, `
+			UPDATE sandbox
+			   SET status=?, container_id=?, cgroup_path=NULL,
+			       error_message=NULL,
+			       stopped_at=CASE WHEN ?='running' THEN NULL ELSE stopped_at END,
+			       updated_at=?
+			 WHERE id=?`, status, runtimeID, status, now, id)
+		return err
+	})
+}
+
 // MarkStopped is used by the reconciler when a container has gone away
 // but its row remains. container_id and cgroup_path are preserved as
 // last-known.
 func (s *Store) MarkStopped(ctx context.Context, id string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx,
 			`UPDATE sandbox SET status='stopped', updated_at=? WHERE id=?`,
 			time.Now().Unix(), id)
@@ -315,7 +379,7 @@ func (s *Store) MarkStopped(ctx context.Context, id string) error {
 // MarkError records a failure on the row. Used by both the create
 // flow's failure cleanup and the reconciler's error path.
 func (s *Store) MarkError(ctx context.Context, id, msg string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx,
 			`UPDATE sandbox SET status='error', error_message=?, updated_at=? WHERE id=?`,
 			msg, time.Now().Unix(), id)
@@ -328,10 +392,14 @@ func (s *Store) MarkError(ctx context.Context, id, msg string) error {
 // enter/exit, and wake handler. Idempotent — moves the timestamp
 // forward only.
 func (s *Store) BumpLastActive(ctx context.Context, id string, t time.Time) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
+		max := "MAX"
+		if db.provider == ProviderPostgres {
+			max = "GREATEST"
+		}
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox
-			   SET last_active_at = MAX(last_active_at, ?),
+			   SET last_active_at = `+max+`(last_active_at, ?),
 			       updated_at     = ?
 			 WHERE id = ?`, t.Unix(), time.Now().Unix(), id)
 		return err
@@ -343,7 +411,7 @@ func (s *Store) BumpLastActive(ctx context.Context, id string, t time.Time) erro
 // container_id and cgroup_path are deliberately preserved for the
 // audit trail; the reconciler ignores them on running checks.
 func (s *Store) MarkStoppedAt(ctx context.Context, id string, t time.Time) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox
 			   SET status     = 'stopped',
@@ -358,7 +426,7 @@ func (s *Store) MarkStoppedAt(ctx context.Context, id string, t time.Time) error
 // last_active_at — used by the wake handler when a stopped sandbox
 // comes back up.
 func (s *Store) MarkRunningWoke(ctx context.Context, id, containerID, cgroupPath string, t time.Time) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox
 			   SET status='running',
@@ -378,7 +446,7 @@ func (s *Store) MarkRunningWoke(ctx context.Context, id, containerID, cgroupPath
 // is expected to have already clamped the value to the maximum
 // permitted offset; the store stores whatever it's given.
 func (s *Store) SetKeepaliveUntil(ctx context.Context, id string, until time.Time) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox SET keepalive_until = ?, updated_at = ? WHERE id = ?`,
 			until.Unix(), time.Now().Unix(), id)
@@ -391,7 +459,7 @@ func (s *Store) SetKeepaliveUntil(ctx context.Context, id string, until time.Tim
 // after `docker start`. Idempotent — overwriting with the same value
 // is a no-op.
 func (s *Store) SetContainerIP(ctx context.Context, id, ip string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox SET container_ip = ?, updated_at = ? WHERE id = ?`,
 			ip, time.Now().Unix(), id)
@@ -404,7 +472,7 @@ func (s *Store) SetContainerIP(ctx context.Context, id, ip string) error {
 // stopped container's old bridge IP is no longer ours to advertise to
 // nftables.
 func (s *Store) ClearContainerIP(ctx context.Context, id string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			UPDATE sandbox SET container_ip = NULL, updated_at = ? WHERE id = ?`,
 			time.Now().Unix(), id)
@@ -418,7 +486,7 @@ func (s *Store) ClearContainerIP(ctx context.Context, id string) error {
 // when migration 0002 runs against a populated DB.
 func (s *Store) BackfillRunningActivity(ctx context.Context) (int, error) {
 	var n int
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `
 			UPDATE sandbox
 			   SET last_active_at = updated_at
@@ -437,7 +505,7 @@ func (s *Store) BackfillRunningActivity(ctx context.Context) (int, error) {
 
 // Delete removes the sandbox row. Ports cascade via the FK.
 func (s *Store) Delete(ctx context.Context, id string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `DELETE FROM sandbox WHERE id=?`, id)
 		if err != nil {
 			return err
@@ -460,6 +528,10 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
+	}
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+		return true
 	}
 	return errors.Is(err, errUnique) || // overridable in tests
 		containsAny(err.Error(), "UNIQUE constraint failed", "constraint failed: UNIQUE")

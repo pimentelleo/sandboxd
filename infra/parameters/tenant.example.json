@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "applicationDisplayName": {
+      "value": "<sandboxd-production-application-display-name>"
+    },
+    "userGroupObjectId": {
+      "value": "<entra-user-security-group-object-id>"
+    },
+    "adminGroupObjectId": {
+      "value": "<entra-admin-security-group-object-id>"
+    },
+    "homepageUrl": {
+      "value": "https://console.<root-domain>"
+    }
+  }
+}

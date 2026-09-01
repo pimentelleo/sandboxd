@@ -1,0 +1,19 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: sandboxd-production
+spec:
+  acme:
+    email: ${ACME_EMAIL}
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: sandboxd-production-acme-account
+    solvers:
+      - dns01:
+          azureDNS:
+            subscriptionID: ${SUBSCRIPTION_ID}
+            resourceGroupName: ${DNS_ZONE_RESOURCE_GROUP}
+            hostedZoneName: ${ROOT_DOMAIN}
+            environment: AzurePublicCloud
+            managedIdentity:
+              clientID: ${CERT_MANAGER_CLIENT_ID}

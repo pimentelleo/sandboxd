@@ -198,4 +198,29 @@ func TestConversationChildInheritsTurnSettingsAndExposesBoundedPatch(t *testing.
 		snapshot.Children[0].ChangedFiles()[0] != "test/app_test.go" {
 		t.Fatalf("snapshot children = %#v", snapshot.Children)
 	}
+	interrupted, err := st.InterruptActiveConversationChildren(ctx, conversation.ID, "restart")
+	if err != nil {
+		t.Fatalf("interrupt active children: %v", err)
+	}
+	if len(interrupted) != 0 {
+		t.Fatalf("interrupted completed children = %#v", interrupted)
+	}
+	stored, err := st.GetConversationChild(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("get completed child after interruption: %v", err)
+	}
+	if stored.Status != ConversationChildSucceeded || stored.PatchState != ConversationChildPatchAvailable {
+		t.Fatalf("completed child was overwritten by interruption: %#v", stored)
+	}
+
+	if err := st.FinishConversationTurn(ctx, turn.ID, ConversationTurnSucceeded, `{}`, ""); err != nil {
+		t.Fatalf("finish parent turn: %v", err)
+	}
+	lateChild := &ConversationChild{
+		ID: "child-after-finish", ConversationID: conversation.ID, ParentTurnID: turn.ID,
+		Label: "Late child", Prompt: "must not be created", WorkspacePath: "/private/late-child",
+	}
+	if err := st.CreateConversationChild(ctx, lateChild); !errors.Is(err, ErrConflict) {
+		t.Fatalf("create child after parent finish = %v; want ErrConflict", err)
+	}
 }

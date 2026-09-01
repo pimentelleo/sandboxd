@@ -1,8 +1,8 @@
 // v1_api_keys.go — programmatic API keys managed from the console. Each key is
 // shown once at creation (its sha256 is stored, never the plaintext) and, in the
-// default single-tenant deployment, authenticates as the shared tenant. Only a
-// logged-in console user (session) may manage keys — a leaked key cannot mint
-// more keys.
+// default single-tenant deployment, authenticates as the shared tenant. Local
+// console users may manage keys; Entra requires an administrator because that
+// pool is globally scoped. A leaked key cannot mint more keys.
 package api
 
 import (
@@ -38,14 +38,24 @@ func toV1APIKey(k *store.APIKey) v1APIKey {
 	return out
 }
 
-// requireUser returns false (and writes 403) unless the caller is a logged-in
-// console user. Key management is session-only by design.
-func requireUser(w http.ResponseWriter, r *http.Request) bool {
-	if auth.ActorFrom(r.Context()).Kind == "user" {
-		return true
+// requireAPIKeyManager keeps local console behavior unchanged while preventing
+// a tenant-scoped Entra user from managing the globally scoped API-key pool.
+func (s *Server) requireAPIKeyManager(w http.ResponseWriter, r *http.Request) bool {
+	if s.authCfg().LocalAuthMode == auth.LocalAuthModeAccounts {
+		writeV1Err(w, http.StatusNotFound, "not_found", "API keys are not available with local account authentication")
+		return false
 	}
-	writeV1Err(w, http.StatusForbidden, "forbidden", "API key management requires a console login")
-	return false
+	actor := auth.ActorFrom(r.Context())
+	if actor.Kind != "user" {
+		writeV1Err(w, http.StatusForbidden, "forbidden", "API key management requires a console login")
+		return false
+	}
+	if s.authCfg().Profile == auth.ProfileEntra &&
+		(actor.Principal == nil || !actor.Principal.HasRole(auth.RoleAdmin)) {
+		writeV1Err(w, http.StatusForbidden, "forbidden", "API key management requires an administrator console login")
+		return false
+	}
+	return true
 }
 
 // POST /v1/api-keys {name} — mint a key; returns the plaintext ONCE.
@@ -54,7 +64,7 @@ func (s *Server) v1CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "auth store not configured")
 		return
 	}
-	if !requireUser(w, r) {
+	if !s.requireAPIKeyManager(w, r) {
 		return
 	}
 	var body struct {
@@ -98,7 +108,7 @@ func (s *Server) v1ListAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "auth store not configured")
 		return
 	}
-	if !requireUser(w, r) {
+	if !s.requireAPIKeyManager(w, r) {
 		return
 	}
 	keys, err := s.Store.ListAPIKeys(r.Context())
@@ -119,7 +129,7 @@ func (s *Server) v1DeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "auth store not configured")
 		return
 	}
-	if !requireUser(w, r) {
+	if !s.requireAPIKeyManager(w, r) {
 		return
 	}
 	id := r.PathValue("id")

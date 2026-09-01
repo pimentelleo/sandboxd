@@ -90,8 +90,8 @@ build:
 ```
 1. POST /v1/apps                      {name: 'gitea', tags: ['catalog','catalog:gitea']}
 2. POST /v1/apps/{id}/sandbox         → sandboxId
-3. PUT  /v1/sandboxes/{id}/files?path=workspace/app/catalog-run.sh   (recipe.script)
-4. PUT  /v1/sandboxes/{id}/files?path=workspace/app/sandbox.yaml     (manifest above)
+3. PUT  /v1/sandboxes/{id}/files?path=catalog-run.sh   (recipe.script)
+4. PUT  /v1/sandboxes/{id}/files?path=sandbox.yaml     (manifest above)
 5. POST /v1/sandboxes/{id}/stop  → poll status=stopped → POST /start   (adopt manifest, evict template)
 6. Poll GET /v1/sandboxes/{id} until status=running & web process running & preview.status healthy
 7. Done → open preview.url + entryPath

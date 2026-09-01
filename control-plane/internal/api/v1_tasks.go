@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +15,25 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
-// runtimeClientFor builds a runtime.Client for a sandbox's runtimed.
-func (s *Server) runtimeClientFor(id string) *runtime.Client {
+// runtimeClientFor returns the task transport for a sandbox's runtimed. In
+// provider mode it is always bound through the provider; it never dials a
+// host-mounted Unix socket.
+func (s *Server) runtimeClientFor(id string) runtimebackend.TaskRuntime {
+	if s.usesRuntimeProvider() {
+		sb, err := s.Store.Get(context.Background(), id)
+		if err != nil {
+			return unavailableTaskRuntime{err: fmt.Errorf("lookup provider sandbox %s: %w", id, err)}
+		}
+		client, err := s.providerTaskRuntime(sb)
+		if err != nil {
+			return unavailableTaskRuntime{err: err}
+		}
+		return client
+	}
 	_, mnt := s.Loopback.Paths(id)
 	return runtime.NewClient(filepath.Join(mnt, ".runtimed", "sock"))
 }
@@ -123,6 +138,17 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if s.usesRuntimeProvider() && sb.Status == "creating" {
+		sb, err = s.waitForProviderRunning(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, ErrRuntimeStarting) {
+				writeV1Err(w, http.StatusServiceUnavailable, "sandbox_starting", "sandbox is starting; retry task submission")
+				return
+			}
+			writeV1Err(w, http.StatusBadGateway, "sandbox_unavailable", "sandbox startup: "+err.Error())
+			return
+		}
+	}
 	if sb.Status != "running" {
 		writeV1Err(w, http.StatusConflict, "conflict",
 			"sandbox is "+sb.Status+" — cannot run a task")
@@ -209,15 +235,47 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.runtimeClientFor(id).StartTask(r.Context(), runtime.StartTaskRequest{
+	task := &store.Task{
+		TaskID: taskID, SandboxID: id, Agent: agent, Prompt: req.Prompt,
+		Status:         "running",
+		TimeoutS:       req.TimeoutS,
+		ExternalUserID: sb.ExternalUserID, ExternalProjectID: sb.ExternalProjectID,
+	}
+	taskRequest := runtime.StartTaskRequest{
 		TaskID: taskID, Prompt: req.Prompt, Agent: agent, Model: req.Model, TimeoutS: req.TimeoutS, Continue: req.Continue,
 		CopilotCapability: copilotCapability,
-	}); err != nil {
+	}
+	providerRuntime := s.usesRuntimeProvider()
+	if providerRuntime {
+		sb, err = s.startProviderTask(r.Context(), id, task, taskRequest)
+	} else {
+		err = s.runtimeClientFor(id).StartTask(r.Context(), taskRequest)
+	}
+	if err != nil {
 		if copilotCapability != "" {
 			s.Copilot.CancelCapability(copilotCapability)
 		}
+		var stateErr *providerSandboxStateError
+		if errors.As(err, &stateErr) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"sandbox is "+stateErr.status+" — cannot run a task")
+			return
+		}
+		if errors.Is(err, ErrRuntimeOperationBusy) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"sandbox lifecycle operation is already in progress")
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
+			return
+		}
 		if errors.Is(err, runtime.ErrTaskInProgress) {
 			writeV1Err(w, http.StatusConflict, "task_in_progress", "a task is already in progress")
+			return
+		}
+		if errors.Is(err, ErrRuntimeUnavailable) {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider is unavailable")
 			return
 		}
 		if agent == githubCopilotAgentID {
@@ -230,18 +288,19 @@ func (s *Server) v1SubmitTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// B2 — persist the durable task row; B3 — start the result watcher.
-	if err := s.Store.CreateTask(r.Context(), &store.Task{
-		TaskID: taskID, SandboxID: id, Agent: agent, Prompt: req.Prompt,
-		Status:         "running",
-		TimeoutS:       req.TimeoutS,
-		ExternalUserID: sb.ExternalUserID, ExternalProjectID: sb.ExternalProjectID,
-	}); err != nil {
-		// The task is running in runtimed but the row failed to write.
-		// The task still proceeds; GET would 404 until reconciled.
-		s.loggerFor(r, id).Error("v1 task: CreateTask failed", "task", taskID, "err", err.Error())
-	} else {
+	// The provider path persists admission under its lifecycle lease before
+	// StartTask. Keep the original local ordering intact for Docker installs.
+	if providerRuntime {
 		go s.watchTask(id, taskID, req.TimeoutS)
+	} else {
+		// B2 — persist the durable task row; B3 — start the result watcher.
+		if err := s.Store.CreateTask(r.Context(), task); err != nil {
+			// The task is running in runtimed but the row failed to write.
+			// The task still proceeds; GET would 404 until reconciled.
+			s.loggerFor(r, id).Error("v1 task: CreateTask failed", "task", taskID, "err", err.Error())
+		} else {
+			go s.watchTask(id, taskID, req.TimeoutS)
+		}
 	}
 
 	s.auditAction(r, audit.Entry{
@@ -409,7 +468,29 @@ func (s *Server) v1RevertTask(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusConflict, "conflict", "start the sandbox to revert (the restore runs in the workspace)")
 		return
 	}
-	if err := s.runtimeClientFor(id).RevertTask(r.Context(), taskID); err != nil {
+	if s.usesRuntimeProvider() {
+		err = s.withProviderTaskRuntime(r.Context(), id, func(ctx context.Context, taskRuntime runtimebackend.TaskRuntime) error {
+			return taskRuntime.RevertTask(ctx, taskID)
+		})
+	} else {
+		err = s.runtimeClientFor(id).RevertTask(r.Context(), taskID)
+	}
+	if err != nil {
+		var stateErr *providerSandboxStateError
+		if errors.As(err, &stateErr) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"start the sandbox to revert (the restore runs in the workspace)")
+			return
+		}
+		if errors.Is(err, ErrRuntimeOperationBusy) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"sandbox lifecycle operation is already in progress")
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
+			return
+		}
 		writeV1Err(w, http.StatusBadRequest, "revert_failed", err.Error())
 		return
 	}
@@ -458,7 +539,30 @@ func (s *Server) v1TaskEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) v1CancelTask(w http.ResponseWriter, r *http.Request) {
 	id, taskID := r.PathValue("id"), r.PathValue("taskId")
-	if err := s.runtimeClientFor(id).CancelTask(r.Context(), taskID); err != nil {
+	var err error
+	if s.usesRuntimeProvider() {
+		err = s.withProviderTaskRuntime(r.Context(), id, func(ctx context.Context, taskRuntime runtimebackend.TaskRuntime) error {
+			return taskRuntime.CancelTask(ctx, taskID)
+		})
+	} else {
+		err = s.runtimeClientFor(id).CancelTask(r.Context(), taskID)
+	}
+	if err != nil {
+		var stateErr *providerSandboxStateError
+		if errors.As(err, &stateErr) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"sandbox is "+stateErr.status+" — cannot cancel a task")
+			return
+		}
+		if errors.Is(err, ErrRuntimeOperationBusy) {
+			writeV1Err(w, http.StatusConflict, "conflict",
+				"sandbox lifecycle operation is already in progress")
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
+			return
+		}
 		writeV1Err(w, http.StatusBadGateway, "sandbox_unavailable", "runtimed: "+err.Error())
 		return
 	}

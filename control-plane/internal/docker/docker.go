@@ -332,6 +332,12 @@ func (c *Client) Exec(ctx context.Context, name string, cmd []string) (ExecResul
 // pty.Setsize, and MUST Close the PTY and Kill the process when the session ends.
 // This is the interactive counterpart to Exec (which is deliberately one-shot).
 func (c *Client) ExecTTY(name, user, workdir string, argv []string) (*os.File, *exec.Cmd, error) {
+	return c.ExecTTYContext(context.Background(), name, user, workdir, argv)
+}
+
+// ExecTTYContext is ExecTTY with cancellation and deadline support for the
+// terminal process. ExecTTY remains available for existing callers.
+func (c *Client) ExecTTYContext(ctx context.Context, name, user, workdir string, argv []string) (*os.File, *exec.Cmd, error) {
 	args := []string{"exec", "-i", "-t"}
 	if user != "" {
 		args = append(args, "-u", user)
@@ -341,7 +347,7 @@ func (c *Client) ExecTTY(name, user, workdir string, argv []string) (*os.File, *
 	}
 	args = append(args, name)
 	args = append(args, argv...)
-	cmd := exec.Command(c.Bin, args...)
+	cmd := exec.CommandContext(ctx, c.Bin, args...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, nil, err

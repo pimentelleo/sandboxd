@@ -82,7 +82,7 @@ func (s *Server) v1CreateGitCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	g := &store.GitCredential{
 		ID:         newULID(),
-		OwnerToken: tenantToken(r),
+		OwnerToken: actorOwnerToken(r),
 		Name:       name,
 		Host:       host,
 		Username:   username,
@@ -105,7 +105,7 @@ func (s *Server) v1ListGitCredentials(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusServiceUnavailable, "unavailable", "git credential store not configured")
 		return
 	}
-	creds, err := s.Store.ListGitCredentials(r.Context(), tenantToken(r))
+	creds, err := s.gitCredentialsForRequest(r)
 	if err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", "could not list credentials")
 		return

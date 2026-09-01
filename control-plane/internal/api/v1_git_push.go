@@ -64,6 +64,11 @@ func (s *Server) v1GitPush(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusInternalServerError, "internal", "lookup failed")
 		return
 	}
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"git push is unavailable with the runtime provider")
+		return
+	}
 	var req v1GitPushReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid json: "+err.Error())

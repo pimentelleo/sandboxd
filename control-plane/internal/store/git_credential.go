@@ -39,7 +39,7 @@ func scanGitCredential(sc scanner) (*GitCredential, error) {
 // are the sealed token (the store never sees plaintext). ErrConflict when
 // (owner_token, name) already exists.
 func (s *Store) CreateGitCredential(ctx context.Context, g *GitCredential, secretEnc, secretNonce []byte) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		now := time.Now().Unix()
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO git_credential
@@ -100,7 +100,7 @@ func (s *Store) GetGitCredentialSecret(ctx context.Context, owner, id string) (s
 // another owner's credential.
 func (s *Store) DeleteGitCredential(ctx context.Context, owner, id string) (bool, error) {
 	var deleted bool
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx,
 			`DELETE FROM git_credential WHERE owner_token = ? AND id = ?`, owner, id)
 		if err != nil {

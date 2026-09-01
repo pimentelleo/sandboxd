@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/loopback"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
@@ -170,5 +172,105 @@ func TestWatchTaskFailsWhenSilentPastWindow(t *testing.T) {
 	}
 	if got.Status != string(runtime.TaskFailed) {
 		t.Errorf("task status = %q; want %q", got.Status, runtime.TaskFailed)
+	}
+}
+
+func TestProviderTaskWatchLeasePreventsDuplicateTerminalEvents(t *testing.T) {
+	s, provider := newProviderAPIServer(t)
+	app := &store.App{ID: newULID(), OwnerToken: "tenant-a", Name: "provider task watcher"}
+	if err := s.Store.CreateApp(context.Background(), app); err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	sb := createProviderSandbox(t, s, "running", app.ID)
+	taskID := newULID()
+	if err := s.Store.CreateTask(context.Background(), &store.Task{
+		TaskID: taskID, SandboxID: sb.ID, Agent: "opencode", Prompt: "x",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	s.Events = events.New(s.Store, s.Log)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var hookMu sync.Mutex
+	calls := 0
+	provider.mu.Lock()
+	provider.taskEventsHook = func(ctx context.Context, gotTaskID string, _ int) (io.ReadCloser, error) {
+		if gotTaskID != taskID {
+			t.Errorf("watched task = %q; want %q", gotTaskID, taskID)
+		}
+		hookMu.Lock()
+		calls++
+		hookMu.Unlock()
+		startedOnce.Do(func() { close(started) })
+
+		reader, writer := io.Pipe()
+		go func() {
+			select {
+			case <-release:
+				if err := json.NewEncoder(writer).Encode(doneEvent(taskID, runtime.TaskSucceeded)); err != nil {
+					t.Errorf("write task event: %v", err)
+				}
+			case <-ctx.Done():
+			}
+			_ = writer.Close()
+		}()
+		return reader, nil
+	}
+	provider.mu.Unlock()
+
+	firstDone := make(chan struct{})
+	go func() {
+		s.watchTaskWindow(sb.ID, taskID, 2*time.Second)
+		close(firstDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first provider watcher did not reach its event stream")
+	}
+
+	// The second replica must not even attach while the first owns the task lease.
+	s.watchTaskWindow(sb.ID, taskID, 2*time.Second)
+	hookMu.Lock()
+	streamsWhileLeased := calls
+	hookMu.Unlock()
+	if streamsWhileLeased != 1 {
+		t.Fatalf("provider event streams while first watcher holds the lease = %d; want 1", streamsWhileLeased)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first provider watcher did not finish")
+	}
+
+	// A delayed reconciliation may attach after the first watcher has released
+	// its lease. The terminal-state compare-and-set must still suppress a second
+	// result and its duplicate task event.
+	s.watchTaskWindow(sb.ID, taskID, 2*time.Second)
+	hookMu.Lock()
+	streamsAfterReconcile := calls
+	hookMu.Unlock()
+	if streamsAfterReconcile != 2 {
+		t.Fatalf("provider event streams after delayed reconciliation = %d; want 2", streamsAfterReconcile)
+	}
+
+	task, err := s.Store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if task.Status != string(runtime.TaskSucceeded) {
+		t.Fatalf("task status = %q; want %q", task.Status, runtime.TaskSucceeded)
+	}
+	taskEvents, err := s.Store.ListTaskEvents(context.Background(), app.OwnerToken, taskID, "", 10)
+	if err != nil {
+		t.Fatalf("list task events: %v", err)
+	}
+	if len(taskEvents) != 1 || taskEvents[0].Type != events.TaskCompleted {
+		t.Fatalf("task terminal events = %#v; want exactly one completion", taskEvents)
 	}
 }

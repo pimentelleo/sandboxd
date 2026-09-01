@@ -214,7 +214,7 @@ func (o *OAuth) exchange(body map[string]string) (claudeCred, error) {
 }
 
 func (o *OAuth) read() (claudeCred, error) {
-	b, err := os.ReadFile(o.credPath())
+	b, err := o.store.ReadCredential("claude-code", claudeCredRel)
 	if err != nil {
 		return claudeCred{}, err
 	}

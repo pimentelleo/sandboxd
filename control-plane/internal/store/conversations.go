@@ -275,7 +275,7 @@ func (s *Store) CreateConversation(ctx context.Context, c *Conversation) error {
 	if c.DefaultMode == "" {
 		c.DefaultMode = ConversationModeInteractive
 	}
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		now := time.Now().Unix()
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO conversation
@@ -344,16 +344,16 @@ func (s *Store) ListConversationIDsForSandbox(ctx context.Context, sandboxID str
 // made. It deliberately refuses a queued, running, or waiting turn.
 func (s *Store) ArchiveActiveConversation(ctx context.Context, sandboxID string) (*Conversation, error) {
 	var archived *Conversation
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		current, err := scanConversation(tx.QueryRowContext(ctx,
+		current, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
 			`SELECT `+conversationSelectCols+`
 			   FROM conversation WHERE sandbox_id=? AND archived_at IS NULL
-			   ORDER BY created_at DESC LIMIT 1`, sandboxID))
+			   ORDER BY created_at DESC LIMIT 1`), sandboxID))
 		if err != nil {
 			return err
 		}
@@ -400,14 +400,14 @@ func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, tur
 		turn     *ConversationTurn
 		position int
 	)
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, conversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), conversationID))
 		if err != nil {
 			return err
 		}
@@ -500,25 +500,25 @@ func (s *Store) EnqueueConversationTurn(ctx context.Context, conversationID, tur
 // turn still owns the conversation.
 func (s *Store) ClaimNextConversationTurn(ctx context.Context, conversationID string) (*ConversationTurn, error) {
 	var turn *ConversationTurn
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, conversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), conversationID))
 		if err != nil {
 			return err
 		}
 		if conversation.ArchivedAt.Valid || conversation.ActiveTurnID.Valid {
 			return ErrConflict
 		}
-		claimed, err := scanConversationTurn(tx.QueryRowContext(ctx,
+		claimed, err := scanConversationTurn(tx.QueryRowContext(ctx, tx.ForUpdate(
 			`SELECT `+conversationTurnSelectCols+`
 			   FROM conversation_turn
 			  WHERE conversation_id=? AND status=?
-			  ORDER BY sequence ASC LIMIT 1`, conversationID, ConversationTurnQueued))
+			  ORDER BY sequence ASC LIMIT 1`), conversationID, ConversationTurnQueued))
 		if err != nil {
 			return err
 		}
@@ -631,14 +631,14 @@ func (s *Store) CreateConversationInteraction(ctx context.Context, interaction *
 	if err != nil {
 		return err
 	}
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, interaction.ConversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), interaction.ConversationID))
 		if err != nil {
 			return err
 		}
@@ -701,7 +701,7 @@ func (s *Store) CreateConversationInteraction(ctx context.Context, interaction *
 // answers to the provider.
 func (s *Store) ResolveConversationInteraction(ctx context.Context, id, answer string, approved *bool, selectedAction, feedback string) (*ConversationInteraction, error) {
 	var resolved *ConversationInteraction
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -716,19 +716,29 @@ func (s *Store) ResolveConversationInteraction(ctx context.Context, id, answer s
 		if interaction.Status != ConversationInteractionPending {
 			return ErrConflict
 		}
+		if _, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), interaction.ConversationID)); err != nil {
+			return err
+		}
 		now := time.Now().Unix()
 		var approvedValue any
 		if approved != nil {
 			approvedValue = boolToInt(*approved)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(ctx, `
 			UPDATE conversation_interaction
 			   SET status=?, answer=?, approved=?, selected_action=?, feedback=?, resolved_at=?
 			 WHERE id=? AND status=?`,
 			ConversationInteractionResolved, nullIfEmpty(answer), approvedValue,
 			nullIfEmpty(selectedAction), nullIfEmpty(feedback), now, interaction.ID,
-			ConversationInteractionPending); err != nil {
+			ConversationInteractionPending)
+		if err != nil {
 			return err
+		}
+		if count, err := result.RowsAffected(); err != nil {
+			return err
+		} else if count != 1 {
+			return ErrConflict
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE conversation_turn SET status=? WHERE id=?`,
@@ -778,7 +788,7 @@ func (s *Store) AppendAssistantText(ctx context.Context, conversationID, turnID,
 	if len(text) > maxConversationEventPayload {
 		return errors.New("conversation message delta exceeds limit")
 	}
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -823,7 +833,7 @@ func (s *Store) AppendAssistantText(ctx context.Context, conversationID, turnID,
 
 // AppendConversationEvent records an already-redacted provider lifecycle event.
 func (s *Store) AppendConversationEvent(ctx context.Context, conversationID, turnID, typ string, payload any) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := appendConversationEvent(ctx, db, conversationID, turnID, typ, payload)
 		return err
 	})
@@ -832,7 +842,7 @@ func (s *Store) AppendConversationEvent(ctx context.Context, conversationID, tur
 // FinishConversationTurn stores the canonical hosted result in the existing
 // task row, releases the conversation queue, and interrupts any stale callback.
 func (s *Store) FinishConversationTurn(ctx context.Context, turnID, status, resultJSON, errorMessage string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -843,8 +853,8 @@ func (s *Store) FinishConversationTurn(ctx context.Context, turnID, status, resu
 		if err != nil {
 			return err
 		}
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, turn.ConversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), turn.ConversationID))
 		if err != nil {
 			return err
 		}
@@ -905,14 +915,14 @@ func (s *Store) FinishConversationTurn(ctx context.Context, turnID, status, resu
 // that still protects the sandbox until the SDK worker finalizes it.
 func (s *Store) RequestConversationTurnCancellation(ctx context.Context, conversationID string) (*ConversationTurn, error) {
 	var current *ConversationTurn
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, conversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), conversationID))
 		if err != nil {
 			return err
 		}
@@ -992,10 +1002,7 @@ func (s *Store) InterruptConversationTurn(ctx context.Context, turnID, message s
 // SnapshotActiveConversation reads the complete current UI state. The bounded
 // transcript is returned oldest-first for direct rendering.
 func (s *Store) SnapshotActiveConversation(ctx context.Context, sandboxID string) (*ConversationSnapshot, error) {
-	// The cursor must describe the same SQLite snapshot as the transcript. If it
-	// were read separately, a client could skip an event committed between the
-	// transcript reads and the cursor query during its SSE handoff.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.db.BeginTx(ctx, conversationSnapshotTxOptions(s.provider))
 	if err != nil {
 		return nil, err
 	}
@@ -1040,6 +1047,14 @@ func (s *Store) SnapshotActiveConversation(ctx context.Context, sandboxID string
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+func conversationSnapshotTxOptions(provider Provider) *sql.TxOptions {
+	options := &sql.TxOptions{ReadOnly: true}
+	if provider == ProviderPostgres {
+		options.Isolation = sql.LevelRepeatableRead
+	}
+	return options
 }
 
 func (s *Store) listConversationTurns(ctx context.Context, conversationID string, limit int) ([]*ConversationTurn, error) {
@@ -1178,7 +1193,7 @@ func latestConversationEventID(ctx context.Context, queryer conversationQueryer,
 	return id.Int64, nil
 }
 
-func nextConversationSequence(ctx context.Context, tx *sql.Tx, conversationID string) (int64, error) {
+func nextConversationSequence(ctx context.Context, tx *dialectTx, conversationID string) (int64, error) {
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE conversation SET next_sequence=next_sequence+1 WHERE id=?`, conversationID); err != nil {
 		return 0, err
@@ -1202,10 +1217,17 @@ func appendConversationEvent(ctx context.Context, exec sqlExecutor, conversation
 	if len(raw) > maxConversationEventPayload {
 		return 0, errors.New("conversation event exceeds limit")
 	}
-	result, err := exec.ExecContext(ctx, `
+	query := `
 		INSERT INTO conversation_event
 		    (conversation_id, turn_id, type, payload_json, created_at)
-		VALUES (?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?)`
+	if exec.providerName() == ProviderPostgres {
+		var id int64
+		err := exec.QueryRowContext(ctx, query+` RETURNING id`,
+			conversationID, nullIfEmpty(turnID), typ, string(raw), time.Now().Unix()).Scan(&id)
+		return id, err
+	}
+	result, err := exec.ExecContext(ctx, query,
 		conversationID, nullIfEmpty(turnID), typ, string(raw), time.Now().Unix())
 	if err != nil {
 		return 0, err
@@ -1215,6 +1237,8 @@ func appendConversationEvent(ctx context.Context, exec sqlExecutor, conversation
 
 type sqlExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	providerName() Provider
 }
 
 func publicInteractionPayload(interaction *ConversationInteraction) map[string]any {

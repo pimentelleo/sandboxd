@@ -34,6 +34,8 @@ const (
 	TaskExecutionHostedCopilot = "hosted-copilot"
 )
 
+var ErrTaskNotRunning = errors.New("task is no longer running")
+
 const taskSelectCols = `task_id, sandbox_id, external_user_id, external_project_id,
 	agent, prompt, status, result_json, timeout_s, execution_kind, conversation_id,
 	conversation_turn_id, created_at, finished_at`
@@ -58,7 +60,7 @@ func scanTask(sc scanner) (*Task, error) {
 // the legacy running/runtimed defaults; hosted conversation turns may begin
 // queued before their coordinator claims them.
 func (s *Store) CreateTask(ctx context.Context, t *Task) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		status := t.Status
 		if status == "" {
 			status = "running"
@@ -80,14 +82,61 @@ func (s *Store) CreateTask(ctx context.Context, t *Task) error {
 	})
 }
 
-// FinishTask records a task's terminal status and canonical result.
+// FinishTask records a task's terminal status and canonical result only while
+// the task is still running. The conditional update keeps duplicate local
+// watchers from overwriting the first durable terminal result.
 func (s *Store) FinishTask(ctx context.Context, taskID, status, resultJSON string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
-		_, err := db.ExecContext(ctx, `
+	return s.finishRunningTask(ctx, taskID, status, resultJSON, nil)
+}
+
+// FinishTaskWithLease records a task result only while the caller still owns
+// its task-watch lease. This fences stale Kubernetes replicas after a lease
+// expires and ensures that only one watcher can publish the terminal result.
+func (s *Store) FinishTaskWithLease(ctx context.Context, lease OperationLease, taskID, status, resultJSON string) error {
+	if lease.Resource != LeaseResourceTask || lease.ResourceID != taskID || lease.HolderID == "" || lease.Token == "" {
+		return errors.New("invalid task completion lease")
+	}
+	return s.finishRunningTask(ctx, taskID, status, resultJSON, &lease)
+}
+
+func (s *Store) finishRunningTask(ctx context.Context, taskID, status, resultJSON string, lease *OperationLease) error {
+	return s.submit(ctx, func(db *dialectDB) error {
+		query := `
 			UPDATE task SET status=?, result_json=?, finished_at=?
-			 WHERE task_id=?`,
-			status, resultJSON, time.Now().Unix(), taskID)
-		return err
+			 WHERE task_id=? AND status='running'`
+		args := []any{status, resultJSON, s.now().Unix(), taskID}
+		if lease != nil {
+			query += `
+			   AND EXISTS (
+			       SELECT 1 FROM operation_lease
+			        WHERE resource_type=? AND resource_id=? AND holder_id=? AND token=?`
+			args = append(args, lease.Resource, lease.ResourceID, lease.HolderID, lease.Token)
+			if db.providerName() == ProviderPostgres {
+				query += `
+			          AND expires_at > (SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+			   )`
+			} else {
+				query += `
+			          AND expires_at > ?
+			   )`
+				args = append(args, s.now().UTC().UnixMilli())
+			}
+		}
+		result, err := db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			if lease != nil {
+				return ErrLeaseLost
+			}
+			return ErrTaskNotRunning
+		}
+		return nil
 	})
 }
 

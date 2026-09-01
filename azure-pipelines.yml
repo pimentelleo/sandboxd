@@ -1,0 +1,366 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: azureServiceConnection
+    type: string
+    default: ''
+  - name: privateAgentPool
+    type: string
+    default: ''
+  - name: productionEnvironment
+    type: string
+    default: ''
+  - name: resourceGroup
+    type: string
+    default: ''
+  - name: workloadPrefix
+    type: string
+    default: ''
+  - name: productionParametersFile
+    type: string
+    default: ''
+  - name: tenantParametersFile
+    type: string
+    default: ''
+  - name: rootDomain
+    type: string
+    default: ''
+  - name: dnsZoneResourceGroup
+    type: string
+    default: ''
+  - name: acmeEmail
+    type: string
+    default: ''
+  - name: entraTenantId
+    type: string
+    default: ''
+  - name: entraClientId
+    type: string
+    default: ''
+  - name: entraRedirectUrl
+    type: string
+    default: ''
+  - name: controlPlaneRunAsUser
+    type: string
+    default: ''
+  - name: controlPlaneRunAsGroup
+    type: string
+    default: ''
+  - name: kubernetesClusterDomain
+    type: string
+    default: 'cluster.local'
+
+stages:
+  - stage: Validate
+    displayName: Validate production artifacts
+    jobs:
+      - job: ValidateArtifacts
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: GoTool@0
+            inputs:
+              version: "1.24.0"
+          - script: |
+              set -euo pipefail
+              cd control-plane
+              unformatted="$(gofmt -l .)"
+              test -z "$unformatted" || {
+                echo "These files are not gofmt-clean:"
+                echo "$unformatted"
+                exit 1
+              }
+              go vet ./...
+              go build ./...
+              go test ./...
+            displayName: Test Go control plane
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "20.x"
+          - script: |
+              set -euo pipefail
+              cd console
+              corepack enable
+              corepack prepare pnpm@9.15.0 --activate
+              pnpm install --frozen-lockfile
+              pnpm exec tsc --noEmit
+              pnpm test
+              pnpm build
+            displayName: Test and build console
+          - script: |
+              set -euo pipefail
+              az bicep upgrade
+              az bicep build --file infra/main.bicep
+              az bicep build --file infra/tenant/entra-app.bicep
+            displayName: Build Bicep templates
+          - script: |
+              set -euo pipefail
+              python -m pip install --disable-pip-version-check --quiet yamllint
+              yamllint -d '{extends: default, rules: {line-length: disable, document-start: disable, new-lines: disable}}' azure-pipelines.yml infra
+            displayName: Lint YAML
+          - script: |
+              set -euo pipefail
+              export ROOT_DOMAIN=example.com
+              export DNS_ZONE_RESOURCE_GROUP=sandboxd-dns
+              export ACME_EMAIL=operators@example.com
+              export ENTRA_TENANT_ID=00000000-0000-0000-0000-000000000001
+              export ENTRA_CLIENT_ID=00000000-0000-0000-0000-000000000002
+              export ENTRA_REDIRECT_URL=https://console.example.com/v1/auth/callback
+              export CONTROL_PLANE_RUN_AS_USER=10001
+              export CONTROL_PLANE_RUN_AS_GROUP=10001
+              export KUBERNETES_CLUSTER_DOMAIN=cluster.local
+              export CONTROL_PLANE_CLIENT_ID=00000000-0000-0000-0000-000000000003
+              export CERT_MANAGER_CLIENT_ID=00000000-0000-0000-0000-000000000004
+              export KEY_VAULT_NAME=sandboxdkv
+              export POSTGRES_FQDN=sandboxd-pg.postgres.database.azure.com
+              export SUBSCRIPTION_ID=00000000-0000-0000-0000-000000000005
+              export TENANT_ID="$ENTRA_TENANT_ID"
+              export INGRESS_PUBLIC_IP=203.0.113.10
+              export IMAGE_TAG=test
+              export CONTROL_PLANE_IMAGE=registry.example/sandboxd-control-plane:test
+              export CONSOLE_IMAGE=registry.example/sandboxd-console:test
+              export SANDBOX_IMAGE=registry.example/sandboxd-base:test
+              rendered="$(mktemp -d)"
+              trap 'rm -rf "$rendered"' EXIT
+              for file in infra/manifests/*.yaml; do
+                envsubst < "$file" > "$rendered/$(basename "$file")"
+              done
+              docker run --rm -v "$rendered:/work:ro" ghcr.io/yannh/kubeconform:v0.6.7 \
+                -strict -summary -ignore-missing-schemas /work
+            displayName: Render and validate Kubernetes manifests
+          - script: |
+              set -euo pipefail
+              docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/gitleaks/gitleaks:v8.24.2 \
+                dir --redact --no-banner /repo
+            displayName: Scan committed source for secrets
+
+  - stage: Entra
+    displayName: Deploy Entra application
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'Manual'))
+    jobs:
+      - deployment: DeployEntra
+        pool:
+          name: ${{ parameters.privateAgentPool }}
+        environment: ${{ parameters.productionEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: ${{ parameters.azureServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      test -n '${{ parameters.tenantParametersFile }}'
+                      az bicep upgrade
+                      az deployment tenant what-if \
+                        --location brazilsouth \
+                        --template-file infra/tenant/entra-app.bicep \
+                        --parameters @"${{ parameters.tenantParametersFile }}"
+                      az deployment tenant create \
+                        --name "sandboxd-entra-$(Build.BuildId)" \
+                        --location brazilsouth \
+                        --template-file infra/tenant/entra-app.bicep \
+                        --parameters @"${{ parameters.tenantParametersFile }}"
+
+  - stage: Infrastructure
+    displayName: Deploy resource-group infrastructure
+    dependsOn: Entra
+    condition: succeeded()
+    jobs:
+      - deployment: DeployInfrastructure
+        pool:
+          name: ${{ parameters.privateAgentPool }}
+        environment: ${{ parameters.productionEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  env:
+                    POSTGRES_ADMIN_PASSWORD: $(POSTGRES_ADMIN_PASSWORD)
+                    DEPLOYMENT_PRINCIPAL_OBJECT_ID: $(DEPLOYMENT_PRINCIPAL_OBJECT_ID)
+                  inputs:
+                    azureSubscription: ${{ parameters.azureServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      test -n '${{ parameters.resourceGroup }}'
+                      test -n '${{ parameters.productionParametersFile }}'
+                      test -n "$POSTGRES_ADMIN_PASSWORD"
+                      test -n "$DEPLOYMENT_PRINCIPAL_OBJECT_ID"
+                      az bicep upgrade
+                      az deployment group what-if \
+                        --resource-group '${{ parameters.resourceGroup }}' \
+                        --template-file infra/main.bicep \
+                        --parameters @"${{ parameters.productionParametersFile }}" \
+                        postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD" \
+                        deploymentPrincipalObjectId="$DEPLOYMENT_PRINCIPAL_OBJECT_ID"
+                      az deployment group create \
+                        --name "sandboxd-infra-$(Build.BuildId)" \
+                        --resource-group '${{ parameters.resourceGroup }}' \
+                        --template-file infra/main.bicep \
+                        --parameters @"${{ parameters.productionParametersFile }}" \
+                        postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD" \
+                        deploymentPrincipalObjectId="$DEPLOYMENT_PRINCIPAL_OBJECT_ID"
+
+  - stage: BuildImages
+    displayName: Build and publish immutable images
+    dependsOn: Infrastructure
+    condition: succeeded()
+    jobs:
+      - job: BuildAndPublish
+        pool:
+          name: ${{ parameters.privateAgentPool }}
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                registry_name="$(printf '%s' '${{ parameters.workloadPrefix }}' | tr '[:upper:]' '[:lower:]')acr"
+                image_tag="$(Build.SourceVersion)"
+                login_server="$(az acr show --name "$registry_name" --query loginServer -o tsv)"
+                az acr login --name "$registry_name"
+                publish() {
+                  local image_name="$1"
+                  local dockerfile="$2"
+                  local context="$3"
+                  local target="$login_server/$image_name:$image_tag"
+                  if az acr repository show --name "$registry_name" --image "$image_name:$image_tag" >/dev/null 2>&1; then
+                    echo "Refusing to overwrite immutable image tag $image_name:$image_tag" >&2
+                    exit 1
+                  fi
+                  docker build --pull --file "$dockerfile" --tag "$target" "$context"
+                  docker push "$target"
+                }
+                publish sandboxd-control-plane control-plane/Dockerfile.production control-plane
+                publish sandboxd-console console/Dockerfile.production console
+                publish sandboxd-base image/Dockerfile .
+
+  - stage: DeployWorkloads
+    displayName: Migrate and deploy workloads
+    dependsOn: BuildImages
+    condition: succeeded()
+    jobs:
+      - deployment: DeployWorkloads
+        pool:
+          name: ${{ parameters.privateAgentPool }}
+        environment: ${{ parameters.productionEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  env:
+                    SANDBOXD_DATABASE_URL: $(SANDBOXD_DATABASE_URL)
+                    SANDBOXD_ENCRYPTION_KEY: $(SANDBOXD_ENCRYPTION_KEY)
+                    SANDBOXD_ENTRA_CLIENT_SECRET: $(SANDBOXD_ENTRA_CLIENT_SECRET)
+                  inputs:
+                    azureSubscription: ${{ parameters.azureServiceConnection }}
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      test -n '${{ parameters.rootDomain }}'
+                      test -n '${{ parameters.dnsZoneResourceGroup }}'
+                      test -n '${{ parameters.acmeEmail }}'
+                      test -n '${{ parameters.entraTenantId }}'
+                      test -n '${{ parameters.entraClientId }}'
+                      test -n '${{ parameters.entraRedirectUrl }}'
+                      test -n '${{ parameters.controlPlaneRunAsUser }}'
+                      test -n '${{ parameters.controlPlaneRunAsGroup }}'
+                      test -n '${{ parameters.kubernetesClusterDomain }}'
+                      test -n "$SANDBOXD_DATABASE_URL"
+                      test -n "$SANDBOXD_ENCRYPTION_KEY"
+                      test -n "$SANDBOXD_ENTRA_CLIENT_SECRET"
+                      registry_name="$(printf '%s' '${{ parameters.workloadPrefix }}' | tr '[:upper:]' '[:lower:]')acr"
+                      key_vault_name="$(printf '%s' '${{ parameters.workloadPrefix }}' | tr '[:upper:]' '[:lower:]')-kv"
+                      aks_name="${{ parameters.workloadPrefix }}-aks"
+                      image_tag="$(Build.SourceVersion)"
+                      login_server="$(az acr show --name "$registry_name" --query loginServer -o tsv)"
+                      ingress_public_ip="$(az network public-ip show --resource-group '${{ parameters.resourceGroup }}' --name '${{ parameters.workloadPrefix }}-ingress-pip' --query ipAddress -o tsv)"
+                      control_plane_client_id="$(az identity show --resource-group '${{ parameters.resourceGroup }}' --name '${{ parameters.workloadPrefix }}-control-mi' --query clientId -o tsv)"
+                      cert_manager_client_id="$(az identity show --resource-group '${{ parameters.resourceGroup }}' --name '${{ parameters.workloadPrefix }}-cert-manager-mi' --query clientId -o tsv)"
+                      subscription_id="$(az account show --query id -o tsv)"
+                      az keyvault secret set --vault-name "$key_vault_name" --name sandboxd-database-url --value "$SANDBOXD_DATABASE_URL" --only-show-errors >/dev/null
+                      az keyvault secret set --vault-name "$key_vault_name" --name sandboxd-encryption-key --value "$SANDBOXD_ENCRYPTION_KEY" --only-show-errors >/dev/null
+                      az keyvault secret set --vault-name "$key_vault_name" --name sandboxd-entra-client-secret --value "$SANDBOXD_ENTRA_CLIENT_SECRET" --only-show-errors >/dev/null
+                      az aks get-credentials --resource-group '${{ parameters.resourceGroup }}' --name "$aks_name" --overwrite-existing
+                      kubelogin convert-kubeconfig -l azurecli
+                      export ROOT_DOMAIN='${{ parameters.rootDomain }}'
+                      export DNS_ZONE_RESOURCE_GROUP='${{ parameters.dnsZoneResourceGroup }}'
+                      export ACME_EMAIL='${{ parameters.acmeEmail }}'
+                      export ENTRA_TENANT_ID='${{ parameters.entraTenantId }}'
+                      export ENTRA_CLIENT_ID='${{ parameters.entraClientId }}'
+                      export ENTRA_REDIRECT_URL='${{ parameters.entraRedirectUrl }}'
+                      export CONTROL_PLANE_RUN_AS_USER='${{ parameters.controlPlaneRunAsUser }}'
+                      export CONTROL_PLANE_RUN_AS_GROUP='${{ parameters.controlPlaneRunAsGroup }}'
+                      export KUBERNETES_CLUSTER_DOMAIN='${{ parameters.kubernetesClusterDomain }}'
+                      export CONTROL_PLANE_CLIENT_ID="$control_plane_client_id"
+                      export CERT_MANAGER_CLIENT_ID="$cert_manager_client_id"
+                      export KEY_VAULT_NAME="$key_vault_name"
+                      export POSTGRES_FQDN="$(az postgres flexible-server show --resource-group '${{ parameters.resourceGroup }}' --name "$(printf '%s' '${{ parameters.workloadPrefix }}' | tr '[:upper:]' '[:lower:]')-pg" --query fullyQualifiedDomainName -o tsv)"
+                      export SUBSCRIPTION_ID="$subscription_id"
+                      export TENANT_ID="$ENTRA_TENANT_ID"
+                      export INGRESS_PUBLIC_IP="$ingress_public_ip"
+                      export INGRESS_RESOURCE_GROUP='${{ parameters.resourceGroup }}'
+                      export IMAGE_TAG="$image_tag"
+                      export CONTROL_PLANE_IMAGE="$login_server/sandboxd-control-plane:$image_tag"
+                      export CONSOLE_IMAGE="$login_server/sandboxd-console:$image_tag"
+                      export SANDBOX_IMAGE="$login_server/sandboxd-base:$image_tag"
+                      mkdir -p "$(Pipeline.Workspace)/sandboxd-rendered"
+                      for file in infra/manifests/*.yaml; do
+                        envsubst < "$file" > "$(Pipeline.Workspace)/sandboxd-rendered/$(basename "$file")"
+                      done
+                      helm dependency build infra/helm/cert-manager
+                      helm upgrade --install cert-manager infra/helm/cert-manager \
+                        --namespace cert-manager --create-namespace \
+                        --values <(envsubst < infra/helm/cert-manager/values.production.yaml) \
+                        --wait --timeout 10m
+                      helm dependency build infra/helm/traefik
+                      helm upgrade --install traefik infra/helm/traefik \
+                        --namespace traefik --create-namespace \
+                        --values <(envsubst < infra/helm/traefik/values.production.yaml) \
+                        --wait --timeout 10m
+                      kubectl apply --server-side --field-manager=sandboxd-release \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/namespaces.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/runtimeclass.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/preview-system.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/system-network-policy.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/cert-manager.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/certificates.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/control-plane.yaml"
+                      kubectl wait --for=condition=complete --timeout=10m \
+                        -n sandboxd-system "job/sandboxd-migrate-$image_tag"
+                      kubectl apply --server-side --field-manager=sandboxd-release \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/control-plane-deployment.yaml" \
+                        -f "$(Pipeline.Workspace)/sandboxd-rendered/console.yaml"
+                      kubectl rollout status --timeout=10m -n sandboxd-system deployment/sandboxd-control-plane
+                      kubectl rollout status --timeout=10m -n sandboxd-system deployment/sandboxd-console
+                      for attempt in $(seq 1 30); do
+                        resolved_ip="$(getent ahostsv4 "console.$ROOT_DOMAIN" | awk 'NR == 1 { print $1 }')"
+                        if [ "$resolved_ip" = "$ingress_public_ip" ]; then break; fi
+                        sleep 10
+                      done
+                      test "${resolved_ip:-}" = "$ingress_public_ip"
+                      curl --fail --silent --show-error "https://console.$ROOT_DOMAIN/" >/dev/null
+                      curl --fail --silent --show-error "https://console.$ROOT_DOMAIN/v1/auth/status" >/dev/null
+                      auth_code="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://console.$ROOT_DOMAIN/v1/apps")"
+                      test "$auth_code" = 401

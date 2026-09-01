@@ -13,6 +13,7 @@ import (
 var requiredPublicSurface = []string{
 	"GET /v1/settings",
 	"PATCH /v1/settings",
+	"POST /v1/auth/accounts",
 	"GET /v1/agents",
 	"GET /v1/agents/github-copilot/models",
 	"GET /v1/presets",
@@ -31,6 +32,7 @@ var requiredPublicSurface = []string{
 	"POST /v1/apps",
 	"POST /v1/apps/{id}/sandbox",
 	"GET /v1/sandboxes/{id}",
+	"POST /v1/sandboxes/{id}/exec",
 	"GET /v1/sandboxes/{id}/processes/{name}/logs",
 	"POST /v1/snapshots",
 	"GET /v1/snapshots",

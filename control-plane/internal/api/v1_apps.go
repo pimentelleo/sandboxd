@@ -121,11 +121,21 @@ func (s *Server) v1CreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Image != nil {
-		writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		if s.usesRuntimeProvider() {
+			writeV1Err(w, http.StatusNotImplemented, "unsupported",
+				"per-app image selection is unavailable with the runtime provider")
+		} else {
+			writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		}
 		return
 	}
 	if req.Name == "" {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "name is required")
+		return
+	}
+	if s.usesRuntimeProvider() && (req.RuntimePreset != "" || req.Git != nil) {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"git import and runtime presets are unavailable with the runtime provider")
 		return
 	}
 	if req.RuntimePreset != "" && !preset.Valid(req.RuntimePreset) {
@@ -134,11 +144,12 @@ func (s *Server) v1CreateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	app := &store.App{
 		ID:                newULID(),
-		OwnerToken:        tenantToken(r),
+		OwnerToken:        actorOwnerToken(r),
+		OwnerPrincipalID:  nullStr(principalID(r)),
 		Name:              req.Name,
 		Description:       req.Description,
 		Tags:              req.Tags,
-		ExternalUserID:    nullStr(req.ExternalUserID),
+		ExternalUserID:    nullStr(s.creationExternalUserID(r, req.ExternalUserID)),
 		ExternalProjectID: nullStr(req.ExternalProjectID),
 		RuntimePreset:     nullStr(req.RuntimePreset),
 	}
@@ -193,7 +204,7 @@ func (s *Server) v1CreateApp(w http.ResponseWriter, r *http.Request) {
 
 // v1ListApps — GET /v1/apps (tenant-scoped; optional ?external_user_id).
 func (s *Server) v1ListApps(w http.ResponseWriter, r *http.Request) {
-	apps, err := s.Store.ListAppsForOwner(r.Context(), tenantToken(r), r.URL.Query().Get("external_user_id"))
+	apps, err := s.appsForRequest(r)
 	if err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -295,8 +306,13 @@ func (s *Server) v1DeleteApp(w http.ResponseWriter, r *http.Request) {
 		freed += f
 	}
 
-	// 2. Snapshot image files (library .img) — capture paths before the rows go.
-	snapPaths, _ := s.Store.SnapshotImagePathsForApp(r.Context(), id)
+	// 2. Snapshot image files are local-provider artifacts. A Kubernetes
+	// provider never materializes a workspace or snapshot path in the
+	// control-plane filesystem, so skip this lookup and removal entirely.
+	var snapPaths []string
+	if !s.usesRuntimeProvider() {
+		snapPaths, _ = s.Store.SnapshotImagePathsForApp(r.Context(), id)
+	}
 
 	// 3. Delete all app-scoped rows + the app itself, in one transaction.
 	if err := s.Store.DeleteApp(r.Context(), id); err != nil {
@@ -304,9 +320,12 @@ func (s *Server) v1DeleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Remove the snapshot image files (best-effort; the rows are already gone).
-	for _, p := range snapPaths {
-		_ = os.Remove(p)
+	// 4. Remove local snapshot image files best-effort; the rows are already
+	// gone. Provider mode has no control-plane filesystem cleanup.
+	if !s.usesRuntimeProvider() {
+		for _, p := range snapPaths {
+			_ = os.Remove(p)
+		}
 	}
 
 	// audit_log is a separate, append-only table (NOT app_events, which we just
@@ -351,12 +370,27 @@ func (s *Server) v1CreateAppSandbox(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&req) // body optional
 	}
 	if req.Image != nil {
-		writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		if s.usesRuntimeProvider() {
+			writeV1Err(w, http.StatusNotImplemented, "unsupported",
+				"per-app image selection is unavailable with the runtime provider")
+		} else {
+			writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		}
+		return
+	}
+	if s.usesRuntimeProvider() && (req.Template != "" || req.RuntimePreset != "" ||
+		(app.RuntimePreset.Valid && app.RuntimePreset.String != "") ||
+		(app.GitRepoURL.Valid && app.GitRepoURL.String != "")) {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"templates, git import, and runtime presets are unavailable with the runtime provider")
 		return
 	}
 	ports := req.Ports
 	if len(ports) == 0 {
 		ports = []int{3000}
+		if s.usesRuntimeProvider() {
+			ports[0] = s.providerWebPort()
+		}
 	}
 	createBody := map[string]any{
 		"ports":  ports,

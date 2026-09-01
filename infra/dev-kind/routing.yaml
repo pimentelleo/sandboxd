@@ -1,0 +1,29 @@
+apiVersion: projectcontour.io/v1
+kind: HTTPProxy
+metadata:
+  name: sandboxd-console
+  namespace: sandboxd-system
+spec:
+  virtualhost:
+    fqdn: console.localhost
+  routes:
+    - services:
+        - name: sandboxd-console
+          port: 80
+---
+apiVersion: projectcontour.io/v1
+kind: HTTPProxy
+metadata:
+  name: sandboxd-preview-gateway
+  namespace: sandboxd-system
+spec:
+  virtualhost:
+    fqdn: "*.preview.localhost"
+  routes:
+    - requestHeadersPolicy:
+        set:
+          - name: X-Sandboxd-Preview-Gateway
+            value: "1"
+      services:
+        - name: sandboxd-control-plane
+          port: 9000

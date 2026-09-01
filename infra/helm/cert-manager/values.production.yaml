@@ -1,0 +1,10 @@
+cert-manager:
+  crds:
+    enabled: true
+  serviceAccount:
+    create: true
+    name: cert-manager
+    annotations:
+      azure.workload.identity/client-id: ${CERT_MANAGER_CLIENT_ID}
+  podLabels:
+    azure.workload.identity/use: "true"

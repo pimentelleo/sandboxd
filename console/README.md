@@ -23,8 +23,11 @@ Core mode (`docker compose up`, no profile) runs sandboxd without the console.
 The console is routed through the **same Traefik as the previews**, by Host
 header — `console.<domain>` → console, `*.preview.<domain>` → sandboxes — so it
 shares one entrypoint. nginx serves the built SPA and proxies `/v1` to the
-`sandboxd` service on the internal network, so the browser uses same-origin
-relative paths: no CORS, and no auth in the single-user default.
+control-plane service on the internal network, so the browser uses same-origin
+relative paths: no CORS. The local image targets Docker's `sandboxd` service;
+the separate unprivileged production image targets the AKS ClusterIP service.
+The local single-user default has no auth; plain HTTP is suitable only for local
+use.
 
 ## Develop
 
@@ -68,8 +71,28 @@ New App offers a **runtime preset** picker (React/Vite, Next.js, AdonisJS,
 Node/Express, FastAPI, Worker), data-driven from `GET /v1/presets`; the chosen preset is stored
 on the app and applied to its sandbox.
 
+## Authentication and previews
+
+The local Compose profile can remain auth-off on loopback, or use the existing
+local password-backed browser session and bearer API-token mechanisms for a
+trusted host. These are not production authentication options.
+
+The production console is HTTPS-only at `console.<domain>` and uses OIDC
+authorization-code PKCE against one Entra tenant. The control plane creates a
+server-side session in a host-only cookie. Access is assigned through the
+`sandboxd.user` and `sandboxd.admin` roles and ownership is keyed to the
+immutable Entra OID; admins have full access. Preview URLs are served at
+`*.preview.<domain>` over HTTPS. An owner or authorized admin obtains access
+through a secure, one-time bootstrap ticket, then the browser uses a host-only
+cookie. The console never receives provider credentials, and hosted GitHub
+Copilot remains a trusted control-plane integration.
+
+Production deployment is separately gated and uses the AKS/Kata profile. See
+[`../docs/production-safety.md`](../docs/production-safety.md) and
+[`../infra/README.md`](../infra/README.md) for the deployment contract.
+
 ## Scope (MVP)
 
-Single-user, auth-off, public previews. Multi-user auth, private-preview
-embedding, and a richer UI come later. The console assumes a local/loopback
-sandboxd.
+The local UI remains single-user by default, with public previews. Production
+adds multi-user Entra auth and owner/admin-authorized previews; do not infer
+those guarantees when running the local profile.

@@ -5,15 +5,20 @@ info:
   description: >
     The public, tenant-scoped API for sandboxd. This is the only surface a
     console or external integration should use — the internal /sandbox and
-    /wake endpoints are not part of this contract. Scoped by the API token
-    (Bearer); when auth is disabled (the single-user default) the whole
-    surface is reachable without a token.
+    /wake endpoints are not part of this contract. In the local Docker profile,
+    requests may use a server session cookie, a bearer API token, or (when
+    explicitly disabled) no credential. In the production AKS profile, requests
+    use the server session created by OIDC authorization-code PKCE in the
+    configured Entra tenant; local passwords and API keys are not production
+    authentication mechanisms. Production ownership is keyed to the immutable
+    Entra OID and roles are sandboxd.user or sandboxd.admin.
 servers:
   - url: http://127.0.0.1:9090
     description: Default loopback bind (docker-compose maps SANDBOXD_API_BIND here)
 security:
+  - sessionCookieAuth: []
   - bearerAuth: []
-  - {} # auth disabled by default (single-user)
+  - {} # local auth-disabled mode only
 
 tags:
   - name: apps
@@ -182,53 +187,53 @@ paths:
     get:
       operationId: authStatus
       tags: [apps]
-      summary: Console auth status — is auth enabled, is the caller authenticated, is a password set (pre-login probe, no credential required)
+      summary: Console auth status (safe pre-login probe; no credential required)
+      security: []
       responses:
         "200":
           description: OK
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  enabled: { type: boolean }
-                  authenticated: { type: boolean }
-                  password_set: { type: boolean }
+              schema: { $ref: "#/components/schemas/AuthStatus" }
   /v1/auth/setup:
     post:
       operationId: authSetup
       tags: [apps]
-      summary: First-run — set the console password and start a session. 409 once a password is already set.
+      summary: Local account profile only — create the initial administrator and start a session
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [password]
+              required: [email, password]
               properties:
-                password: { type: string, description: min 8 chars }
+                email: { type: string, format: email }
+                password: { type: string, format: password, writeOnly: true, description: min 8 chars }
       responses:
-        "204": { description: Password set; session cookie issued }
-        "400": { description: Password too short / invalid body }
-        "409": { description: A password is already set }
+        "204": { description: Initial administrator created; session cookie issued }
+        "400": { description: Invalid email, password, or body }
+        "409": { description: An initial account already exists }
   /v1/auth/login:
     post:
       operationId: authLogin
       tags: [apps]
-      summary: Verify the console password and issue an HttpOnly session cookie
+      summary: Local account profile only — verify credentials and issue an HttpOnly session cookie
+      security: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [password]
+              required: [email, password]
               properties:
-                password: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, format: password, writeOnly: true }
       responses:
         "204": { description: Authenticated; session cookie issued }
-        "401": { description: Invalid password }
+        "401": { description: Invalid credentials }
   /v1/auth/logout:
     post:
       operationId: authLogout
@@ -240,7 +245,7 @@ paths:
     post:
       operationId: authChangePassword
       tags: [apps]
-      summary: Change the console password (requires a logged-in session); revokes all sessions and re-issues one
+      summary: Local profile only — change the console password (requires a logged-in session)
       requestBody:
         required: true
         content:
@@ -256,11 +261,77 @@ paths:
         "400": { description: New password too short / invalid body }
         "401": { description: Current password incorrect }
         "403": { description: Not logged in as a console user }
+  /v1/auth/accounts:
+    post:
+      operationId: createLocalAccount
+      tags: [apps]
+      summary: Create a local user account
+      description: >
+        Available only in the local account profile and requires a sandboxd.admin
+        session. New accounts receive the sandboxd.user role only. Passwords are
+        write-only and never returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password, writeOnly: true }
+      responses:
+        "201":
+          description: Local user account created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email, roles]
+                properties:
+                  id: { type: string }
+                  email: { type: string, format: email }
+                  roles:
+                    type: array
+                    items: { type: string }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/auth/entra/login:
+    get:
+      operationId: authEntraLogin
+      tags: [apps]
+      summary: Production profile — begin Entra OIDC authorization-code PKCE login
+      security: []
+      description: >
+        Browser redirect only. The console does not receive the authorization
+        code, token, verifier, state, or nonce. Returns 302 when configured;
+        production uses one configured Entra tenant.
+      responses:
+        "302": { description: Redirect to the Entra authorize endpoint }
+        "503": { description: Enterprise sign-in is unavailable }
+  /v1/auth/entra/callback:
+    get:
+      operationId: authEntraCallback
+      tags: [apps]
+      summary: Production profile — consume the Entra OIDC callback
+      security: []
+      description: >
+        Consumes the short-lived state and authorization code, validates the
+        tenant, issuer, audience, nonce, signature, and roles, then issues the
+        host-only server session cookie. Tokens are never returned.
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, required: true, schema: { type: string } }
+      responses:
+        "303": { description: Redirect to the console after session creation }
+        "400": { description: Invalid or expired sign-in state }
+        "503": { description: Enterprise sign-in is unavailable }
   /v1/api-keys:
     post:
       operationId: createApiKey
       tags: [apps]
-      summary: Mint an API key (each = the shared tenant). The plaintext key is returned exactly once. Session-only.
+      summary: Local profile only — mint an API key. Plaintext is returned exactly once.
       requestBody:
         required: true
         content:
@@ -288,7 +359,7 @@ paths:
     get:
       operationId: listApiKeys
       tags: [apps]
-      summary: List API keys (metadata only — never the key or its hash). Session-only.
+      summary: Local profile only — list API key metadata; never the key or its hash.
       responses:
         "200":
           description: OK
@@ -312,7 +383,7 @@ paths:
     delete:
       operationId: revokeApiKey
       tags: [apps]
-      summary: Revoke an API key. Session-only.
+      summary: Local profile only — revoke an API key.
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
@@ -1170,6 +1241,48 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/sandboxes/{id}/exec:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    post:
+      operationId: execSandbox
+      tags: [sandboxes]
+      summary: Execute a non-interactive command in the sandbox
+      description: >
+        Runs the supplied argv as the sandbox user in the app workspace. Set
+        `stream` to receive plain-text command output instead of the structured
+        JSON response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cmd]
+              properties:
+                cmd:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                stream: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Command completed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stdout, stderr, exit_code]
+                properties:
+                  stdout: { type: string }
+                  stderr: { type: string }
+                  exit_code: { type: integer }
+            text/plain:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+
   /v1/sandboxes/{id}/stop:
     parameters: [ { $ref: "#/components/parameters/Id" } ]
     post:
@@ -1187,6 +1300,32 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/sandboxes/{id}/preview-ticket:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    post:
+      operationId: createPreviewTicket
+      tags: [sandboxes]
+      summary: Create a one-time production preview bootstrap URL
+      description: >
+        Production Entra profile only. Requires the sandbox owner or sandboxd.admin;
+        a foreign sandbox responds with 404. The returned opaque ticket expires quickly,
+        is bound to that exact preview host, and is consumed once to create a host-only
+        secure preview cookie. The preview gateway removes the ticket from the URL
+        before proxying traffic.
+      responses:
+        "201":
+          description: One-time preview bootstrap URL
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_at]
+                properties:
+                  url: { type: string, format: uri }
+                  expires_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
 
   /v1/sandboxes/{id}/tasks:
     parameters: [ { $ref: "#/components/parameters/Id" } ]
@@ -1610,23 +1749,19 @@ paths:
       tags: [sandboxes]
       summary: Write a workspace file (atomic)
       description: >
-        Writes one file into the sandbox workspace. The `path` query parameter is
-        RELATIVE TO THE WORKSPACE MOUNT ROOT (`/home/sandbox` inside the container),
-        NOT the app directory. The app source lives under `workspace/app`, so the
-        app's runtime manifest must be written as
-        `path=workspace/app/sandbox.yaml`. A bare `path=sandbox.yaml` is accepted
-        but writes to the mount root (`/home/sandbox/sandbox.yaml`), where runtimed
-        does NOT read it for app runtime. Reserved subtrees (`.runtimed/`,
-        `lost+found/`) are refused. The request body is the RAW file content
-        (opaque bytes), not JSON.
+        Writes one file into the sandbox app directory (`workspace/app` inside the
+        runtime). The `path` query parameter is app-relative for every runtime, so
+        `path=sandbox.yaml` writes the manifest runtimed reads. Reserved subtrees
+        (`.runtimed/`, `lost+found/`) are refused. The request body is the RAW file
+        content (opaque bytes), not JSON.
       parameters:
         - in: query
           name: path
           required: true
           schema: { type: string }
           description: >
-            File path relative to the workspace mount root (e.g.
-            `workspace/app/sandbox.yaml`). Absolute paths and `..` are rejected.
+            File path relative to the app directory (e.g. `sandbox.yaml` or
+            `src/main.ts`). Absolute paths and `..` are rejected.
       requestBody:
         required: true
         description: Raw file content (opaque bytes) — not JSON.
@@ -1649,7 +1784,7 @@ paths:
           name: path
           required: true
           schema: { type: string }
-          description: "Path relative to the APP dir (e.g. `AGENTS.md`). Note: read is app-relative, whereas PUT /files is mount-relative."
+          description: "Path relative to the app directory (e.g. `AGENTS.md`), matching PUT /files."
       responses:
         "200":
           description: Raw file content.
@@ -1786,6 +1921,14 @@ paths:
 
 components:
   securitySchemes:
+    sessionCookieAuth:
+      type: apiKey
+      in: cookie
+      name: sbx_session
+      description: >
+        HttpOnly, host-only server session cookie. In production it is issued
+        after the OIDC authorization-code PKCE flow; the cookie is not a bearer
+        credential for preview hosts.
     bearerAuth:
       type: http
       scheme: bearer
@@ -1802,6 +1945,45 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    AuthStatus:
+      type: object
+      description: >
+        Safe authentication probe. Password fields describe the local profile
+        only; production uses Entra OIDC and server sessions.
+      required: [enabled, authenticated, password_set]
+      properties:
+        enabled: { type: boolean }
+        authenticated: { type: boolean }
+        password_set:
+          type: boolean
+          description: Local profile only; false does not describe production OIDC configuration.
+        profile:
+          type: string
+          enum: [local, entra]
+        login_available:
+          type: boolean
+          description: Production only; whether the configured Entra login flow is available.
+        principal:
+          $ref: "#/components/schemas/Principal"
+        capabilities:
+          type: object
+          properties:
+            console_access: { type: boolean }
+            administrator: { type: boolean }
+    Principal:
+      type: object
+      description: Safe Entra identity metadata; tokens and secrets are never returned.
+      required: [oid, tenant_id, roles]
+      properties:
+        oid: { type: string, description: Immutable Entra object identifier }
+        tenant_id: { type: string }
+        display_name: { type: string }
+        upn: { type: string }
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [sandboxd.user, sandboxd.admin]
     Settings:
       type: object
       description: Read-only instance summary (GET /v1/settings) and the shape returned by PATCH.

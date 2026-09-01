@@ -56,6 +56,7 @@ COPY control-plane/go.mod control-plane/go.sum ./control-plane/
 RUN cd control-plane && go mod download
 COPY control-plane/ ./control-plane/
 RUN cd control-plane && CGO_ENABLED=0 go build -trimpath -o /runtimed ./cmd/runtimed
+RUN cd control-plane && CGO_ENABLED=0 go build -trimpath -o /runtimed-tunnel ./cmd/runtimed-tunnel
 
 # --- Stage 2: the sandbox base image ---------------------------------
 FROM debian:stable-slim
@@ -171,6 +172,7 @@ ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org/ \
 # runtimed — the in-sandbox supervisor, compiled in stage 1. It becomes
 # the container's main process below.
 COPY --from=runtimed-builder /runtimed /usr/local/bin/runtimed
+COPY --from=runtimed-builder /runtimed-tunnel /usr/local/bin/runtimed-tunnel
 
 USER sandbox
 WORKDIR /home/sandbox/workspace

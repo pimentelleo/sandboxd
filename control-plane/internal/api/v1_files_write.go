@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,27 +11,26 @@ import (
 	"syscall"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
 // PUT /v1/sandboxes/{id}/files?path=<rel> — atomic generic file write.
 //
-// Roots at the workspace mount (`/home/sandbox/` inside the container).
-// the upstream backend uses this to prepare AGENTS.md / CLAUDE.md / opencode.json /
-// any other file the chosen agent expects. The platform does NOT
-// inspect the body — the file is opaque bytes.
+// Roots at the application directory (`/home/sandbox/workspace/app` inside
+// the container). The backend uses this to prepare AGENTS.md / CLAUDE.md /
+// opencode.json / any other file the chosen agent expects. The platform does
+// NOT inspect the body — the file is opaque bytes.
 //
-// IMPORTANT for callers: the root is the MOUNT, not the app dir. The app (and the
-// sandbox.yaml runtimed reads) lives at `workspace/app/`, so to write the manifest
-// the caller MUST use `path=workspace/app/sandbox.yaml` — a bare `path=sandbox.yaml`
-// writes to `/home/sandbox/sandbox.yaml`, which returns 200 but runtimed never sees
-// it (the console "Apply sandbox.yaml" CTA depends on this; don't "simplify" it).
+// PUT, GET /files, and GET /files/content share this app-relative public
+// contract for both local and provider runtimes. In particular, a bare
+// `path=sandbox.yaml` writes the manifest runtimed reads.
 //
 // Security model (paying-tenant threat model):
-//   - The caller holds a service token; the upstream backend bugs are the
-//     primary concern, not malicious traffic.
+//   - The caller has already passed the resource authorization boundary.
 //   - Path is `filepath.Clean`-normalised, absolute paths and `..` are
-//     rejected, and the resolved final path MUST stay under the mount
-//     root via prefix check.
+//     rejected, and the resolved final path MUST stay under the app root
+//     via prefix check.
 //   - Reserved subtrees (`.runtimed/`, `lost+found/`) are refused —
 //     `.runtimed/` is the in-sandbox supervisor's working dir and
 //     writing into it could corrupt task state.
@@ -50,12 +50,12 @@ const (
 	maxPutFileBytes = 25 << 20
 )
 
-// reservedPathPrefixes are subtrees of the workspace mount that the
-// platform owns. Writes here are refused even with a valid token.
+// reservedPathPrefixes are app-relative subtrees the platform reserves.
+// Writes here are refused even with a valid token.
 var reservedPathPrefixes = []string{".runtimed/", ".runtimed", "lost+found/", "lost+found"}
 
 // resolveWritePath validates a caller-supplied relative path against
-// the workspace mount root and returns the absolute on-disk path.
+// an app root and returns the absolute on-disk path.
 //
 // Rules (in order):
 //  1. path is non-empty and does not contain a NUL byte.
@@ -63,8 +63,8 @@ var reservedPathPrefixes = []string{".runtimed/", ".runtimed", "lost+found/", "l
 //  3. After Clean, no segment is `..` (would escape) and no segment is
 //     empty (would denote a directory write).
 //  4. The cleaned path does not target a reserved subtree.
-//  5. The resolved on-disk path stays under <mnt>/.
-func resolveWritePath(mnt, raw string) (string, string, error) {
+//  5. The resolved on-disk path stays under <appRoot>/.
+func resolveWritePath(appRoot, raw string) (string, string, error) {
 	if raw == "" {
 		return "", "", errors.New("path is required")
 	}
@@ -72,7 +72,7 @@ func resolveWritePath(mnt, raw string) (string, string, error) {
 		return "", "", errors.New("invalid path: NUL byte")
 	}
 	if filepath.IsAbs(raw) {
-		return "", "", errors.New("path must be relative to the workspace root")
+		return "", "", errors.New("path must be relative to the app root")
 	}
 	// Trailing slash signals directory intent — check before Clean,
 	// which would strip it.
@@ -100,10 +100,10 @@ func resolveWritePath(mnt, raw string) (string, string, error) {
 				strings.TrimSuffix(p, "/") + ")")
 		}
 	}
-	full := filepath.Join(mnt, clean)
+	full := filepath.Join(appRoot, clean)
 	// Defence-in-depth: re-check the final prefix after Join.
-	if full != mnt && !strings.HasPrefix(full, mnt+string(os.PathSeparator)) {
-		return "", "", errors.New("resolved path escapes the workspace mount")
+	if full != appRoot && !strings.HasPrefix(full, appRoot+string(os.PathSeparator)) {
+		return "", "", errors.New("resolved path escapes the app root")
 	}
 	return full, clean, nil
 }
@@ -128,6 +128,10 @@ func (s *Server) v1PutFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isULID(id) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid sandbox id")
+		return
+	}
+	if s.usesRuntimeProvider() {
+		s.v1PutProviderFile(w, r, id)
 		return
 	}
 	_, mnt := s.Loopback.Paths(id)
@@ -235,4 +239,69 @@ func (s *Server) v1PutFile(w http.ResponseWriter, r *http.Request) {
 		Detail: map[string]any{"path": rel, "size": written},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"path": rel, "size": written})
+}
+
+func (s *Server) v1PutProviderFile(w http.ResponseWriter, r *http.Request, id string) {
+	if s.RuntimeFiles == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider file access is unavailable")
+		return
+	}
+	sb, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeV1Err(w, http.StatusNotFound, "not_found", "no workspace for that sandbox")
+		return
+	}
+	if err != nil {
+		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	logical, err := providerAppPath(r.URL.Query().Get("path"), true)
+	if err != nil {
+		writeV1Err(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	limit := s.providerFileByteLimit()
+	if r.ContentLength > limit {
+		writeV1Err(w, http.StatusRequestEntityTooLarge, "invalid_request", providerFileLimitMessage(limit))
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	contents, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeV1Err(w, http.StatusRequestEntityTooLarge, "invalid_request", providerFileLimitMessage(limit))
+			return
+		}
+		writeV1Err(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	info, err := s.RuntimeFiles.WriteFile(r.Context(), s.runtimeRef(sb), runtimebackend.WriteFileRequest{
+		Path: logical, Contents: contents, MaxBytes: limit,
+	})
+	if err != nil {
+		writeProviderFileError(w, err, "file")
+		return
+	}
+	rel, ok := providerPublicPath(info.Path)
+	if !ok || rel == "" {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider returned an invalid file path")
+		return
+	}
+	s.auditAction(r, audit.Entry{
+		Action: "file.put", Target: id,
+		Detail: map[string]any{"path": rel, "size": info.Size, "runtime_provider": true},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"path": rel, "size": info.Size})
+}
+
+func (s *Server) providerFileByteLimit() int64 {
+	if s.ProviderFileByteLimit > 0 {
+		return s.ProviderFileByteLimit
+	}
+	return maxPutFileBytes
+}
+
+func providerFileLimitMessage(limit int64) string {
+	return fmt.Sprintf("file exceeds the runtime provider limit of %d bytes", limit)
 }

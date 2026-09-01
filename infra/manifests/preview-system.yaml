@@ -1,0 +1,95 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sandboxd-azure-disk
+provisioner: disk.csi.azure.com
+allowVolumeExpansion: true
+# A purge is an irreversible tenant-data deletion, so do not retain a
+# recoverable Azure Disk after its workspace PVC is removed.
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  skuName: Premium_LRS
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: sandboxd-azure-disk
+driver: disk.csi.azure.com
+# Expired/deleted workspace snapshots must also remove their Azure backing data.
+deletionPolicy: Delete
+---
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: sandboxd-sandbox-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      k8s:sandboxd.io/managed: "true"
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sandboxd-system
+            k8s:app.kubernetes.io/name: sandboxd-control-plane
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+  # The explicit allow list below enables Cilium's egress default-deny for
+  # every managed sandbox. Do not add broad private-CIDR egressDeny rules:
+  # Cilium denies take precedence and would shadow the identity-scoped
+  # control-plane proxy exception. Private VNet, pod, service, metadata, and
+  # loopback destinations cannot match any allowed egress rule.
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:k8s-app: kube-dns
+            k8s:io.kubernetes.pod.namespace: kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Direct public HTTPS is an explicit FQDN allow-list. This leaves Azure
+    # management and private-endpoint names unreachable even if a sandbox
+    # attempts to resolve or hard-code them.
+    - toFQDNs:
+        - matchName: registry.npmjs.org
+        - matchPattern: "*.npmjs.org"
+        - matchName: registry.yarnpkg.com
+        - matchPattern: "*.yarnpkg.com"
+        - matchName: pypi.org
+        - matchPattern: "*.pypi.org"
+        - matchName: files.pythonhosted.org
+        - matchName: github.com
+        - matchPattern: "*.github.com"
+        - matchName: githubusercontent.com
+        - matchPattern: "*.githubusercontent.com"
+        - matchName: registry-1.docker.io
+        - matchName: auth.docker.io
+        - matchPattern: "*.docker.io"
+        - matchName: production.cloudflare.docker.com
+        - matchName: proxy.golang.org
+        - matchName: sum.golang.org
+        - matchName: go.dev
+        - matchName: bun.sh
+        - matchPattern: "*.bun.sh"
+        - matchName: deno.land
+        - matchPattern: "*.deno.land"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    # The sole in-cluster egress exception: coding agents access an
+    # uncredentialed proxy endpoint, which injects credentials control-plane
+    # side and forwards only to its fixed public provider allow-list.
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sandboxd-system
+            k8s:app.kubernetes.io/name: sandboxd-control-plane
+      toPorts:
+        - ports:
+            - port: "9100"
+              protocol: TCP

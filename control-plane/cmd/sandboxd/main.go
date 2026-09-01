@@ -105,9 +105,18 @@ const (
 )
 
 func main() {
-	// Phase 8 — one-shot subcommands run and exit before the daemon
-	// startup path. `sandboxd backfill-legacy ...` is the only one.
+	// One-shot subcommands run and exit before the daemon startup path.
 	if len(os.Args) > 1 {
+		if isMigrateCommand(os.Args[1:]) {
+			os.Exit(runMigrate(
+				os.Args[2:],
+				os.Getenv,
+				openMigrationStore,
+				configuredMigrationsDir(),
+				os.Stdout,
+				os.Stderr,
+			))
+		}
 		switch os.Args[1] {
 		case "backfill-legacy":
 			os.Exit(runBackfillLegacy(os.Args[2:]))
@@ -122,6 +131,21 @@ func main() {
 	}
 
 	log := logging.NewLogger()
+	platform, err := configuredPlatform(os.Getenv)
+	if err != nil {
+		log.Error("startup: platform configuration invalid", "err", err.Error())
+		os.Exit(1)
+	}
+	if platform == platformKubernetes {
+		os.Exit(runKubernetes(log))
+	}
+	if platform == platformKubernetesLocal {
+		os.Exit(runKubernetesLocal(log))
+	}
+	if err := validateLocalPlatformProfile(os.Getenv); err != nil {
+		log.Error("startup: local platform configuration invalid", "err", err.Error())
+		os.Exit(1)
+	}
 
 	addr := envDefault("SANDBOXD_ADDR", defaultListenAddr)
 	image := envDefault("SANDBOXD_IMAGE", defaultImage)
@@ -162,15 +186,7 @@ func main() {
 	publicHTTPPort := envDefault("SANDBOXD_PUBLIC_HTTP_PORT", "80")
 	setMemoryHigh := boolFromEnv("SANDBOXD_SET_MEMORY_HIGH", false)
 
-	migrations := envDefault("SANDBOXD_MIGRATIONS", migrationsDir)
-	if _, err := os.Stat(migrations); err != nil {
-		if exe, e := os.Executable(); e == nil {
-			alt := filepath.Join(filepath.Dir(exe), "..", "..", "migrations")
-			if _, e2 := os.Stat(alt); e2 == nil {
-				migrations = alt
-			}
-		}
-	}
+	migrations := configuredMigrationsDir()
 
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		log.Error("startup: mkdir state dir failed", "err", err.Error())
@@ -180,10 +196,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dsn := fmt.Sprintf("file:%s?_journal=WAL&_busy_timeout=5000&_fk=1", envDefault("SANDBOXD_DB", dbPath))
-	st, err := store.Open(ctx, dsn, migrations)
+	storeConfig, err := configuredStoreConfig(os.Getenv, dbPath, migrations)
 	if err != nil {
-		log.Error("startup: store open failed", "err", err.Error())
+		log.Error("startup: store configuration invalid", "err", err.Error())
+		os.Exit(1)
+	}
+	st, err := store.OpenWithConfig(ctx, storeConfig)
+	if err != nil {
+		if storeConfig.Profile == store.ProfileProduction {
+			log.Error("startup: store open failed")
+		} else {
+			log.Error("startup: store open failed", "err", err.Error())
+		}
 		os.Exit(1)
 	}
 	defer func() {
@@ -210,7 +234,18 @@ func main() {
 	authCfg := auth.ParseConfig(os.Getenv)
 	// The credential resolver validates DB-backed console sessions and API keys;
 	// env-configured SANDBOXD_API_TOKENS remain a fallback for the bootstrap key.
-	authMw := auth.NewMiddleware(authCfg, api.NewStoreResolver(st), auditLog, log.With("component", "auth"))
+	authMw := auth.NewMiddleware(
+		authCfg, api.NewStoreResolver(st), auditLog, log.With("component", "auth"),
+		auth.WithLoginTransactionStore(api.NewEntraLoginTransactionStore(st)),
+	)
+	if authCfg.Profile == auth.ProfileEntra && storeConfig.Profile != store.ProfileProduction {
+		log.Error("startup: production authentication requires PostgreSQL persistence")
+		os.Exit(1)
+	}
+	if err := authMw.StartupError(); err != nil {
+		log.Error("startup: production authentication is not configured")
+		os.Exit(1)
+	}
 	denyMode := envDefault("SANDBOXD_FORWARD_AUTH_DENY_MODE", "redirect")
 	{
 		ac := authMw.Snapshot()
@@ -645,11 +680,11 @@ func main() {
 	// the Traefik catch-all reverse-proxied traffic. The Host header
 	// is the only discriminator.
 	// Phase 8 — the service-token auth middleware wraps the API mux
-	// only. The wake catch-all (dispatched first by hostDispatch) is
-	// the browser preview path and stays unauthenticated; a private
-	// sandbox's stopped-wake is gated inside the wake handler itself.
+	// only. The local browser preview path remains the Docker wake route.
+	// Entra production instead reaches the fail-closed control-plane preview
+	// gateway before any runtime wake is requested.
 	apiMux := authMw.Wrap(server.Handler())
-	root := hostDispatch(wakeHandler, apiMux, log)
+	root := hostDispatch(wakeHandler, server.ProductionPreviewHandler(), server.IsPreviewHost, apiMux, log)
 	root = logging.Middleware(log, root)
 
 	httpSrv := &http.Server{
@@ -901,6 +936,21 @@ func main() {
 						"err", err.Error())
 				} else {
 					nc := auth.ParseConfig(auth.MapGetter(env))
+					currentAuth := authMw.Snapshot()
+					if err := validateAuthProfileReload(currentAuth, nc); err != nil {
+						log.Error("reload: rejected authentication profile change; restart required",
+							"current_profile", authProfile(currentAuth),
+							"requested_profile", authProfile(nc))
+						continue
+					}
+					if nc.Profile == auth.ProfileEntra && storeConfig.Profile != store.ProfileProduction {
+						log.Error("reload: rejected production authentication without PostgreSQL persistence")
+						continue
+					}
+					if nc.Profile == auth.ProfileEntra && !nc.ProductionReady() {
+						log.Error("reload: rejected incomplete production authentication configuration")
+						continue
+					}
 					authMw.Reload(nc)
 					log.Info("reload: auth config reloaded",
 						"api_tokens", len(nc.APITokens),
@@ -933,8 +983,12 @@ func main() {
 // (when Host header matches s-<id>-<port>.preview.<domain>) or the
 // loopback API. Both share the same listener so the operator only
 // has to wire one entry into Traefik's file provider.
-func hostDispatch(w *wake.Handler, apiMux http.Handler, _ any) http.Handler {
+func hostDispatch(w *wake.Handler, productionPreview http.Handler, productionHostMatches func(string) bool, apiMux http.Handler, _ any) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if productionPreview != nil && productionHostMatches != nil && productionHostMatches(r.Host) {
+			productionPreview.ServeHTTP(rw, r)
+			return
+		}
 		if w != nil && w.HostMatchesPreview(r.Host) {
 			w.ServeCatchAll(rw, r)
 			return

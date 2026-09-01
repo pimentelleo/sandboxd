@@ -1,8 +1,8 @@
-// Package store is the SQLite-backed source of truth for the sandbox
-// lifecycle. SQLite is the source of truth: the reconciler converges
-// Docker to SQLite, never the other way.
+// Package store is the source of truth for the sandbox
+// lifecycle. For local deployments SQLite is the source of truth: the
+// reconciler converges Docker to it, never the other way.
 //
-// Concurrency model: a single writer
+// SQLite concurrency model: a single writer
 // goroutine reads from a buffered channel of write ops; readers use
 // `db.QueryRow` / `db.Query` directly. This avoids "database is locked"
 // without scattering mutexes across the code.
@@ -13,8 +13,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -64,6 +69,10 @@ type Sandbox struct {
 	// (migrations/0013_apps.sql). NULL for sandboxes created outside the
 	// app model (the existing sandbox API).
 	AppID sql.NullString
+
+	// OwnerPrincipalID is the durable authenticated owner identity. Legacy
+	// SQLite and API callers may leave it NULL while they use owner tokens.
+	OwnerPrincipalID sql.NullString
 }
 
 // WorkspaceOwner is the durable sandbox_id -> upstream-identity
@@ -77,55 +86,126 @@ type WorkspaceOwner struct {
 	CreatedAt           time.Time
 }
 
-// Store wraps an open *sql.DB plus the write-loop goroutine.
+// Store wraps an open database. SQLite uses a single writer; PostgreSQL allows
+// concurrent writes and relies on transactional compare-and-set operations.
 type Store struct {
-	db      *sql.DB
-	writes  chan writeOp
-	doneCh  chan struct{}
-	closeCh chan struct{}
+	db        *dialectDB
+	provider  Provider
+	writes    chan writeOp
+	doneCh    chan struct{}
+	closeCh   chan struct{}
+	now       func() time.Time
+	closeOnce sync.Once
+	closeErr  error
 }
+
+var sqliteMemoryDSNSequence uint64
 
 // Open opens the database at dsn, applies migrations, and starts the
 // single-writer goroutine. The caller MUST call Close to drain pending
 // writes before exiting.
 func Open(ctx context.Context, dsn string, migrationsDir string) (*Store, error) {
-	db, err := sql.Open("sqlite3", dsn)
+	return OpenWithConfig(ctx, Config{
+		Provider: ProviderSQLite, DSN: dsn, MigrationsDir: migrationsDir,
+	})
+}
+
+// OpenWithConfig opens a deliberately selected database provider. It never
+// copies or upgrades a SQLite database into PostgreSQL: PostgreSQL receives
+// only its own clean migration stream under migrations/postgres.
+func OpenWithConfig(ctx context.Context, config Config) (*Store, error) {
+	provider, err := config.selectedProvider()
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
-	// SQLite handles one connection at a time at the file level; the
-	// writer goroutine serializes writes. Allow a small pool for reads.
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(4)
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping sqlite: %w", err)
+	if config.DSN == "" {
+		return nil, errors.New("database dsn is required")
 	}
-	if err := Migrate(ctx, db, migrationsDir); err != nil {
-		_ = db.Close()
+	if config.MigrationsDir == "" {
+		return nil, errors.New("migrations directory is required")
+	}
+	driver := "sqlite3"
+	if provider == ProviderPostgres {
+		driver = "pgx"
+	} else {
+		config.DSN = sharedSQLiteMemoryDSN(config.DSN)
+	}
+	raw, err := sql.Open(driver, config.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", provider, err)
+	}
+	if provider == ProviderSQLite {
+		// SQLite handles one connection at a time at the file level; the
+		// writer goroutine serializes writes. Allow a small pool for reads.
+		raw.SetMaxOpenConns(8)
+		raw.SetMaxIdleConns(4)
+	} else {
+		raw.SetMaxOpenConns(32)
+		raw.SetMaxIdleConns(8)
+	}
+	if err := raw.PingContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("ping %s: %w", provider, err)
+	}
+	if provider == ProviderSQLite {
+		err = Migrate(ctx, raw, config.MigrationsDir)
+	} else {
+		err = MigratePostgres(ctx, raw, config.MigrationsDir)
+	}
+	if err != nil {
+		_ = raw.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	s := &Store{
-		db:      db,
-		writes:  make(chan writeOp, 64),
-		doneCh:  make(chan struct{}),
-		closeCh: make(chan struct{}),
+		db:       &dialectDB{DB: raw, provider: provider},
+		provider: provider,
+		now:      time.Now,
 	}
-	go s.writeLoop()
+	if provider == ProviderSQLite {
+		s.writes = make(chan writeOp, 64)
+		s.doneCh = make(chan struct{})
+		s.closeCh = make(chan struct{})
+		go s.writeLoop()
+	}
 	return s, nil
+}
+
+func sharedSQLiteMemoryDSN(dsn string) string {
+	trimmed := strings.TrimSpace(dsn)
+	lower := strings.ToLower(trimmed)
+	if lower != ":memory:" && !strings.HasPrefix(lower, "file::memory:") {
+		return dsn
+	}
+	name := "sandboxd-memory-" + strconv.FormatUint(atomic.AddUint64(&sqliteMemoryDSNSequence, 1), 10)
+	query := ""
+	if index := strings.IndexByte(trimmed, '?'); index >= 0 {
+		query = strings.TrimPrefix(trimmed[index:], "?")
+	}
+	if query == "" {
+		return "file:" + name + "?mode=memory&cache=shared"
+	}
+	return "file:" + name + "?mode=memory&cache=shared&" + query
 }
 
 // Close drains the write channel and closes the database.
 func (s *Store) Close() error {
-	close(s.closeCh)
-	<-s.doneCh
-	return s.db.Close()
+	s.closeOnce.Do(func() {
+		if s.provider == ProviderSQLite {
+			close(s.closeCh)
+			<-s.doneCh
+		}
+		s.closeErr = s.db.Close()
+	})
+	return s.closeErr
 }
 
-// DB exposes the underlying *sql.DB for read-only queries.
-// Writes MUST go through the write methods below so they're serialised
-// by the single writer goroutine.
-func (s *Store) DB() *sql.DB { return s.db }
+// DB exposes the underlying *sql.DB for read-only queries. Writes MUST go
+// through Store methods so SQLite remains serialized and PostgreSQL methods
+// retain their transactional compare-and-set behavior.
+func (s *Store) DB() *sql.DB { return s.db.DB }
+
+// Provider reports the deliberately selected backing provider.
+func (s *Store) Provider() Provider { return s.provider }
 
 // DefaultTenant is the single shared tenant every credential resolves to in the
 // default (single-tenant) deployment: the console session, env-configured API
@@ -151,7 +231,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Sandbox, error) {
 		       last_active_at, stopped_at, keepalive_until,
 		       container_ip,
 		       external_user_id, external_project_id, external_workspace_id, visibility,
-		       idle_policy, app_id, web_port
+		       idle_policy, app_id, web_port, owner_principal_id
 		  FROM sandbox WHERE id = ?`, id)
 	sb, err := scanSandbox(row)
 	if err != nil {
@@ -173,7 +253,7 @@ func (s *Store) List(ctx context.Context) ([]*Sandbox, error) {
 		       last_active_at, stopped_at, keepalive_until,
 		       container_ip,
 		       external_user_id, external_project_id, external_workspace_id, visibility,
-		       idle_policy, app_id, web_port
+		       idle_policy, app_id, web_port, owner_principal_id
 		  FROM sandbox ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -209,7 +289,7 @@ func (s *Store) ListByStatuses(ctx context.Context, statuses ...string) ([]*Sand
 	             last_active_at, stopped_at, keepalive_until,
 	             container_ip,
 	             external_user_id, external_project_id, external_workspace_id, visibility,
-	             idle_policy, app_id, web_port
+	             idle_policy, app_id, web_port, owner_principal_id
 	        FROM sandbox WHERE status IN (?`
 	args := make([]any, 0, len(statuses))
 	args = append(args, statuses[0])
@@ -254,7 +334,7 @@ func (s *Store) ListIdleCandidates(ctx context.Context, cutoff time.Time) ([]*Sa
 		       last_active_at, stopped_at, keepalive_until,
 		       container_ip,
 		       external_user_id, external_project_id, external_workspace_id, visibility,
-		       idle_policy, app_id, web_port
+		       idle_policy, app_id, web_port, owner_principal_id
 		  FROM sandbox
 		 WHERE status='running' AND last_active_at < ? AND idle_policy != 'always_on'
 		 ORDER BY last_active_at ASC`, cutoff.Unix())
@@ -309,6 +389,7 @@ func scanSandbox(s scanner) (*Sandbox, error) {
 		&sb.IdlePolicy,
 		&sb.AppID,
 		&sb.WebPort,
+		&sb.OwnerPrincipalID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -335,7 +416,7 @@ const sandboxSelectCols = `id, status, image, workspace_img, workspace_mnt,
 	       last_active_at, stopped_at, keepalive_until,
 	       container_ip,
 	       external_user_id, external_project_id, external_workspace_id, visibility,
-	       idle_policy, app_id, web_port`
+	       idle_policy, app_id, web_port, owner_principal_id`
 
 // ListFiltered returns sandbox rows filtered by external_user_id and/
 // or external_project_id. An empty string for either filter means "do

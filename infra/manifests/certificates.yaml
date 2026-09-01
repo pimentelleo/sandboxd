@@ -1,0 +1,25 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sandboxd-console
+  namespace: sandboxd-system
+spec:
+  secretName: sandboxd-console-tls
+  issuerRef:
+    name: sandboxd-production
+    kind: ClusterIssuer
+  dnsNames:
+    - "console.${ROOT_DOMAIN}"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: sandboxd-preview-wildcard
+  namespace: sandboxd-system
+spec:
+  secretName: sandboxd-preview-gateway-tls
+  issuerRef:
+    name: sandboxd-production
+    kind: ClusterIssuer
+  dnsNames:
+    - "*.preview.${ROOT_DOMAIN}"

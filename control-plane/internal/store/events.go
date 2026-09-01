@@ -39,7 +39,7 @@ func scanAppEvent(sc scanner) (*AppEvent, error) {
 // importing this package — mirrors InsertAudit. Goes through the single
 // writer. Empty optional ids/payload are stored as NULL.
 func (s *Store) InsertAppEvent(ctx context.Context, id, ownerToken, appID, sandboxID, taskID, snapshotID, typ, severity, message, payloadJSON, createdAt string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO app_events (`+appEventCols+`)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

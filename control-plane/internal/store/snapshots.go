@@ -10,23 +10,24 @@ import (
 // (migrations/0009). A snapshot is a reusable, frozen copy of a
 // sandbox's workspace .img.
 type Snapshot struct {
-	ID              string
-	Name            string
-	OwnerToken      string         // auth.Actor.Name — the tenant boundary
-	SourceSandboxID sql.NullString // provenance
-	CreatedByUserID sql.NullString // untrusted passthrough; provenance only
-	BaseImage       string         // recorded, not pinned
-	Visibility      string         // 'private' in v1
-	Format          string         // 'raw' in v1
-	Status          string         // ready | error
-	ImagePath       string
-	SizeBytes       sql.NullInt64
-	ErrorMessage    sql.NullString
-	CreatedAt       time.Time
-	SourceAppID     sql.NullString // app the snapshot was captured from (0015)
+	ID               string
+	Name             string
+	OwnerToken       string         // auth.Actor.Name — the tenant boundary
+	OwnerPrincipalID sql.NullString // durable authenticated owner (nullable for legacy tenants)
+	SourceSandboxID  sql.NullString // provenance
+	CreatedByUserID  sql.NullString // untrusted passthrough; provenance only
+	BaseImage        string         // recorded, not pinned
+	Visibility       string         // 'private' in v1
+	Format           string         // 'raw' in v1
+	Status           string         // ready | error
+	ImagePath        string
+	SizeBytes        sql.NullInt64
+	ErrorMessage     sql.NullString
+	CreatedAt        time.Time
+	SourceAppID      sql.NullString // app the snapshot was captured from (0015)
 }
 
-const snapshotCols = `id, name, owner_token, source_sandbox_id, created_by_user_id,
+const snapshotCols = `id, name, owner_token, owner_principal_id, source_sandbox_id, created_by_user_id,
 	base_image, visibility, format, status, image_path, size_bytes,
 	error_message, created_at, source_app_id`
 
@@ -36,7 +37,7 @@ func scanSnapshot(sc interface {
 	var s Snapshot
 	var createdAt int64
 	if err := sc.Scan(
-		&s.ID, &s.Name, &s.OwnerToken, &s.SourceSandboxID, &s.CreatedByUserID,
+		&s.ID, &s.Name, &s.OwnerToken, &s.OwnerPrincipalID, &s.SourceSandboxID, &s.CreatedByUserID,
 		&s.BaseImage, &s.Visibility, &s.Format, &s.Status, &s.ImagePath,
 		&s.SizeBytes, &s.ErrorMessage, &createdAt, &s.SourceAppID,
 	); err != nil {
@@ -110,11 +111,11 @@ func (s *Store) CreateSnapshot(ctx context.Context, snap *Snapshot) error {
 	if snap.CreatedAt.IsZero() {
 		snap.CreatedAt = time.Now().UTC()
 	}
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO snapshot (`+snapshotCols+`)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			snap.ID, snap.Name, snap.OwnerToken, snap.SourceSandboxID,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			snap.ID, snap.Name, snap.OwnerToken, snap.OwnerPrincipalID, snap.SourceSandboxID,
 			snap.CreatedByUserID, snap.BaseImage, snap.Visibility, snap.Format,
 			snap.Status, snap.ImagePath, snap.SizeBytes, snap.ErrorMessage,
 			snap.CreatedAt.Unix(), snap.SourceAppID)
@@ -128,7 +129,7 @@ func (s *Store) CreateSnapshot(ctx context.Context, snap *Snapshot) error {
 // DeleteSnapshot removes a snapshot row. Returns ErrNotFound if absent.
 // The caller is responsible for removing the image file on disk.
 func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `DELETE FROM snapshot WHERE id = ?`, id)
 		if err != nil {
 			return err

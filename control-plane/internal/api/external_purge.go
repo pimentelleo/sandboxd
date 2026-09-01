@@ -66,6 +66,29 @@ func (s *Server) purgeOne(ctx context.Context, id string) (freedBytes int64, ext
 		}
 	}
 
+	if s.usesRuntimeProvider() {
+		if s.RuntimePurger == nil {
+			return 0, externalUserID, ErrRuntimeUnavailable
+		}
+		if e := s.withRuntimeLease(ctx, id, func(operationCtx context.Context) error {
+			sb, getErr := s.Store.Get(operationCtx, id)
+			if getErr == nil {
+				if err := s.RuntimePurger.Purge(operationCtx, s.runtimeRef(sb)); err != nil {
+					return err
+				}
+			} else if !errors.Is(getErr, store.ErrNotFound) {
+				return fmt.Errorf("get sandbox: %w", getErr)
+			}
+			return s.Store.PurgeSandbox(operationCtx, id)
+		}); e != nil {
+			return 0, externalUserID, fmt.Errorf("runtime provider purge: %w", e)
+		}
+		// Provider workspaces are never mounted into the control-plane pod, so
+		// there is no host size to report and no Docker/loopback fallback.
+		_ = metrics.RefreshSandboxGauge(ctx, s.Store)
+		return 0, externalUserID, nil
+	}
+
 	// Container teardown if one exists.
 	name := sandboxname.Container(id)
 	if sb, e := s.Store.Get(ctx, id); e == nil {

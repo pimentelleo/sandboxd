@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
 const (
@@ -49,7 +51,7 @@ func failedResult(taskID, reason, msg string) *runtime.TaskResult {
 
 // watchTask runs in the background for the lifetime of a coding task:
 // it streams runtimed's event log and persists the canonical result
-// to SQLite when the terminal `done` event arrives — independent of
+// to the durable store when the terminal `done` event arrives — independent of
 // whether any client ever connects to the public events stream. This
 // is what makes a task's result durable past the sandbox's lifetime.
 // watchTask streams a task's events under a window derived from its
@@ -61,9 +63,30 @@ func (s *Server) watchTask(sandboxID, taskID string, taskTimeoutS int) {
 // watchTaskWindow is watchTask with an explicit streaming window. Split
 // out so tests can inject a short window instead of waiting minutes.
 func (s *Server) watchTaskWindow(sandboxID, taskID string, window time.Duration) {
-	log := s.Log.With("component", "taskwatch", "task", taskID)
 	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
+
+	if s.usesRuntimeProvider() {
+		err := s.withTaskWatchLease(ctx, taskID, func(watchCtx context.Context, lease store.OperationLease) error {
+			return s.watchTaskEvents(watchCtx, sandboxID, taskID, &lease)
+		})
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrRuntimeOperationBusy), errors.Is(err, store.ErrTaskNotRunning), errors.Is(err, store.ErrLeaseLost):
+			s.Log.Debug("task watcher: another replica owns or completed task", "task", taskID)
+		default:
+			s.Log.Warn("task watcher ended", "task", taskID, "err", err.Error())
+		}
+		return
+	}
+
+	if err := s.watchTaskEvents(ctx, sandboxID, taskID, nil); err != nil && !errors.Is(err, store.ErrTaskNotRunning) {
+		s.Log.Warn("task watcher ended", "task", taskID, "err", err.Error())
+	}
+}
+
+func (s *Server) watchTaskEvents(ctx context.Context, sandboxID, taskID string, lease *store.OperationLease) error {
+	log := s.Log.With("component", "taskwatch", "task", taskID)
 
 	rc := s.runtimeClientFor(sandboxID)
 	var body io.ReadCloser
@@ -74,14 +97,17 @@ func (s *Server) watchTaskWindow(sandboxID, taskID string, window time.Duration)
 		}
 		if attempt >= taskWatchAttempts {
 			log.Warn("task watcher: cannot reach runtimed; marking failed", "err", err.Error())
-			s.finishWatchedTask(sandboxID, taskID, failedResult(taskID, "sandbox_unavailable",
-				"task watcher could not reach runtimed"))
-			return
+			return s.finishWatchedTask(sandboxID, taskID, failedResult(taskID, "sandbox_unavailable",
+				"task watcher could not reach runtimed"), lease)
 		}
 		select {
 		case <-time.After(2 * time.Second):
 		case <-ctx.Done():
-			return
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return s.finishWatchedTask(sandboxID, taskID, failedResult(taskID, "internal",
+					"task watcher timed out before receiving a terminal event"), lease)
+			}
+			return ctx.Err()
 		}
 	}
 	defer body.Close()
@@ -98,24 +124,48 @@ func (s *Server) watchTaskWindow(sandboxID, taskID string, window time.Duration)
 		return true
 	})
 	if result == nil {
+		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ctx.Err()
+		}
 		log.Warn("task watcher: event stream ended without a terminal event")
-		s.finishWatchedTask(sandboxID, taskID, failedResult(taskID, "internal",
-			"task event stream ended without a terminal event"))
-		return
+		return s.finishWatchedTask(sandboxID, taskID, failedResult(taskID, "internal",
+			"task event stream ended without a terminal event"), lease)
 	}
-	s.finishWatchedTask(sandboxID, taskID, result)
+	if err := s.finishWatchedTask(sandboxID, taskID, result, lease); err != nil {
+		return err
+	}
 	log.Info("task watcher: result persisted", "status", result.Status)
-
+	return nil
 }
 
-func (s *Server) finishWatchedTask(sandboxID, taskID string, result *runtime.TaskResult) {
+func (s *Server) finishWatchedTask(sandboxID, taskID string, result *runtime.TaskResult, lease *store.OperationLease) error {
 	raw, _ := json.Marshal(result)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.Store.FinishTask(ctx, taskID, string(result.Status), string(raw)); err != nil {
-		s.Log.Warn("task watcher: FinishTask failed", "task", taskID, "err", err.Error())
+	var err error
+	if lease == nil {
+		err = s.Store.FinishTask(ctx, taskID, string(result.Status), string(raw))
+	} else {
+		err = s.Store.FinishTaskWithLease(ctx, *lease, taskID, string(result.Status), string(raw))
+	}
+	if err != nil {
+		return err
 	}
 	s.recordTaskEvents(sandboxID, taskID, result)
+	return nil
+}
+
+func (s *Server) finishReconciledProviderTask(sandboxID, taskID string, result *runtime.TaskResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := s.withTaskWatchLease(ctx, taskID, func(_ context.Context, lease store.OperationLease) error {
+		return s.finishWatchedTask(sandboxID, taskID, result, &lease)
+	})
+	if err != nil && !errors.Is(err, ErrRuntimeOperationBusy) &&
+		!errors.Is(err, store.ErrTaskNotRunning) && !errors.Is(err, store.ErrLeaseLost) {
+		s.Log.Warn("task reconcile: could not persist provider task result", "task", taskID, "err", err.Error())
+	}
+	return err
 }
 
 // recordTaskEvents appends the durable timeline entries for a finished task.
@@ -186,13 +236,33 @@ func (s *Server) ReconcileTasks(ctx context.Context) {
 		s.Log.Warn("task reconcile: list running tasks failed", "err", err.Error())
 		return
 	}
+	if s.usesRuntimeProvider() {
+		// Provider runtimed is reachable only through its private transport.
+		// There is no host-visible result.json or workspace mount in this mode.
+		for _, t := range tasks {
+			sb, gerr := s.Store.Get(ctx, t.SandboxID)
+			if gerr == nil && sb.Status == "running" {
+				s.Log.Info("task reconcile: provider sandbox running — re-attaching watcher", "task", t.TaskID)
+				go s.watchTask(t.SandboxID, t.TaskID, t.TimeoutS)
+				continue
+			}
+			if err := s.finishReconciledProviderTask(t.SandboxID, t.TaskID, failedResult(t.TaskID, "sandbox_unavailable",
+				"task interrupted by a sandboxd restart; the provider sandbox was unavailable to resume or report it")); err == nil {
+				s.Log.Info("task reconcile: finalized interrupted provider task", "task", t.TaskID)
+			}
+		}
+		return
+	}
 	for _, t := range tasks {
 		_, mnt := s.Loopback.Paths(t.SandboxID)
 		resultPath := filepath.Join(mnt, ".runtimed", "tasks", t.TaskID, "result.json")
 		if raw, rerr := os.ReadFile(resultPath); rerr == nil {
 			var tr runtime.TaskResult
 			if json.Unmarshal(raw, &tr) == nil && tr.Status != "" {
-				s.finishWatchedTask(t.SandboxID, t.TaskID, &tr)
+				if err := s.finishWatchedTask(t.SandboxID, t.TaskID, &tr, nil); err != nil &&
+					!errors.Is(err, store.ErrTaskNotRunning) {
+					s.Log.Warn("task reconcile: could not persist runtimed result", "task", t.TaskID, "err", err.Error())
+				}
 				s.Log.Info("task reconcile: finalized from runtimed result.json",
 					"task", t.TaskID, "status", tr.Status)
 				continue
@@ -203,8 +273,11 @@ func (s *Server) ReconcileTasks(ctx context.Context) {
 			go s.watchTask(t.SandboxID, t.TaskID, t.TimeoutS)
 			continue
 		}
-		s.finishWatchedTask(t.SandboxID, t.TaskID, failedResult(t.TaskID, "sandbox_unavailable",
-			"task interrupted by a sandboxd restart; the sandbox was unavailable to resume or report it"))
+		if err := s.finishWatchedTask(t.SandboxID, t.TaskID, failedResult(t.TaskID, "sandbox_unavailable",
+			"task interrupted by a sandboxd restart; the sandbox was unavailable to resume or report it"), nil); err != nil &&
+			!errors.Is(err, store.ErrTaskNotRunning) {
+			s.Log.Warn("task reconcile: could not persist task result", "task", t.TaskID, "err", err.Error())
+		}
 		s.Log.Info("task reconcile: finalized interrupted task", "task", t.TaskID)
 	}
 }

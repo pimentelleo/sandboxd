@@ -25,8 +25,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -70,17 +68,17 @@ func isMiniMaxUpstream(up string) bool {
 
 // Proxy injects the real provider credential into forwarded requests.
 type Proxy struct {
-	store *agentauth.Store
-	log   *slog.Logger
+	source agentauth.TrustedCredentialSource
+	log    *slog.Logger
 }
 
 // New builds the proxy over the agent-auth store (which holds every provider's
 // credential). Returns nil if store is nil (proxy disabled).
-func New(store *agentauth.Store, log *slog.Logger) *Proxy {
-	if store == nil {
+func New(source agentauth.TrustedCredentialSource, log *slog.Logger) *Proxy {
+	if source == nil {
 		return nil
 	}
-	return &Proxy{store: store, log: log}
+	return &Proxy{source: source, log: log}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +97,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// MiniMax direct endpoints are credential-only — never rewrite them to the
 	// opencode free-tier path (a MiniMax request needs the connected MiniMax key,
 	// never Zen's keyless free models).
-	if !isMiniMaxUpstream(up) && agent == "opencode" && p.store.Method("opencode") == "" {
+	if !isMiniMaxUpstream(up) && agent == "opencode" && p.method("opencode") == "" {
 		up = "zen"
 	}
 	rest := "/"
@@ -132,7 +130,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FlushInterval: -1, // stream SSE token-by-token
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			if p.log != nil {
-				p.log.Warn("authproxy: upstream error", "upstream", up, "err", err.Error())
+				p.log.Warn("authproxy: upstream request failed", "upstream", up)
 			}
 			http.Error(w, "upstream error", http.StatusBadGateway)
 		},
@@ -141,9 +139,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// "did not finish within the timeout" minutes later — a misleading
 		// message for a problem the provider reported immediately. Rewriting
 		// these as a 400 (which no agent retries) makes the task fail in
-		// seconds with the provider's own words. Transient rate limits are
-		// passed through untouched so normal backoff still works.
+		// seconds with a stable reason. Provider bodies are never reflected:
+		// providers can include submitted credentials in diagnostic responses.
+		// Transient rate limits retain their status so normal backoff still works.
 		ModifyResponse: func(resp *http.Response) error {
+			// Provider cookies belong to the control-plane exchange only; never
+			// relay them to the sandbox.
+			resp.Header.Del("Set-Cookie")
 			if resp.StatusCode < 400 {
 				return nil // success and streaming responses are never touched
 			}
@@ -155,31 +157,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			reason, terminal := terminalProviderError(resp.StatusCode, string(raw))
 			if !terminal {
-				resp.Body = io.NopCloser(bytes.NewReader(raw)) // unchanged
-				resp.ContentLength = int64(len(raw))
+				sanitizeProviderError(resp, "provider request failed")
 				return nil
 			}
 			msg := up + ": " + reason
-			if detail := providerMessage(raw); detail != "" {
-				msg += " — " + detail
-			}
 			if p.log != nil {
 				p.log.Warn("authproxy: permanent provider error (failing the task fast)",
-					"upstream", up, "agent", agent, "status", resp.StatusCode, "detail", msg)
+					"upstream", up, "agent", agent, "status", resp.StatusCode)
 			}
-			body := []byte(`{"error":{"type":"provider_error","message":` + strconv.Quote(msg) + `}}`)
+			sanitizeProviderError(resp, msg)
 			resp.StatusCode = http.StatusBadRequest
 			resp.Status = "400 Bad Request"
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			resp.ContentLength = int64(len(body))
-			resp.Header = resp.Header.Clone()
-			resp.Header.Set("Content-Type", "application/json")
-			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 			resp.Header.Del("Retry-After") // nothing to wait for
 			return nil
 		},
 	}
 	rp.ServeHTTP(w, r)
+}
+
+func sanitizeProviderError(resp *http.Response, message string) {
+	body := []byte(`{"error":{"type":"provider_error","message":` + strconv.Quote(message) + `}}`)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header = resp.Header.Clone()
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 }
 
 // credFor returns a header-injector for (agent, upstream) using the agent's
@@ -191,24 +193,23 @@ func (p *Proxy) credFor(agent, up string) (func(http.Header), bool) {
 	// Authorization: Bearer). The carrying agent's own credential is irrelevant
 	// here; MiniMax has no task-agent CLI of its own.
 	if isMiniMaxUpstream(up) {
-		key := readTrim(filepath.Join(p.store.Dir("minimax"), agentauth.APIKeyFile))
+		key := p.readTrim("minimax", agentauth.APIKeyFile)
 		if key == "" {
 			return nil, false
 		}
 		return func(h http.Header) {
-			h.Del("X-Api-Key")
+			stripUntrustedHeaders(h)
 			h.Set("Authorization", "Bearer "+key)
 		}, true
 	}
-	switch p.store.Method(agent) {
+	switch p.method(agent) {
 	case "api_key":
-		key := readTrim(filepath.Join(p.store.Dir(agent), agentauth.APIKeyFile))
+		key := p.readTrim(agent, agentauth.APIKeyFile)
 		if key == "" {
 			return nil, false
 		}
 		return func(h http.Header) {
-			h.Del("Authorization")
-			h.Del("X-Api-Key")
+			stripUntrustedHeaders(h)
 			if up == "anthropic" {
 				h.Set("X-Api-Key", key) // Anthropic API-key header
 			} else {
@@ -219,13 +220,12 @@ func (p *Proxy) credFor(agent, up string) (func(http.Header), bool) {
 		// Only claude-code's Anthropic OAuth is proxyable today (opencode/codex
 		// OAuth/subscription formats are not — they connect by API key instead).
 		if agent == "claude-code" && up == "anthropic" {
-			tok := claudeOAuthToken(p.store)
+			tok := claudeOAuthToken(p.source)
 			if tok == "" {
 				return nil, false
 			}
 			return func(h http.Header) {
-				h.Del("X-Api-Key")
-				h.Del("Authorization")
+				stripUntrustedHeaders(h)
 				h.Set("Authorization", "Bearer "+tok)
 				h.Set("anthropic-beta", mergeBeta(h.Get("anthropic-beta")))
 			}, true
@@ -240,8 +240,7 @@ func (p *Proxy) credFor(agent, up string) (func(http.Header), bool) {
 	// full paid catalog — this branch is reached only when nothing is connected.
 	if agent == "opencode" {
 		return func(h http.Header) {
-			h.Del("Authorization")
-			h.Del("X-Api-Key")
+			stripUntrustedHeaders(h)
 		}, true
 	}
 	return nil, false
@@ -249,8 +248,8 @@ func (p *Proxy) credFor(agent, up string) (func(http.Header), bool) {
 
 // claudeOAuthToken reads the current subscription access token from the claude
 // credential file. Opaque read; empty when absent/unparseable.
-func claudeOAuthToken(store *agentauth.Store) string {
-	b, err := os.ReadFile(filepath.Join(store.Dir("claude-code"), ".claude/.credentials.json"))
+func claudeOAuthToken(source agentauth.TrustedCredentialSource) string {
+	b, err := source.ReadCredential("claude-code", ".claude/.credentials.json")
 	if err != nil {
 		return ""
 	}
@@ -265,12 +264,27 @@ func claudeOAuthToken(store *agentauth.Store) string {
 	return d.ClaudeAiOauth.AccessToken
 }
 
-func readTrim(path string) string {
-	b, err := os.ReadFile(path)
+func (p *Proxy) readTrim(provider, rel string) string {
+	b, err := p.source.ReadCredential(provider, rel)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+func (p *Proxy) method(provider string) string {
+	method, err := p.source.CredentialMethod(provider)
+	if err != nil {
+		return ""
+	}
+	return method
+}
+
+func stripUntrustedHeaders(h http.Header) {
+	h.Del("Authorization")
+	h.Del("Proxy-Authorization")
+	h.Del("X-Api-Key")
+	h.Del("Cookie")
 }
 
 // mergeBeta ensures the OAuth beta flag is present without dropping any the CLI
