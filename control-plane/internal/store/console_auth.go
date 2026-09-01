@@ -32,7 +32,7 @@ func (s *Store) GetPasswordHash(ctx context.Context) (string, error) {
 
 // SetPasswordHash upserts the single console password row.
 func (s *Store) SetPasswordHash(ctx context.Context, hash string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO console_auth (id, password_hash, updated_at) VALUES (1, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash, updated_at = excluded.updated_at`,
@@ -45,7 +45,7 @@ func (s *Store) SetPasswordHash(ctx context.Context, hash string) error {
 
 // CreateSession inserts a session keyed by the sha256 hex of the cookie value.
 func (s *Store) CreateSession(ctx context.Context, tokenHash, owner string, createdAt, lastUsed, expires int64) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO console_session (token_hash, owner_token, created_at, last_used_at, expires_at)
 			VALUES (?,?,?,?,?)`, tokenHash, owner, createdAt, lastUsed, expires)
@@ -71,7 +71,7 @@ func (s *Store) LookupSession(ctx context.Context, tokenHash string) (owner stri
 // TouchSession bumps last_used_at (best-effort; ignore the returned error at the
 // call site).
 func (s *Store) TouchSession(ctx context.Context, tokenHash string, lastUsed int64) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx,
 			`UPDATE console_session SET last_used_at = ? WHERE token_hash = ?`, lastUsed, tokenHash)
 		return err
@@ -80,7 +80,7 @@ func (s *Store) TouchSession(ctx context.Context, tokenHash string, lastUsed int
 
 // DeleteSession removes one session (logout).
 func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `DELETE FROM console_session WHERE token_hash = ?`, tokenHash)
 		return err
 	})
@@ -88,7 +88,7 @@ func (s *Store) DeleteSession(ctx context.Context, tokenHash string) error {
 
 // DeleteAllSessions removes every session (sign out everywhere / password change).
 func (s *Store) DeleteAllSessions(ctx context.Context) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `DELETE FROM console_session`)
 		return err
 	})
@@ -116,7 +116,7 @@ func scanAPIKey(sc scanner) (*APIKey, error) {
 // CreateAPIKey inserts a key. keyHash is the sha256 hex of the plaintext (the
 // store never sees plaintext). ErrConflict when the name (or hash) already exists.
 func (s *Store) CreateAPIKey(ctx context.Context, id, name, keyHash, prefix string, createdAt int64) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO api_key (id, name, key_hash, prefix, created_at, last_used_at)
 			VALUES (?,?,?,?,?,NULL)`, id, name, keyHash, prefix, createdAt)
@@ -162,7 +162,7 @@ func (s *Store) LookupAPIKey(ctx context.Context, keyHash string) (id string, fo
 
 // TouchAPIKey bumps last_used_at (best-effort).
 func (s *Store) TouchAPIKey(ctx context.Context, id string, lastUsed int64) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `UPDATE api_key SET last_used_at = ? WHERE id = ?`, lastUsed, id)
 		return err
 	})
@@ -171,7 +171,7 @@ func (s *Store) TouchAPIKey(ctx context.Context, id string, lastUsed int64) erro
 // DeleteAPIKey removes a key by id. Returns false when no such key exists (404).
 func (s *Store) DeleteAPIKey(ctx context.Context, id string) (bool, error) {
 	var deleted bool
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `DELETE FROM api_key WHERE id = ?`, id)
 		if err != nil {
 			return err

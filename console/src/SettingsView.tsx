@@ -36,7 +36,7 @@ function SectionTitle({ children, note }: { children: ReactNode; note?: string }
   )
 }
 
-export function SettingsView({ onError, toast }: { onError: (m: string) => void; toast: (m: string) => void }) {
+export function SettingsView({ onError, toast, accountMode = false }: { onError: (m: string) => void; toast: (m: string) => void; accountMode?: boolean }) {
   const [s, setS] = useState<TSettings | null>(null)
   const [agents, setAgents] = useState<Agent[]>([])
   const [creds, setCreds] = useState<GitCredential[]>([])
@@ -58,7 +58,13 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
 
   const loadAgents = useCallback(() => api.getAgents().then(setAgents).catch(() => {}), [])
   const loadCreds = useCallback(() => api.listGitCredentials().then(setCreds).catch(() => {}), [])
-  const loadKeys = useCallback(() => api.listApiKeys().then(setKeys).catch(() => {}), [])
+  const loadKeys = useCallback(() => {
+    if (accountMode) {
+      setKeys([])
+      return Promise.resolve()
+    }
+    return api.listApiKeys().then(setKeys).catch(() => {})
+  }, [accountMode])
   useEffect(() => {
     api.getSettings().then((d) => { setS(d); setIdle(d.lifecycle.idle_reap_enabled); setIdleSec(d.lifecycle.idle_threshold_seconds); setKeepSec(d.lifecycle.keepalive_max_seconds); setProvider(d.agents.provider || 'opencode'); setModels(d.agents.default_models || {}) }).catch((e) => onError((e as Error).message))
     loadAgents(); loadCreds(); loadKeys()
@@ -272,7 +278,7 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
         </div>
       </Card>
 
-      <Card style={{ padding: 16, marginTop: 12 }} data-testid="settings-api-keys">
+      {!accountMode && <Card style={{ padding: 16, marginTop: 12 }} data-testid="settings-api-keys">
         <H style={{ marginBottom: 6 }}>API keys</H>
         <div style={{ color: c.muted, fontSize: 12.5, marginBottom: 12 }}>Programmatic access to the <span style={{ ...mono, fontSize: 11.5 }}>/v1</span> API. The full key is shown once at creation — store it somewhere safe.</div>
         {keys.length === 0 && <div style={{ color: c.muted2, fontSize: 12, marginBottom: 8 }}>No API keys yet.</div>}
@@ -298,7 +304,7 @@ export function SettingsView({ onError, toast }: { onError: (m: string) => void;
           <Input value={keyName} onChange={(e) => setKeyName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createKey()} placeholder="key name (ci, laptop…)" style={{ flex: 1, fontFamily: font.sans }} data-testid="api-key-name" />
           <Btn variant="primary" onClick={createKey} data-testid="api-key-create">Create key</Btn>
         </div>
-      </Card>
+      </Card>}
 
       {/* ─────────────── INSTANCE CONFIGURATION (read-only) ─────────────── */}
       <SectionTitle note="fixed at deploy — the badge shows the env var to change each one">Instance configuration</SectionTitle>

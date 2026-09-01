@@ -59,11 +59,13 @@ func v1SnapshotFromRow(s *store.Snapshot) v1Snapshot {
 	return out
 }
 
-// tenantToken is the snapshot ownership boundary: the authenticated
-// API token's name (auth.Actor.Name). All the upstream backend traffic carries one
-// token, so the upstream backend's snapshots are shared across its end-users — the
-// platform cannot and does not scope by the untrusted external user_id.
+// tenantToken is the legacy tenant boundary. In Entra deployments the
+// authorization middleware supplies the resource's established tenant token;
+// new resources are additionally bound to an immutable principal.
 func tenantToken(r *http.Request) string {
+	if owner := authorizationFrom(r.Context()).ownerToken; owner != "" {
+		return owner
+	}
 	return auth.ActorFrom(r.Context()).Name
 }
 
@@ -76,6 +78,11 @@ type v1CreateSnapshotReq struct {
 // check → raw cp under the source's id-lock → row. 409 if the source
 // is running (cp of a live loopback would be inconsistent).
 func (s *Server) v1CreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
 	if s.LibraryRoot == "" {
 		writeV1Err(w, http.StatusServiceUnavailable, "internal", "snapshots not configured on this host")
 		return
@@ -88,6 +95,12 @@ func (s *Server) v1CreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	if req.SourceSandboxID == "" || req.Name == "" {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "source_sandbox_id and name are required")
 		return
+	}
+	if s.productionAuthorization() {
+		var ok bool
+		if r, ok = s.authorizeSandboxRequest(w, r, req.SourceSandboxID); !ok {
+			return
+		}
 	}
 
 	src, err := s.Store.Get(r.Context(), req.SourceSandboxID)
@@ -139,18 +152,19 @@ func (s *Server) v1CreateSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snap := &store.Snapshot{
-		ID:              snapID,
-		Name:            req.Name,
-		OwnerToken:      tenantToken(r),
-		SourceSandboxID: sql.NullString{String: src.ID, Valid: true},
-		SourceAppID:     src.AppID,          // per-app history survives the sandbox (0015)
-		CreatedByUserID: src.ExternalUserID, // provenance only
-		BaseImage:       src.Image,
-		Visibility:      "private",
-		Format:          "raw",
-		Status:          "ready",
-		ImagePath:       imgPath,
-		SizeBytes:       sql.NullInt64{Int64: size, Valid: true},
+		ID:               snapID,
+		Name:             req.Name,
+		OwnerToken:       tenantToken(r),
+		OwnerPrincipalID: nullStr(principalID(r)),
+		SourceSandboxID:  sql.NullString{String: src.ID, Valid: true},
+		SourceAppID:      src.AppID,          // per-app history survives the sandbox (0015)
+		CreatedByUserID:  src.ExternalUserID, // provenance only
+		BaseImage:        src.Image,
+		Visibility:       "private",
+		Format:           "raw",
+		Status:           "ready",
+		ImagePath:        imgPath,
+		SizeBytes:        sql.NullInt64{Int64: size, Valid: true},
 	}
 	if err := s.Store.CreateSnapshot(r.Context(), snap); err != nil {
 		_ = os.RemoveAll(imgPath) // roll back the orphaned snapshot
@@ -169,7 +183,12 @@ func (s *Server) v1CreateSnapshot(w http.ResponseWriter, r *http.Request) {
 
 // v1ListSnapshots — GET /v1/snapshots (tenant-scoped).
 func (s *Server) v1ListSnapshots(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.Store.ListSnapshotsByOwner(r.Context(), tenantToken(r))
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
+	rows, err := s.snapshotsForRequest(r)
 	if err != nil {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -183,6 +202,11 @@ func (s *Server) v1ListSnapshots(w http.ResponseWriter, r *http.Request) {
 
 // v1GetSnapshot — GET /v1/snapshots/{id} (tenant-scoped).
 func (s *Server) v1GetSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
 	snap, err := s.snapshotForTenant(r, r.PathValue("id"))
 	if err != nil {
 		s.writeSnapshotLookupErr(w, err)
@@ -195,6 +219,11 @@ func (s *Server) v1GetSnapshot(w http.ResponseWriter, r *http.Request) {
 // + row. Safe: sandboxes cloned from it are independent copies (ext4,
 // no CoW), so deletion never affects them.
 func (s *Server) v1DeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"snapshots are unavailable with the runtime provider")
+		return
+	}
 	snap, err := s.snapshotForTenant(r, r.PathValue("id"))
 	if err != nil {
 		s.writeSnapshotLookupErr(w, err)
@@ -219,6 +248,12 @@ func (s *Server) snapshotForTenant(r *http.Request, id string) (*store.Snapshot,
 	snap, err := s.Store.GetSnapshot(r.Context(), id)
 	if err != nil {
 		return nil, err
+	}
+	if s.productionAuthorization() {
+		if !requestIsAdmin(r) && (!snap.OwnerPrincipalID.Valid || snap.OwnerPrincipalID.String != principalID(r)) {
+			return nil, store.ErrNotFound
+		}
+		return snap, nil
 	}
 	if snap.OwnerToken != tenantToken(r) {
 		return nil, store.ErrNotFound

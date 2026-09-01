@@ -1,9 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/auth"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/console"
 )
 
 func TestAPIKeysCRUD(t *testing.T) {
@@ -13,6 +18,7 @@ func TestAPIKeysCRUD(t *testing.T) {
 	if w.Code != 204 {
 		t.Fatalf("setup: %d", w.Code)
 	}
+
 	cookie := sessionFrom(t, w)
 
 	// create → 201 with plaintext key + prefix
@@ -62,5 +68,54 @@ func TestAPIKeysCRUD(t *testing.T) {
 	// the revoked key no longer authenticates
 	if w := doAuth(t, h, "GET", "/v1/apps", "", "", created.Key); w.Code != 401 {
 		t.Fatalf("revoked key still works: %d", w.Code)
+	}
+}
+
+func TestEntraAPIKeysRequireAdministrator(t *testing.T) {
+	userHandler, userServer, userVerifier := newEntraAuthTestServer(t, []string{string(auth.RoleUser)})
+	userCookie := completeEntraLogin(t, userHandler, userVerifier)
+
+	_, hash, prefix, err := console.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := userServer.Store.CreateAPIKey(context.Background(), "global-key", "global", hash, prefix, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []struct {
+		method, path, body string
+	}{
+		{http.MethodGet, "/v1/api-keys", ""},
+		{http.MethodPost, "/v1/api-keys", `{"name":"user-key"}`},
+		{http.MethodDelete, "/v1/api-keys/global-key", ""},
+	} {
+		if w := doAuthWithCookie(t, userHandler, request.method, request.path, request.body,
+			auth.EntraSessionCookie, userCookie, ""); w.Code != http.StatusForbidden {
+			t.Fatalf("ordinary user %s %s: want 403 got %d %s", request.method, request.path, w.Code, w.Body.String())
+		}
+	}
+	keys, err := userServer.Store.ListAPIKeys(context.Background())
+	if err != nil || len(keys) != 1 || keys[0].ID != "global-key" {
+		t.Fatalf("ordinary user changed global API keys: %#v, %v", keys, err)
+	}
+
+	adminHandler, _, adminVerifier := newEntraAuthTestServer(t, []string{string(auth.RoleAdmin)})
+	adminCookie := completeEntraLogin(t, adminHandler, adminVerifier)
+	created := doAuthWithCookie(t, adminHandler, http.MethodPost, "/v1/api-keys", `{"name":"admin-key"}`,
+		auth.EntraSessionCookie, adminCookie, "")
+	if created.Code != http.StatusCreated {
+		t.Fatalf("administrator create: want 201 got %d %s", created.Code, created.Body.String())
+	}
+	var adminKey v1APIKey
+	if err := json.Unmarshal(created.Body.Bytes(), &adminKey); err != nil || adminKey.ID == "" {
+		t.Fatalf("administrator create payload = %s, %v", created.Body.String(), err)
+	}
+	if w := doAuthWithCookie(t, adminHandler, http.MethodGet, "/v1/api-keys", "",
+		auth.EntraSessionCookie, adminCookie, ""); w.Code != http.StatusOK {
+		t.Fatalf("administrator list: want 200 got %d %s", w.Code, w.Body.String())
+	}
+	if w := doAuthWithCookie(t, adminHandler, http.MethodDelete, "/v1/api-keys/"+adminKey.ID, "",
+		auth.EntraSessionCookie, adminCookie, ""); w.Code != http.StatusNoContent {
+		t.Fatalf("administrator delete: want 204 got %d %s", w.Code, w.Body.String())
 	}
 }

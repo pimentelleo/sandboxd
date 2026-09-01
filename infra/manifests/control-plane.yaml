@@ -1,0 +1,238 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandboxd-control-plane
+  namespace: sandboxd-system
+  annotations:
+    azure.workload.identity/client-id: ${CONTROL_PLANE_CLIENT_ID}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandboxd-config
+  namespace: sandboxd-system
+data:
+  SANDBOXD_ADDR: "0.0.0.0:9000"
+  SANDBOXD_PLATFORM: "kubernetes"
+  SANDBOXD_API_AUTH_DISABLED: "false"
+  SANDBOXD_AUTH_PROFILE: "entra"
+  SANDBOXD_ENTRA_TENANT_ID: "${ENTRA_TENANT_ID}"
+  SANDBOXD_ENTRA_CLIENT_ID: "${ENTRA_CLIENT_ID}"
+  SANDBOXD_ENTRA_REDIRECT_URL: "${ENTRA_REDIRECT_URL}"
+  SANDBOXD_DATA_DIR: "/var/lib/sandboxd"
+  SANDBOXD_LOG_DIR: "/var/log/sandboxd"
+  PREVIEW_DOMAIN: "${ROOT_DOMAIN}"
+  PREVIEW_URL_SCHEME: "https"
+  SANDBOXD_PUBLIC_HTTP_PORT: "443"
+  SANDBOXD_KUBERNETES_NAMESPACE_PREFIX: "sandboxd"
+  SANDBOXD_KUBERNETES_STORAGE_CLASS: "sandboxd-azure-disk"
+  SANDBOXD_KUBERNETES_SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
+  SANDBOXD_KUBERNETES_RUNTIME_CLASS: "kata-vm-isolation"
+  SANDBOXD_KUBERNETES_WORKSPACE_MOUNT: "/home/sandbox"
+  SANDBOXD_KUBERNETES_WEB_PORT: "3000"
+  SANDBOXD_KUBERNETES_CLUSTER_DOMAIN: "${KUBERNETES_CLUSTER_DOMAIN}"
+  SANDBOXD_AGENT_PROXY_URL: "http://sandboxd-control-plane.sandboxd-system.svc.${KUBERNETES_CLUSTER_DOMAIN}:9100"
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: sandboxd-secrets
+  namespace: sandboxd-system
+spec:
+  provider: azure
+  secretObjects:
+    - secretName: sandboxd-runtime-secrets
+      type: Opaque
+      data:
+        - objectName: database-url
+          key: database-url
+        - objectName: encryption-key
+          key: encryption-key
+        - objectName: entra-client-secret
+          key: entra-client-secret
+  parameters:
+    usePodIdentity: "false"
+    clientID: "${CONTROL_PLANE_CLIENT_ID}"
+    keyvaultName: "${KEY_VAULT_NAME}"
+    cloudName: ""
+    objects: |
+      array:
+        - |
+          objectName: sandboxd-database-url
+          objectType: secret
+          objectAlias: database-url
+        - |
+          objectName: sandboxd-encryption-key
+          objectType: secret
+          objectAlias: encryption-key
+        - |
+          objectName: sandboxd-entra-client-secret
+          objectType: secret
+          objectAlias: entra-client-secret
+    tenantId: "${TENANT_ID}"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandboxd-runtime
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "pods/log", "services", "persistentvolumeclaims", "resourcequotas", "limitranges"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "resourcequotas", "limitranges"]
+    verbs: ["update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandboxd-runtime
+subjects:
+  - kind: ServiceAccount
+    name: sandboxd-control-plane
+    namespace: sandboxd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandboxd-runtime
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandboxd-control-plane
+  namespace: sandboxd-system
+spec:
+  selector:
+    app.kubernetes.io/name: sandboxd-control-plane
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+    - name: agent-auth
+      port: 9100
+      targetPort: agent-auth
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sandboxd-preview-gateway
+  namespace: sandboxd-system
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: sandboxd-system-preview-gateway-headers@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["*.preview.${ROOT_DOMAIN}"]
+      secretName: sandboxd-preview-gateway-tls
+  rules:
+    - host: "*.preview.${ROOT_DOMAIN}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sandboxd-control-plane
+                port:
+                  name: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: preview-gateway-headers
+  namespace: sandboxd-system
+spec:
+  headers:
+    # Traefik overwrites this fixed marker after terminating TLS. The Go
+    # gateway uses it instead of a client-provided X-Forwarded-Proto header.
+    customRequestHeaders:
+      X-Sandboxd-Preview-Gateway: "1"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sandboxd-migrate-${IMAGE_TAG}
+  namespace: sandboxd-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandboxd-migrate
+        azure.workload.identity/use: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: sandboxd-control-plane
+      securityContext:
+        fsGroup: ${CONTROL_PLANE_RUN_AS_GROUP}
+        runAsGroup: ${CONTROL_PLANE_RUN_AS_GROUP}
+        runAsUser: ${CONTROL_PLANE_RUN_AS_USER}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ${CONTROL_PLANE_IMAGE}
+          args: ["migrate"]
+          envFrom:
+            - configMapRef:
+                name: sandboxd-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxd-runtime-secrets
+                  key: database-url
+            - name: SANDBOXD_ENTRA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sandboxd-runtime-secrets
+                  key: entra-client-secret
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            - name: runtime-data
+              mountPath: /var/lib/sandboxd
+            - name: runtime-logs
+              mountPath: /var/log/sandboxd
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: sandboxd-secrets
+        - name: runtime-data
+          emptyDir: {}
+        - name: runtime-logs
+          emptyDir: {}

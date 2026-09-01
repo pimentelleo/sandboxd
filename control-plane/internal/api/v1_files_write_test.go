@@ -1,8 +1,14 @@
 package api
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/loopback"
 )
 
 func TestResolveWritePath(t *testing.T) {
@@ -68,6 +74,38 @@ func TestResolveWritePath(t *testing.T) {
 				t.Errorf("invariant violated: %q escapes %q", full, mnt)
 			}
 		})
+	}
+}
+
+func TestV1PutFileUsesAppRelativePath(t *testing.T) {
+	loopbackManager := &loopback.Manager{Root: t.TempDir()}
+	s := &Server{Loopback: loopbackManager}
+	id := newULID()
+	_, mnt := loopbackManager.Paths(id)
+	if err := os.MkdirAll(mnt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPut,
+		"/v1/sandboxes/"+id+"/files?path=sandbox.yaml",
+		strings.NewReader("version: 1\nweb:\n  port: 3000\n"))
+	request.SetPathValue("id", id)
+	response := httptest.NewRecorder()
+	s.v1PutFile(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("PUT sandbox.yaml = %d: %s", response.Code, response.Body.String())
+	}
+
+	manifestPath := filepath.Join(mnt, appSubdir, "sandbox.yaml")
+	contents, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("app-relative manifest was not written: %v", err)
+	}
+	if !strings.Contains(string(contents), "port: 3000") {
+		t.Fatalf("manifest contents = %q", contents)
+	}
+	if _, err := os.Stat(filepath.Join(mnt, "sandbox.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("manifest was unexpectedly written at the workspace mount root: %v", err)
 	}
 }
 

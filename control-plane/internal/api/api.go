@@ -25,6 +25,7 @@ import (
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/instancecfg"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/loopback"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/metrics"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/secrets"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/snapshot"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
@@ -68,6 +69,10 @@ type Server struct {
 	// URLs or it cannot iframe previews (mixed content). Empty = derive from
 	// PreviewTLS, exactly the previous behaviour.
 	PreviewURLScheme string
+	// AllowInsecurePreview is only set by the explicitly validated
+	// kubernetes-local startup profile. It permits host-bound preview cookies
+	// over Kind's HTTP ingress without relaxing the production HTTPS profile.
+	AllowInsecurePreview bool
 	// PublicHTTPPort is the HOST-facing port that preview/console URLs are
 	// reached on (the host side of Traefik's published port). previewURL
 	// appends it unless it's the default for the scheme (80 for http, 443
@@ -191,6 +196,40 @@ type Server struct {
 	// gets this base URL + a dummy key, and the proxy injects the real bearer.
 	// Empty → legacy behaviour (credential mounted into the sandbox).
 	AgentProxyURL string
+
+	// PreviewRuntime owns the private provider endpoint used only by the
+	// production preview gateway. Local Docker previews continue to use Wake.
+	PreviewRuntime   runtimebackend.PreviewGateway
+	PreviewReadiness runtimebackend.PreviewReadiness
+	PreviewTransport http.RoundTripper // test hook; nil uses the default transport
+
+	// RuntimeLifecycle is set only for a provider-backed deployment. Its presence
+	// selects the provider path throughout the API, so a Kubernetes deployment can
+	// never silently fall through to Docker, loopback mounts, or host files.
+	RuntimeLifecycle   runtimebackend.Lifecycle
+	RuntimePurger      runtimebackend.PurgeLifecycle
+	RuntimeFiles       runtimebackend.WorkspaceFiles
+	RuntimeProcessLogs runtimebackend.ProcessLogTailer
+	RuntimeExec        runtimebackend.NonInteractiveExecutor
+	RuntimeTTY         runtimebackend.TTYExecutor
+	TaskRuntime        runtimebackend.TaskRuntimeBinder
+	RuntimeLeaseTTL    time.Duration
+	RuntimeLeaseHolder string
+	// ProviderWebPort is the policy-owned web port exposed by a provider
+	// sandbox. Unlike Docker's arbitrary port list it cannot be selected per
+	// request.
+	ProviderWebPort int
+	// ProviderFileEntryLimit is the policy ceiling supplied by the provider
+	// configuration. It prevents the generic API from requesting more entries
+	// than a Kubernetes adapter permits.
+	ProviderFileEntryLimit int
+	// ProviderFileByteLimit is the largest file the provider transport accepts.
+	// It lets the API reject an oversized request before buffering it in the
+	// control plane.
+	ProviderFileByteLimit int64
+	// PreviewClusterDomain constrains provider preview targets to the cluster's
+	// service DNS suffix rather than assuming cluster.local.
+	PreviewClusterDomain string
 }
 
 // agentAuthBaseMount is the in-container parent dir under which each connected
@@ -257,7 +296,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sandboxes/{id}", s.observe("GET /v1/sandboxes/{id}", s.v1GetSandbox))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/stop", s.observe("POST /v1/sandboxes/{id}/stop", s.v1StopSandbox))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/start", s.observe("POST /v1/sandboxes/{id}/start", s.v1StartSandbox))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/preview-ticket", s.observe("POST /v1/sandboxes/{id}/preview-ticket", s.v1CreatePreviewTicket))
 	mux.HandleFunc("DELETE /v1/sandboxes/{id}", s.observe("DELETE /v1/sandboxes/{id}", s.v1DeleteSandbox))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/exec", s.observe("POST /v1/sandboxes/{id}/exec", s.handleExec))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/tasks", s.observe("POST /v1/sandboxes/{id}/tasks", s.v1SubmitTask))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/tasks", s.observe("GET /v1/sandboxes/{id}/tasks", s.v1ListTasks))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/tasks/{taskId}", s.observe("GET /v1/sandboxes/{id}/tasks/{taskId}", s.v1GetTask))
@@ -305,8 +346,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/auth/status", s.observe("GET /v1/auth/status", s.v1AuthStatus))
 	mux.HandleFunc("POST /v1/auth/setup", s.observe("POST /v1/auth/setup", s.v1AuthSetup))
 	mux.HandleFunc("POST /v1/auth/login", s.observe("POST /v1/auth/login", s.v1AuthLogin))
+	mux.HandleFunc("GET /v1/auth/entra/login", s.observe("GET /v1/auth/entra/login", s.v1AuthEntraLogin))
+	mux.HandleFunc("GET /v1/auth/entra/callback", s.observe("GET /v1/auth/entra/callback", s.v1AuthEntraCallback))
 	mux.HandleFunc("POST /v1/auth/logout", s.observe("POST /v1/auth/logout", s.v1AuthLogout))
 	mux.HandleFunc("POST /v1/auth/password", s.observe("POST /v1/auth/password", s.v1AuthPassword))
+	mux.HandleFunc("POST /v1/auth/accounts", s.observe("POST /v1/auth/accounts", s.v1CreateLocalAccount))
 	mux.HandleFunc("GET /v1/api-keys", s.observe("GET /v1/api-keys", s.v1ListAPIKeys))
 	mux.HandleFunc("POST /v1/api-keys", s.observe("POST /v1/api-keys", s.v1CreateAPIKey))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", s.observe("DELETE /v1/api-keys/{id}", s.v1DeleteAPIKey))
@@ -349,6 +393,12 @@ func (s *Server) observe(endpoint string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
+		var ok bool
+		if r, ok = s.authorizeRequest(sw, r); !ok {
+			metrics.APIDuration.WithLabelValues(endpoint, r.Method).Observe(time.Since(start).Seconds())
+			metrics.APIRequests.WithLabelValues(endpoint, r.Method, statusBucket(sw.status)).Inc()
+			return
+		}
 		h(sw, r)
 		metrics.APIDuration.WithLabelValues(endpoint, r.Method).Observe(time.Since(start).Seconds())
 		metrics.APIRequests.WithLabelValues(endpoint, r.Method, statusBucket(sw.status)).Inc()

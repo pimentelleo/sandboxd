@@ -2,6 +2,7 @@ package api
 
 import (
 	"archive/zip"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
@@ -9,6 +10,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
 // File reads are served by sandboxd directly from the host-side
@@ -72,12 +76,53 @@ type fileEntry struct {
 	Size int64  `json:"size,omitempty"`
 }
 
+// providerAppPath translates the public app-relative API into the provider's
+// workspace-relative contract. It deliberately uses slash-only logical paths,
+// never a control-plane host path.
+func providerAppPath(raw string, requireFile bool) (runtimebackend.LogicalPath, error) {
+	if raw == "" {
+		if requireFile {
+			return runtimebackend.LogicalPath{}, errors.New("path is required")
+		}
+		return runtimebackend.ParseLogicalPath(appSubdir)
+	}
+	logical, err := runtimebackend.ParseLogicalPath(raw)
+	if err != nil {
+		return runtimebackend.LogicalPath{}, errors.New("invalid path")
+	}
+	return runtimebackend.ParseLogicalPath(appSubdir + "/" + logical.String())
+}
+
+func providerPublicPath(logical runtimebackend.LogicalPath) (string, bool) {
+	prefix := appSubdir + "/"
+	value := logical.String()
+	if !strings.HasPrefix(value, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(value, prefix), true
+}
+
+func writeProviderFileError(w http.ResponseWriter, err error, noun string) {
+	switch {
+	case errors.Is(err, runtimebackend.ErrFileNotFound), errors.Is(err, runtimebackend.ErrFileIsDirectory):
+		writeV1Err(w, http.StatusNotFound, "not_found", "no such "+noun)
+	case errors.Is(err, runtimebackend.ErrFileLimitExceeded), errors.Is(err, runtimebackend.ErrSymlinkNotAllowed):
+		writeV1Err(w, http.StatusBadRequest, "invalid_request", err.Error())
+	default:
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider file transport is unavailable")
+	}
+}
+
 // --- GET /v1/sandboxes/{id}/files -----------------------------------
 
 func (s *Server) v1ListFiles(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isULID(id) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no such directory")
+		return
+	}
+	if s.usesRuntimeProvider() {
+		s.v1ListProviderFiles(w, r, id)
 		return
 	}
 	root := s.appDirFor(id)
@@ -144,12 +189,87 @@ func (s *Server) v1ListFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) v1ListProviderFiles(w http.ResponseWriter, r *http.Request, id string) {
+	if s.RuntimeFiles == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider file access is unavailable")
+		return
+	}
+	sb, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeV1Err(w, http.StatusNotFound, "not_found", "no such directory")
+		return
+	}
+	if err != nil {
+		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	rawPath := r.URL.Query().Get("path")
+	logical, err := providerAppPath(rawPath, false)
+	if err != nil {
+		writeV1Err(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	result, err := s.RuntimeFiles.ListFiles(r.Context(), s.runtimeRef(sb), runtimebackend.ListFilesRequest{
+		Path: logical, Recursive: r.URL.Query().Get("recursive") == "true", Limit: s.providerFileEntryLimit(),
+	})
+	if err != nil {
+		writeProviderFileError(w, err, "directory")
+		return
+	}
+	entries := make([]fileEntry, 0, len(result.Entries))
+	for _, entry := range result.Entries {
+		path, ok := providerPublicPath(entry.Path)
+		if !ok || path == "" || providerExcludedPath(path) {
+			continue
+		}
+		entryType := "file"
+		if entry.Type == runtimebackend.FileTypeDirectory {
+			entryType = "dir"
+		}
+		entries = append(entries, fileEntry{Path: path, Type: entryType, Size: entry.Size})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": rawPath, "recursive": r.URL.Query().Get("recursive") == "true", "entries": entries, "truncated": result.Truncated,
+	})
+}
+
+func (s *Server) providerFileEntryLimit() int {
+	if s.ProviderFileEntryLimit > 0 {
+		return s.ProviderFileEntryLimit
+	}
+	return 1_000
+}
+
+// providerFileReadLimit preserves the public file-read cap even when the
+// provider can handle larger files, while honoring a stricter provider policy.
+func (s *Server) providerFileReadLimit() int64 {
+	limit := int64(maxFileBytes)
+	if s.ProviderFileByteLimit > 0 && s.ProviderFileByteLimit < limit {
+		return s.ProviderFileByteLimit
+	}
+	return limit
+}
+
+func providerExcludedPath(path string) bool {
+	for _, segment := range strings.Split(path, "/") {
+		if excludedFromFiles[segment] {
+			return true
+		}
+	}
+	return false
+}
+
 // --- GET /v1/sandboxes/{id}/files/content ---------------------------
 
 func (s *Server) v1FileContent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isULID(id) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+	if s.usesRuntimeProvider() {
+		s.v1ProviderFileContent(w, r, id)
 		return
 	}
 	root := s.appDirFor(id)
@@ -184,12 +304,48 @@ func (s *Server) v1FileContent(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (s *Server) v1ProviderFileContent(w http.ResponseWriter, r *http.Request, id string) {
+	if s.RuntimeFiles == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider file access is unavailable")
+		return
+	}
+	sb, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeV1Err(w, http.StatusNotFound, "not_found", "no such file")
+		return
+	}
+	if err != nil {
+		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	logical, err := providerAppPath(r.URL.Query().Get("path"), true)
+	if err != nil {
+		writeV1Err(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	data, err := s.RuntimeFiles.ReadFile(r.Context(), s.runtimeRef(sb), runtimebackend.ReadFileRequest{
+		Path: logical, MaxBytes: s.providerFileReadLimit(),
+	})
+	if err != nil {
+		writeProviderFileError(w, err, "file")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
 // --- GET /v1/sandboxes/{id}/export ----------------------------------
 
 func (s *Server) v1Export(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isULID(id) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no workspace for that sandbox")
+		return
+	}
+	if s.usesRuntimeProvider() {
+		// Export needs a streaming archive protocol. Do not materialize provider
+		// volumes or files on the control-plane filesystem as a fallback.
+		writeV1Err(w, http.StatusNotImplemented, "unsupported", "workspace export is unavailable with the runtime provider")
 		return
 	}
 	root := s.appDirFor(id)

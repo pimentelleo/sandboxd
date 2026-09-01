@@ -13,13 +13,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/audit"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/events"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtime"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
@@ -78,6 +79,8 @@ func v1ErrCode(code int) string {
 		return "conflict"
 	case http.StatusServiceUnavailable:
 		return "sandbox_capacity"
+	case http.StatusNotImplemented:
+		return "unsupported"
 	default:
 		return "internal"
 	}
@@ -136,19 +139,15 @@ func (s *Server) previewURL(id string, webPort int) string {
 	// local deploy returns a reachable http:// URL the console can iframe),
 	// https when we terminate TLS OR when something in front of us does.
 	scheme, defaultPort := s.previewScheme()
-	// An explicit PREVIEW_URL_SCHEME means something in front of us owns the
-	// public port (a TLS terminator on 443, a tunnel gateway): our own host
-	// port is not what the browser dials, so it must not appear in the URL.
-	if s.PreviewURLScheme != "" {
-		defaultPort = s.PublicHTTPPort
-	}
 	if webPort <= 0 {
 		webPort = 3000 // backward-compatible default
 	}
 	// The preview hostname's port is the sandbox's RESOLVED web port (manifest /
 	// preset / 3000) — the same port the Traefik router serves — so a non-3000
 	// app (e.g. Astro on 4321) gets a reachable URL.
-	host := fmt.Sprintf("s-%s-%d.preview.%s", id, webPort, s.PreviewDomain)
+	// DNS hostnames are case-insensitive, but ingress implementations may not
+	// normalize wildcard matches. Keep the browser-facing host canonical.
+	host := fmt.Sprintf("s-%s-%d.preview.%s", strings.ToLower(id), webPort, strings.ToLower(s.PreviewDomain))
 	// Append the host-facing port unless it's the scheme default. On a
 	// shared host published on e.g. :18080, the bare URL would hit whatever
 	// owns :80 (a front proxy), so the port must be in the URL the browser,
@@ -169,14 +168,17 @@ func (s *Server) v1SandboxFromRow(r *http.Request, sb *store.Sandbox) v1Sandbox 
 		CreatedAt: sb.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt: sb.UpdatedAt.UTC().Format(time.RFC3339),
 	}
-	_, mnt := s.Loopback.Paths(sb.ID)
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	var rs *runtime.Status
-	if got, err := runtime.NewClient(filepath.Join(mnt, ".runtimed", "sock")).Status(ctx); err == nil {
+	if got, err := s.runtimeClientFor(sb.ID).Status(ctx); err == nil {
 		rs = got
 	}
-	out.Preview, out.Processes = s.v1RuntimeView(sb.ID, sb.Status, rs, webPortOf(sb))
+	webPort := webPortOf(sb)
+	if s.usesRuntimeProvider() {
+		webPort = s.providerWebPort()
+	}
+	out.Preview, out.Processes = s.v1RuntimeView(sb.ID, sb.Status, rs, webPort)
 	if rs != nil && rs.ActiveTask != nil {
 		out.ActiveTaskID = rs.ActiveTask.ID
 	}
@@ -243,18 +245,30 @@ func (s *Server) v1CreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Image != nil {
-		writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		if s.usesRuntimeProvider() {
+			writeV1Err(w, http.StatusNotImplemented, "unsupported",
+				"per-app image selection is unavailable with the runtime provider")
+		} else {
+			writeV1Err(w, http.StatusBadRequest, "invalid_request", errPerAppImage)
+		}
 		return
 	}
-	if req.Project.ID == "" || req.Project.UserID == "" {
+	if req.Project.ID == "" || (!s.productionAuthorization() && req.Project.UserID == "") {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "project.id and project.user_id are required")
 		return
+	}
+	if s.productionAuthorization() {
+		req.Project.UserID = actorOwnerToken(r)
 	}
 
 	// Idempotent per project: an existing non-error sandbox for this
 	// project is returned as-is (one durable sandbox per project).
 	if rows, err := s.Store.ListFiltered(r.Context(), "", req.Project.ID); err == nil {
 		for _, sb := range rows {
+			if s.productionAuthorization() && !requestIsAdmin(r) &&
+				(!sb.OwnerPrincipalID.Valid || sb.OwnerPrincipalID.String != principalID(r)) {
+				continue
+			}
 			if sb.Status != "error" {
 				writeJSON(w, http.StatusOK, s.v1SandboxFromRow(r, sb))
 				return
@@ -266,12 +280,27 @@ func (s *Server) v1CreateSandbox(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "template and from_snapshot are mutually exclusive")
 		return
 	}
+	if s.usesRuntimeProvider() && (req.FromSnapshot != "" || req.Template != "" || req.RuntimePreset != "") {
+		// These inputs all select host-local workspace artifacts. Reject them
+		// before preset/snapshot resolution so provider mode cannot touch a
+		// host path even for an otherwise-invalid value.
+		writeV1Err(w, http.StatusNotImplemented, "unsupported",
+			"templates, snapshots, and runtime presets are unavailable with the runtime provider")
+		return
+	}
 	vis := req.Visibility
 	if vis == "" {
 		vis = "public"
+		if s.usesRuntimeProvider() {
+			vis = "private"
+		}
+	}
+	webPort := 3000
+	if s.usesRuntimeProvider() {
+		webPort = s.providerWebPort()
 	}
 	createBody := map[string]any{
-		"ports":      []int{3000},
+		"ports":      []int{webPort},
 		"visibility": vis,
 		"external":   map[string]string{"user_id": req.Project.UserID, "project_id": req.Project.ID},
 	}
@@ -350,6 +379,10 @@ func (s *Server) v1GetSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) v1StopSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if s.usesRuntimeProvider() {
+		s.v1StopProviderSandbox(w, r, id)
+		return
+	}
 	sb, err := s.Store.Get(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
@@ -382,10 +415,9 @@ func (s *Server) v1StopSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Reject a stop while a task is active — the upstream cancels first.
-	_, mnt := s.Loopback.Paths(id)
 	rctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	if rs, rerr := runtime.NewClient(filepath.Join(mnt, ".runtimed", "sock")).Status(rctx); rerr == nil && rs.ActiveTask != nil {
+	if rs, rerr := s.runtimeClientFor(id).Status(rctx); rerr == nil && rs.ActiveTask != nil {
 		writeV1Err(w, http.StatusConflict, "task_in_progress",
 			"a task is in progress; cancel it before stopping")
 		return
@@ -404,6 +436,89 @@ func (s *Server) v1StopSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.v1SandboxFromRow(r, sb))
 }
 
+func (s *Server) v1StopProviderSandbox(w http.ResponseWriter, r *http.Request, id string) {
+	var (
+		result       *store.Sandbox
+		conflictCode string
+		conflictMsg  string
+		stopped      bool
+	)
+	err := s.withRuntimeLease(r.Context(), id, func(ctx context.Context) error {
+		// The state and task checks belong inside the lease: a row read before
+		// acquiring it could otherwise stop a sandbox that another replica
+		// already transitioned or restarted.
+		sb, getErr := s.Store.Get(ctx, id)
+		if getErr != nil {
+			return getErr
+		}
+		result = sb
+		if sb.Status == "stopped" {
+			return nil
+		}
+		if sb.Status != "running" {
+			conflictCode, conflictMsg = "conflict", "sandbox is not running"
+			return nil
+		}
+		runningTask, taskErr := s.Store.SandboxHasRunningTask(ctx, id)
+		if taskErr != nil {
+			return taskErr
+		}
+		if runningTask {
+			conflictCode, conflictMsg = "task_in_progress", "a task is in progress; cancel it before stopping"
+			return nil
+		}
+		if taskRuntime, runtimeErr := s.providerTaskRuntime(sb); runtimeErr == nil {
+			runtimeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			status, statusErr := taskRuntime.Status(runtimeCtx)
+			cancel()
+			if statusErr == nil && status.ActiveTask != nil {
+				conflictCode, conflictMsg = "task_in_progress", "a task is in progress; cancel it before stopping"
+				return nil
+			}
+		}
+		if stopErr := s.RuntimeLifecycle.Stop(ctx, s.runtimeRef(sb), 10*time.Second); stopErr != nil {
+			return stopErr
+		}
+		if persistErr := s.persistRuntimeState(ctx, id, runtimebackend.Sandbox{
+			Ref: s.runtimeRef(sb), State: runtimebackend.LifecycleStopped,
+		}); persistErr != nil {
+			return persistErr
+		}
+		result, getErr = s.Store.Get(ctx, id)
+		if getErr != nil {
+			return getErr
+		}
+		stopped = true
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
+		return
+	}
+	if errors.Is(err, ErrRuntimeOperationBusy) {
+		writeV1Err(w, http.StatusConflict, "conflict", "sandbox lifecycle operation is already in progress")
+		return
+	}
+	if err != nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider stop failed")
+		return
+	}
+	if conflictCode != "" {
+		writeV1Err(w, http.StatusConflict, conflictCode, conflictMsg)
+		return
+	}
+	if result == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider stop failed")
+		return
+	}
+	if stopped {
+		s.auditAction(r, audit.Entry{Action: "sandbox.stop", Target: id})
+		s.recordEvent(r, events.Event{Type: events.SandboxStopped, Severity: events.SeverityInfo,
+			Message: "Sandbox stopped", AppID: result.AppID.String, SandboxID: id})
+	}
+	writeJSON(w, http.StatusOK, s.v1SandboxFromRow(r, result))
+}
+
 // --- POST /v1/sandboxes/{id}/start ----------------------------------
 
 // v1StartSandbox wakes a stopped sandbox. It is the public counterpart
@@ -420,11 +535,20 @@ func (s *Server) v1StartSandbox(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	if sb.Status == "running" {
+	switch sb.Status {
+	case "running":
 		writeJSON(w, http.StatusOK, s.v1SandboxFromRow(r, sb)) // idempotent
 		return
-	}
-	if sb.Status != "stopped" {
+	case "stopped":
+		// Wake below.
+	case "creating":
+		if s.usesRuntimeProvider() {
+			// A provider may remain "creating" after a node restart. Reissuing
+			// its idempotent wake reconciles the retained workload policy.
+			break
+		}
+		fallthrough
+	default:
 		writeV1Err(w, http.StatusConflict, "conflict", "sandbox is "+sb.Status+" — cannot start")
 		return
 	}

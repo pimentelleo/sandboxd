@@ -1,0 +1,158 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: sandboxd-system
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sandboxd-control-plane
+  namespace: sandboxd-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxd-control-plane
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: traefik
+            k8s:app.kubernetes.io/name: traefik
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sandboxd-system
+            k8s:app.kubernetes.io/name: sandboxd-console
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    # Sandbox agents use this credential-injecting proxy rather than receiving
+    # provider credentials. No sandbox may reach the control-plane API port.
+    - fromEndpoints:
+        - matchLabels:
+            k8s:sandboxd.io/managed: "true"
+            k8s:sandboxd.io/component: sandbox
+      toPorts:
+        - ports:
+            - port: "9100"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:k8s-app: kube-dns
+            k8s:io.kubernetes.pod.namespace: kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toFQDNs:
+        - matchName: ${POSTGRES_FQDN}
+        - matchName: "${KEY_VAULT_NAME}.vault.azure.net"
+        - matchName: login.microsoftonline.com
+        - matchName: api.anthropic.com
+        - matchName: api.openai.com
+        - matchName: opencode.ai
+        - matchName: api.minimax.io
+        - matchName: api.minimaxi.com
+        - matchName: api.github.com
+        - matchName: api.githubcopilot.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "5432"
+              protocol: TCP
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:sandboxd.io/managed: "true"
+            k8s:sandboxd.io/component: sandbox
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sandboxd-console
+  namespace: sandboxd-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxd-console
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: traefik
+            k8s:app.kubernetes.io/name: traefik
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:k8s-app: kube-dns
+            k8s:io.kubernetes.pod.namespace: kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: sandboxd-system
+            k8s:app.kubernetes.io/name: sandboxd-control-plane
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - toFQDNs:
+        - matchName: login.microsoftonline.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: sandboxd-migration
+  namespace: sandboxd-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandboxd-migrate
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:k8s-app: kube-dns
+            k8s:io.kubernetes.pod.namespace: kube-system
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    - toFQDNs:
+        - matchName: ${POSTGRES_FQDN}
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP

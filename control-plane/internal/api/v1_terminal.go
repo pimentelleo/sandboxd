@@ -17,6 +17,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
@@ -64,6 +65,10 @@ func (s *Server) v1Terminal(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusConflict, "conflict", "sandbox is "+sb.Status+" — start it to open a terminal")
 		return
 	}
+	if s.usesRuntimeProvider() && s.RuntimeTTY == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider terminal access is unavailable")
+		return
+	}
 
 	conn, err := terminalUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -75,6 +80,11 @@ func (s *Server) v1Terminal(w http.ResponseWriter, r *http.Request) {
 	if s.Inflight != nil {
 		s.Inflight.Enter(id)
 		defer s.Inflight.Exit(id)
+	}
+
+	if s.usesRuntimeProvider() {
+		s.v1ProviderTerminal(conn, r, sb)
+		return
 	}
 
 	// Interactive login shell as uid 1000 in the app workspace. Prefer bash,
@@ -126,6 +136,58 @@ func (s *Server) v1Terminal(w http.ResponseWriter, r *http.Request) {
 			var ctl termResize
 			if json.Unmarshal(data, &ctl) == nil && ctl.Resize != nil {
 				_ = pty.Setsize(ptmx, &pty.Winsize{Cols: ctl.Resize.Cols, Rows: ctl.Resize.Rows})
+			}
+		}
+	}
+}
+
+func (s *Server) v1ProviderTerminal(conn *websocket.Conn, r *http.Request, sb *store.Sandbox) {
+	session, err := s.RuntimeTTY.OpenTTY(r.Context(), s.runtimeRef(sb), runtimebackend.TTYRequest{
+		User: "sandbox", Workdir: "/home/sandbox/workspace/app",
+		Args: []string{"/bin/sh", "-c", "command -v bash >/dev/null && exec bash -l || exec sh"},
+	})
+	if err != nil {
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("\r\n[sandboxd] could not open provider terminal: "+err.Error()+"\r\n"))
+		return
+	}
+	defer func() {
+		_ = session.Close()
+		_ = session.Kill()
+		_ = session.Wait()
+	}()
+
+	// The provider owns the terminal transport; only its byte stream crosses
+	// the WebSocket. No Docker PTY or host filesystem is involved.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := session.Read(buf)
+			if n > 0 {
+				if werr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+					return
+				}
+			}
+			if rerr != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}()
+
+	for {
+		mt, data, rerr := conn.ReadMessage()
+		if rerr != nil {
+			return
+		}
+		switch mt {
+		case websocket.BinaryMessage:
+			if _, werr := session.Write(data); werr != nil {
+				return
+			}
+		case websocket.TextMessage:
+			var ctl termResize
+			if json.Unmarshal(data, &ctl) == nil && ctl.Resize != nil {
+				_ = session.Resize(ctl.Resize.Rows, ctl.Resize.Cols)
 			}
 		}
 	}

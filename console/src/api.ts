@@ -49,6 +49,30 @@ export interface Settings {
   editable?: string[] // field paths the client may PATCH (e.g. lifecycle.*)
 }
 
+export interface AuthPrincipal {
+  id?: string
+  email?: string
+  oid?: string
+  tenant_id?: string
+  display_name?: string
+  upn?: string
+  roles: ('sandboxd.user' | 'sandboxd.admin')[]
+}
+
+export interface AuthStatus {
+  enabled: boolean
+  authenticated: boolean
+  password_set: boolean
+  profile?: 'local' | 'entra' | 'invalid'
+  local_auth_mode?: 'password' | 'accounts'
+  login_available?: boolean
+  principal?: AuthPrincipal
+  capabilities?: {
+    console_access: boolean
+    administrator: boolean
+  }
+}
+
 // Read-only AI Agents status (GET /v1/agents). No tokens are ever returned.
 // `runnable` = runtimed has a task adapter for this provider; a connected but
 // not-runnable provider means "credentials imported, runner not enabled yet".
@@ -491,9 +515,14 @@ export const api = {
   // Auth — session lifecycle. The session cookie is HttpOnly, so state is read
   // only via authStatus; the cookie rides same-origin /v1 calls automatically.
   authStatus: () =>
-    req<{ enabled: boolean; authenticated: boolean; password_set: boolean }>('GET', '/v1/auth/status'),
+    req<AuthStatus>('GET', '/v1/auth/status'),
+  entraLoginURL: () => '/v1/auth/entra/login',
   setupPassword: (password: string) => req<void>('POST', '/v1/auth/setup', { password }),
   login: (password: string) => req<void>('POST', '/v1/auth/login', { password }),
+  setupLocalAccount: (email: string, password: string) =>
+    req<void>('POST', '/v1/auth/setup', { email, password }),
+  loginLocalAccount: (email: string, password: string) =>
+    req<void>('POST', '/v1/auth/login', { email, password }),
   logout: () => req<void>('POST', '/v1/auth/logout'),
   logoutEverywhere: () => req<void>('POST', '/v1/auth/logout?all=true'),
   changePassword: (b: { current_password: string; new_password: string }) =>

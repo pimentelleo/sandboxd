@@ -14,6 +14,7 @@ import (
 type App struct {
 	ID                string
 	OwnerToken        string
+	OwnerPrincipalID  sql.NullString
 	ExternalUserID    sql.NullString
 	ExternalProjectID sql.NullString
 	Name              string
@@ -53,7 +54,7 @@ func scanApp(sc scanner) (*App, error) {
 	a := &App{}
 	var tags string
 	var created, updated int64
-	err := sc.Scan(&a.ID, &a.OwnerToken, &a.ExternalUserID, &a.ExternalProjectID,
+	err := sc.Scan(&a.ID, &a.OwnerToken, &a.OwnerPrincipalID, &a.ExternalUserID, &a.ExternalProjectID,
 		&a.Name, &a.Description, &tags, &a.LatestSnapshotID, &created, &updated, &a.RuntimePreset,
 		&a.GitRepoURL, &a.GitBranch, &a.GitCredentialID, &a.LastImportAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -71,13 +72,13 @@ func scanApp(sc scanner) (*App, error) {
 	return a, nil
 }
 
-const appSelectCols = `id, owner_token, external_user_id, external_project_id,
+const appSelectCols = `id, owner_token, owner_principal_id, external_user_id, external_project_id,
 	       name, description, tags, latest_snapshot_id, created_at, updated_at, runtime_preset,
 	       git_repo_url, git_branch, git_credential_id, last_import_at`
 
 // SetAppImported stamps last_import_at after a successful Git clone.
 func (s *Store) SetAppImported(ctx context.Context, id string, at int64) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		_, err := db.ExecContext(ctx, `UPDATE app SET last_import_at = ? WHERE id = ?`, at, id)
 		return err
 	})
@@ -85,15 +86,15 @@ func (s *Store) SetAppImported(ctx context.Context, id string, at int64) error {
 
 // CreateApp inserts a new app. The caller sets ID (ULID) and OwnerToken.
 func (s *Store) CreateApp(ctx context.Context, a *App) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		now := time.Now().Unix()
 		_, err := db.ExecContext(ctx, `
-			INSERT INTO app (id, owner_token, external_user_id, external_project_id,
+			INSERT INTO app (id, owner_token, owner_principal_id, external_user_id, external_project_id,
 			                 name, description, tags, latest_snapshot_id,
 			                 created_at, updated_at, runtime_preset,
 			                 git_repo_url, git_branch, git_credential_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			a.ID, a.OwnerToken, a.ExternalUserID, a.ExternalProjectID,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			a.ID, a.OwnerToken, a.OwnerPrincipalID, a.ExternalUserID, a.ExternalProjectID,
 			a.Name, a.Description, marshalTags(a.Tags), a.LatestSnapshotID, now, now, a.RuntimePreset,
 			a.GitRepoURL, a.GitBranch, a.GitCredentialID)
 		if err != nil {
@@ -154,7 +155,7 @@ func (s *Store) ListAppsForOwner(ctx context.Context, ownerToken, externalUserID
 // UpdateApp applies a partial update scoped to the tenant. Returns
 // ErrNotFound when no app matches (id, ownerToken).
 func (s *Store) UpdateApp(ctx context.Context, id, ownerToken string, patch AppPatch) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		sets := []string{}
 		args := []any{}
 		if patch.Name != nil {
@@ -246,7 +247,7 @@ func (s *Store) SnapshotImagePathsForApp(ctx context.Context, appID string) ([]s
 // final metadata cleanup so nothing dangling references the app. Idempotent:
 // deleting an already-absent app affects zero rows and returns nil.
 func (s *Store) DeleteApp(ctx context.Context, appID string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err

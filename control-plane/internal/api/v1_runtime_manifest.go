@@ -12,6 +12,7 @@ import (
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/manifest"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/preset"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -40,7 +41,7 @@ type v1AppManifestResp struct {
 
 // GET /v1/apps/{id}/runtime/manifest — the app's current sandbox.yaml (or, if
 // absent, the preset/default that would apply), validated. Owner-scoped,
-// read-only, host-side (works whether the sandbox is running or stopped).
+// read-only, and works whether the sandbox is running or stopped.
 func (s *Server) v1AppManifest(w http.ResponseWriter, r *http.Request) {
 	app, err := s.Store.GetAppForOwner(r.Context(), r.PathValue("id"), tenantToken(r))
 	if errors.Is(err, store.ErrNotFound) {
@@ -57,8 +58,32 @@ func (s *Server) v1AppManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	appDir := filepath.Join(sb.WorkspaceMnt, "workspace", "app")
-	if raw, err := os.ReadFile(filepath.Join(appDir, manifest.File)); err == nil {
+	var raw []byte
+	if s.usesRuntimeProvider() {
+		if s.RuntimeFiles == nil {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable",
+				"runtime provider file access is unavailable")
+			return
+		}
+		manifestPath, pathErr := runtimebackend.ParseLogicalPath(appSubdir + "/" + manifest.File)
+		if pathErr != nil {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable",
+				"runtime provider manifest path is unavailable")
+			return
+		}
+		raw, err = s.RuntimeFiles.ReadFile(r.Context(), s.runtimeRef(sb), runtimebackend.ReadFileRequest{
+			Path: manifestPath, MaxBytes: s.providerFileReadLimit(),
+		})
+		if err != nil && !errors.Is(err, runtimebackend.ErrFileNotFound) {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable",
+				"runtime provider manifest access failed")
+			return
+		}
+	} else {
+		appDir := filepath.Join(sb.WorkspaceMnt, "workspace", "app")
+		raw, err = os.ReadFile(filepath.Join(appDir, manifest.File))
+	}
+	if err == nil {
 		res := manifest.Validate(raw)
 		writeJSON(w, http.StatusOK, v1AppManifestResp{
 			Present: true, Source: "sandbox.yaml", Manifest: string(raw),

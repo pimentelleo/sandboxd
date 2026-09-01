@@ -81,9 +81,11 @@ makes that work, on your own server.** One HTTP request and it:
 3. hands the app a **live preview URL**.
 
 Idle sandboxes **sleep and wake on demand**, so one ordinary box holds many apps
-instead of a VM each. Under the hood it's deliberately small: **one Go program
-driving Docker**, Traefik for URLs, SQLite for state — no Kubernetes, no separate
-database, no queue.
+instead of a VM each. The default local profile is deliberately small: **one Go
+program driving Docker**, Traefik for URLs, SQLite for state — no Kubernetes, no
+separate database, no queue. A separate production profile targets Kubernetes
+and managed Azure services; it is described below and in
+[`docs/production-safety.md`](docs/production-safety.md).
 
 ## Two ways to use it
 
@@ -152,7 +154,7 @@ The console isn't only for coders. Open it and, in **one click or one prompt**, 
 </p>
 
 > **Dev → prod, never shorter:** prompt an app into a sandbox, iterate on a live
-> preview, then self-host it on your own server in [one command](#-deploy-to-a-vps-in-one-click).
+> preview, then self-host it on your own server in [one command](#-deploy-the-local-docker-profile-to-a-vps).
 
 ## Quick start
 
@@ -218,7 +220,55 @@ conversation and 16 globally; each is limited to 20 minutes.
 
 **Full walkthrough → [sandboxd.io/quickstart](https://sandboxd.io/quickstart).**
 
-## 🚀 Deploy to a VPS in one click
+## Local Docker profile vs production profile
+
+The install and Compose examples above are the **local Docker profile**. It is
+single-host, with directory-backed workspaces and SQLite, and is suitable for a
+single operator or a trusted team on a host you control. Auth is local-only:
+the default is auth-off; password-backed browser sessions and bearer API tokens
+remain available when enabled. This profile uses ordinary Linux containers with
+a shared kernel and does not provide a hostile multi-tenant security boundary.
+
+For local Kubernetes integration testing, the separate
+[`infra/dev-kind`](infra/dev-kind/README.md) profile runs against a preconfigured
+Kind cluster through Podman. It uses SQLite, local email/password accounts,
+HTTP on port `9090`, a local-path PVC, and no Kata runtime. It is deliberately
+not a production substitute and does not alter the Docker profile or production
+requirements.
+
+The **production profile** is a separate, multi-user deployment target:
+
+- AKS with Kata Pod Sandboxing and the Kubernetes runtime; Azure Disk PVCs and
+  VolumeSnapshots for workspace state; PostgreSQL Flexible Server for control
+  plane state.
+- Key Vault plus workload identity for control-plane secrets, ACR for images,
+  and Azure CNI Cilium for network policy.
+- One Entra tenant with immutable Entra OID ownership and the
+  `sandboxd.user` / `sandboxd.admin` roles. Browser access uses OIDC
+  authorization-code PKCE and server sessions. Password and API-key auth are
+  not production mechanisms; admins have full access.
+- HTTPS-only ingress at `console.<domain>` and `*.preview.<domain>`. Preview
+  access is owner/admin-authorized through a secure, one-time bootstrap ticket
+  and host-only cookies.
+- Sandboxes start with default-deny networking. They receive public HTTPS DNS
+  egress only; Azure metadata and internal/private network access are blocked.
+  Provider credentials never enter a sandbox. Hosted GitHub Copilot remains a
+  trusted control-plane integration.
+
+Production prerequisites and parameters are maintained in
+[`infra/README.md`](infra/README.md). The Bicep, Kubernetes, and Azure DevOps
+files under `infra/` and `azure-pipelines.yml` are deployment artifacts:
+deployment is explicitly gated and is **not** invoked by cloning, building, or
+running the local profile. No Azure resources are provisioned by this
+repository automatically, and local Docker/SQLite data is not migrated to
+production. Plan a separate, verified export/import if needed.
+
+Kata requires Azure Linux/Gen2 node support for nested virtualization. Validate
+the selected VM SKU and capacity before rollout. Expect different storage
+performance from local disks, and verify the Defender for Containers feature
+set and support level for the chosen Kata configuration.
+
+## 🚀 Deploy the local Docker profile to a VPS
 
 sandboxd needs one Linux server with Docker — nothing else. Grab a server
 below (2 vCPU / 4 GB is plenty to start), paste our
@@ -297,10 +347,11 @@ copy-pasteable runbook.
 - 🤝 **Contribute** — good first PRs: add a runtime preset or an App Store recipe ([`CONTRIBUTING.md`](CONTRIBUTING.md))
 - 🔒 **Security** — report privately per [`SECURITY.md`](SECURITY.md)
 
-> **Beta · 0.x.** Container isolation (not VMs), single-server, and API auth off
-> by default — all fine for your own users; tighten before untrusted
-> multi-tenancy. See [Hardening](https://sandboxd.io/guides/hardening). Expect the
-> occasional breaking change before 1.0 — pin a version and update as you go.
+> **Beta · 0.x.** The local profile is container-isolated (not VM-isolated),
+> single-server, and auth-off by default. Use the documented production profile
+> for multi-user deployments; do not treat local Docker as hostile multi-tenancy.
+> Expect the occasional breaking change before 1.0 — pin a version and update
+> as you go.
 
 ## ⭐ If sandboxd is useful, star it
 

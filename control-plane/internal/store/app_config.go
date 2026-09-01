@@ -54,7 +54,7 @@ func boolToInt(b bool) int {
 
 // CreateAppConfig inserts a config entry. ErrConflict if (app_id, key) exists.
 func (s *Store) CreateAppConfig(ctx context.Context, c *AppConfig) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		now := time.Now().Unix()
 		_, err := db.ExecContext(ctx, `
 			INSERT INTO app_config
@@ -104,7 +104,7 @@ func (s *Store) GetAppConfig(ctx context.Context, appID, key string) (*AppConfig
 // The caller supplies the fully-resolved new value fields. ErrNotFound
 // when no entry matches.
 func (s *Store) UpdateAppConfig(ctx context.Context, appID, key string, c *AppConfig) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `
 			UPDATE app_config
 			   SET value_ciphertext = ?, value_nonce = ?, value_plaintext = ?,
@@ -124,7 +124,7 @@ func (s *Store) UpdateAppConfig(ctx context.Context, appID, key string, c *AppCo
 
 // DeleteAppConfig removes one entry. ErrNotFound when nothing matched.
 func (s *Store) DeleteAppConfig(ctx context.Context, appID, key string) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		res, err := db.ExecContext(ctx, `DELETE FROM app_config WHERE app_id = ? AND key = ?`, appID, key)
 		if err != nil {
 			return err

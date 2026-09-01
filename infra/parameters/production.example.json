@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workloadPrefix": {
+      "value": "<globally-unique-prefix>"
+    },
+    "location": {
+      "value": "brazilsouth"
+    },
+    "vnetAddressPrefix": {
+      "value": "10.42.0.0/16"
+    },
+    "aksSubnetPrefix": {
+      "value": "10.42.0.0/20"
+    },
+    "privateEndpointSubnetPrefix": {
+      "value": "10.42.16.0/24"
+    },
+    "postgresSubnetPrefix": {
+      "value": "10.42.17.0/28"
+    },
+    "dnsZoneResourceId": {
+      "value": "/subscriptions/<subscription-id>/resourceGroups/<dns-resource-group>/providers/Microsoft.Network/dnsZones/<root-domain>"
+    },
+    "adminGroupObjectId": {
+      "value": "<entra-admin-security-group-object-id>"
+    },
+    "deploymentPrincipalObjectId": {
+      "value": "00000000-0000-0000-0000-000000000001"
+    },
+    "postgresAdminLogin": {
+      "value": "<postgres-admin-login>"
+    },
+    "postgresAdminPassword": {
+      "value": "validation-only-not-a-secret"
+    },
+    "kubernetesVersion": {
+      "value": "<aks-version-available-in-brazil-south>"
+    },
+    "sandboxVmSize": {
+      "value": "<kata-supported-nested-virtualization-vm-sku>"
+    },
+    "systemVmSize": {
+      "value": "Standard_D4s_v5"
+    },
+    "aksAdminUsername": {
+      "value": "<break-glass-admin-username>"
+    },
+    "aksAdminSshPublicKey": {
+      "value": "<ssh-ed25519-public-key>"
+    },
+    "postgresPrimaryZone": {
+      "value": "1"
+    },
+    "postgresStandbyZone": {
+      "value": "2"
+    }
+  }
+}

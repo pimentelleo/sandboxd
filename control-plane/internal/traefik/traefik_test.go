@@ -52,7 +52,7 @@ func TestLabels_SinglePort_TLS(t *testing.T) {
 }
 
 func TestLabels_MultiPort(t *testing.T) {
-	got := Labels("01HX", []int{3000, 3001}, "example.com", "public", "web", false)
+	got := Labels("01HX", []int{3000, 3001}, "EXAMPLE.COM", "public", "web", false)
 	if got[0] != "traefik.enable=true" {
 		t.Fatalf("first label must be enable; got %q", got[0])
 	}
@@ -67,8 +67,8 @@ func TestLabels_MultiPort(t *testing.T) {
 		gotMap[l] = true
 	}
 	for _, must := range []string{
-		"traefik.http.routers.s-01HX-3000.rule=Host(`s-01HX-3000.preview.example.com`)",
-		"traefik.http.routers.s-01HX-3001.rule=Host(`s-01HX-3001.preview.example.com`)",
+		"traefik.http.routers.s-01HX-3000.rule=Host(`s-01hx-3000.preview.example.com`)",
+		"traefik.http.routers.s-01HX-3001.rule=Host(`s-01hx-3001.preview.example.com`)",
 		"traefik.http.services.s-01HX-3000.loadbalancer.server.port=3000",
 		"traefik.http.services.s-01HX-3001.loadbalancer.server.port=3001",
 	} {

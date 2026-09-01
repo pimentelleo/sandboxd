@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, setOnUnauthorized, App as TApp, Preset, GitCredential, Agent, UpgradeState } from './api'
+import { api, setOnUnauthorized, App as TApp, Preset, GitCredential, Agent, UpgradeState, AuthStatus } from './api'
 import { c, font, mono, Card, Btn, StatusPill, Input, navItem } from './design/kit'
 import { PRESET_ICONS } from './design/presetIcons'
 import { STARTERS, STARTER_ICONS } from './design/starters'
@@ -8,7 +8,7 @@ import { AppBrain, brainExcerpt, buildBrainGraph } from './brain'
 import { BrainGraph } from './BrainGraph'
 import { StoreView } from './StoreView'
 import { SettingsView } from './SettingsView'
-import { Login, CreatePassword } from './AuthGate'
+import { AccountLogin, CreateLocalAccount, Login, CreatePassword, EntraLogin } from './AuthGate'
 
 type Route = { name: 'apps' } | { name: 'brain' } | { name: 'store' } | { name: 'settings' } | { name: 'app'; id: string; tab?: string; task?: string }
 
@@ -17,7 +17,11 @@ export default function App() {
   const [toasts, setToasts] = useState<{ id: number; msg: string }[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [apps, setApps] = useState<TApp[]>([])
-  const [auth, setAuth] = useState<{ enabled: boolean; authenticated: boolean; password_set: boolean } | null>(null)
+  const [auth, setAuth] = useState<AuthStatus | null>(null)
+  const [authNotice, setAuthNotice] = useState<'denied' | 'expired' | 'logged_out' | 'unavailable' | undefined>(() => {
+    const result = new URLSearchParams(window.location.search).get('auth_error')
+    return result === 'denied' || result === 'unavailable' ? result : undefined
+  })
   // Update notification: the control plane checks GitHub releases (cached ~6h)
   // and reports update_available in /v1/settings. Dismissal is remembered per
   // version, so each new release notifies exactly once.
@@ -37,7 +41,7 @@ export default function App() {
 
   const loadApps = useCallback(() => api.listApps().then(setApps).catch(() => {}), [])
   const refreshAuth = useCallback(
-    () => api.authStatus().then(setAuth).catch(() => setAuth({ enabled: true, authenticated: false, password_set: false })),
+    () => api.authStatus().then(setAuth).catch(() => setAuth({ enabled: true, authenticated: false, password_set: false, profile: 'invalid', login_available: false })),
     [],
   )
 
@@ -45,8 +49,15 @@ export default function App() {
   // bounces back to the gate. Only load apps once we know we're allowed through.
   useEffect(() => {
     refreshAuth()
-    setOnUnauthorized(() => setAuth((a) => (a ? { ...a, authenticated: false } : a)))
+    setOnUnauthorized(() => {
+      setAuth((a) => (a ? { ...a, authenticated: false } : a))
+      setAuthNotice('expired')
+    })
   }, [refreshAuth])
+  useEffect(() => {
+    if (!authNotice || !window.location.search.includes('auth_error=')) return
+    window.history.replaceState({}, '', window.location.pathname)
+  }, [authNotice])
   useEffect(() => {
     if (auth && (auth.authenticated || auth.enabled === false)) loadApps()
   }, [auth, loadApps])
@@ -74,8 +85,16 @@ export default function App() {
     return () => clearInterval(id)
   }, [upg, refreshAuth, loadApps])
 
-  const onAuthed = useCallback(() => { refreshAuth().then(loadApps) }, [refreshAuth, loadApps])
-  const logout = useCallback(() => { api.logout().finally(() => setAuth((a) => (a ? { ...a, authenticated: false } : a))) }, [])
+  const onAuthed = useCallback(() => {
+    setAuthNotice(undefined)
+    refreshAuth().then(loadApps)
+  }, [refreshAuth, loadApps])
+  const logout = useCallback(() => {
+    api.logout().finally(() => {
+      setAuth((a) => (a ? { ...a, authenticated: false } : a))
+      setAuthNotice('logged_out')
+    })
+  }, [])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -105,7 +124,19 @@ export default function App() {
     )
   }
   if (auth.enabled && !auth.authenticated) {
-    return auth.password_set ? <Login onDone={onAuthed} /> : <CreatePassword onDone={onAuthed} />
+    if (auth.profile === 'entra') {
+      return <EntraLogin available={auth.login_available === true} notice={authNotice} />
+    }
+    if (auth.profile === 'invalid') {
+      return <EntraLogin available={false} notice="unavailable" />
+    }
+    if (auth.local_auth_mode === 'accounts') {
+      const notice = authNotice === 'expired' || authNotice === 'logged_out' ? authNotice : undefined
+      return auth.password_set
+        ? <AccountLogin onDone={onAuthed} notice={notice} />
+        : <CreateLocalAccount onDone={onAuthed} />
+    }
+    return auth.password_set ? <Login onDone={onAuthed} notice={authNotice === 'expired' || authNotice === 'logged_out' ? authNotice : undefined} /> : <CreatePassword onDone={onAuthed} />
   }
 
   return (
@@ -180,7 +211,7 @@ export default function App() {
         {route.name === 'apps' && <AppsScreen apps={apps} reload={loadApps} onOpen={(id) => goApp(id)} onError={onError} goStore={() => setRoute({ name: 'store' })} />}
         {route.name === 'brain' && <BrainOverview apps={apps} onOpen={(id) => goApp(id, 'brain')} />}
         {route.name === 'store' && <StoreView onError={onError} toast={toast} onOpen={(id) => goApp(id)} reloadApps={loadApps} />}
-        {route.name === 'settings' && <SettingsView onError={onError} toast={toast} />}
+        {route.name === 'settings' && <SettingsView onError={onError} toast={toast} accountMode={auth.local_auth_mode === 'accounts'} />}
         {route.name === 'app' && (
           <AppView
             appId={route.id}

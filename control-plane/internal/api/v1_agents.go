@@ -94,6 +94,11 @@ func (s *Server) v1ListAgents(w http.ResponseWriter, _ *http.Request) {
 // caches nil and the handler reports installed_state "unknown" — it never
 // blocks startup or fails the request. Overridable in tests via agentProbeFn.
 func (s *Server) installedAgents() map[string]string {
+	if s.usesRuntimeProvider() {
+		// Provider workloads are not Docker images available to the control
+		// plane. Do not fall through to a host Docker probe.
+		return nil
+	}
 	s.agentProbeOnce.Do(func() {
 		probe := probeInstalledAgents
 		if s.agentProbeFn != nil {

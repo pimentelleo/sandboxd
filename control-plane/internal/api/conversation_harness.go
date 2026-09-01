@@ -875,11 +875,21 @@ func (c *ConversationCoordinator) ensureSandboxRunning(ctx context.Context, sand
 	switch sb.Status {
 	case "running":
 		return nil
+	case "creating":
+		if c.server.usesRuntimeProvider() {
+			_, err := c.server.waitForProviderRunning(ctx, sandboxID)
+			return err
+		}
+		return fmt.Errorf("sandbox is %s", sb.Status)
 	case "stopped":
 		outer := httptest.NewRequest(http.MethodPost, "/wake/"+sandboxID, nil).WithContext(ctx)
 		code, body := c.server.delegate(outer, c.server.handleWakeJSON, http.MethodPost,
 			"/wake/"+sandboxID, map[string]string{"id": sandboxID}, nil)
 		if code == http.StatusOK {
+			if c.server.usesRuntimeProvider() {
+				_, err := c.server.waitForProviderRunning(ctx, sandboxID)
+				return err
+			}
 			return nil
 		}
 		var response struct {

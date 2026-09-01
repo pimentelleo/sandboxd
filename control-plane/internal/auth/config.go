@@ -1,10 +1,46 @@
 package auth
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
 )
+
+// Profile selects the interactive console authentication authority.
+type Profile string
+
+const (
+	// ProfileLocal keeps the single-password console login used by local installs.
+	ProfileLocal Profile = "local"
+	// ProfileEntra requires a single Microsoft Entra tenant for console login.
+	ProfileEntra Profile = "entra"
+	// ProfileInvalid is deliberately not a usable profile. Middleware rejects
+	// protected requests when this is selected.
+	ProfileInvalid Profile = "invalid"
+)
+
+// LocalAuthMode selects whether the local profile uses the legacy shared
+// password or durable email/password accounts.
+type LocalAuthMode string
+
+const (
+	LocalAuthModePassword LocalAuthMode = "password"
+	LocalAuthModeAccounts LocalAuthMode = "accounts"
+)
+
+// EntraConfig contains the private and public configuration required for the
+// Entra authorization-code flow. It is never serialized or logged.
+type EntraConfig struct {
+	TenantID     string
+	ClientID     string
+	ClientSecret string
+	RedirectURL  string
+	Issuer       string
+	AuthorizeURL string
+	TokenURL     string
+	JWKSURL      string
+}
 
 // Config is the reloadable auth configuration. It is held behind an
 // atomic.Pointer in Middleware so a SIGHUP can swap it without locks.
@@ -13,6 +49,12 @@ type Config struct {
 	PreviewSecrets  map[string]string // SANDBOXD_PREVIEW_TOKEN_SECRETS: kid -> secret
 	AuthRedirectURL string            // SANDBOXD_AUTH_REDIRECT_URL
 	Disabled        bool              // SANDBOXD_API_AUTH_DISABLED rollback path
+	Profile         Profile
+	LocalAuthMode   LocalAuthMode
+	Entra           EntraConfig
+	// Problem is deliberately generic: it is safe to expose as an availability
+	// state but never includes a secret or an environment value.
+	Problem string
 }
 
 // ParseConfig builds a Config from a key->value getter. At startup the
@@ -24,6 +66,8 @@ func ParseConfig(get func(string) string) *Config {
 		APITokens:       parseNamedPairs(get("SANDBOXD_API_TOKENS")),
 		PreviewSecrets:  pairsToMap(get("SANDBOXD_PREVIEW_TOKEN_SECRETS")),
 		AuthRedirectURL: strings.TrimSpace(get("SANDBOXD_AUTH_REDIRECT_URL")),
+		Profile:         ProfileLocal,
+		LocalAuthMode:   LocalAuthModePassword,
 	}
 	switch strings.ToLower(strings.TrimSpace(get("SANDBOXD_API_AUTH_DISABLED"))) {
 	case "", "0", "false", "no":
@@ -31,7 +75,102 @@ func ParseConfig(get func(string) string) *Config {
 	default:
 		c.Disabled = true
 	}
+	switch strings.ToLower(strings.TrimSpace(get("SANDBOXD_AUTH_PROFILE"))) {
+	case "", string(ProfileLocal):
+		c.Profile = ProfileLocal
+		switch strings.ToLower(strings.TrimSpace(get("SANDBOXD_LOCAL_AUTH_MODE"))) {
+		case "", string(LocalAuthModePassword):
+			c.LocalAuthMode = LocalAuthModePassword
+		case string(LocalAuthModeAccounts):
+			c.LocalAuthMode = LocalAuthModeAccounts
+			if c.Disabled {
+				c.Problem = "local account authentication cannot be disabled"
+			} else if len(c.APITokens) != 0 {
+				c.Problem = "local account authentication does not allow API tokens"
+			}
+		default:
+			c.Problem = "unsupported local authentication mode"
+		}
+	case string(ProfileEntra):
+		c.Profile = ProfileEntra
+		c.Entra = entraConfigFrom(get)
+		if c.Disabled {
+			c.Problem = "production authentication cannot be disabled"
+		} else if err := c.Entra.Validate(); err != nil {
+			c.Problem = "production authentication is not configured"
+		}
+	default:
+		c.Profile = ProfileInvalid
+		c.Problem = "unsupported authentication profile"
+	}
 	return c
+}
+
+// ProductionReady reports whether the selected production profile can safely
+// start an Entra authorization-code flow.
+func (c *Config) ProductionReady() bool {
+	return c != nil && c.Profile == ProfileEntra && c.Problem == "" && c.Entra.Validate() == nil
+}
+
+// LocalAccountsReady reports whether the account-backed local profile can
+// safely issue identity-scoped sessions.
+func (c *Config) LocalAccountsReady() bool {
+	return c != nil && c.Profile == ProfileLocal && c.LocalAuthMode == LocalAuthModeAccounts &&
+		c.Problem == "" && !c.Disabled && len(c.APITokens) == 0
+}
+
+func entraConfigFrom(get func(string) string) EntraConfig {
+	tenantID := strings.TrimSpace(get("SANDBOXD_ENTRA_TENANT_ID"))
+	base := "https://login.microsoftonline.com/" + tenantID
+	return EntraConfig{
+		TenantID:     tenantID,
+		ClientID:     strings.TrimSpace(get("SANDBOXD_ENTRA_CLIENT_ID")),
+		ClientSecret: strings.TrimSpace(get("SANDBOXD_ENTRA_CLIENT_SECRET")),
+		RedirectURL:  strings.TrimSpace(get("SANDBOXD_ENTRA_REDIRECT_URL")),
+		Issuer:       envOrDefault(get("SANDBOXD_ENTRA_ISSUER"), base+"/v2.0"),
+		AuthorizeURL: envOrDefault(get("SANDBOXD_ENTRA_AUTHORIZE_URL"), base+"/oauth2/v2.0/authorize"),
+		TokenURL:     envOrDefault(get("SANDBOXD_ENTRA_TOKEN_URL"), base+"/oauth2/v2.0/token"),
+		JWKSURL:      envOrDefault(get("SANDBOXD_ENTRA_JWKS_URL"), base+"/discovery/v2.0/keys"),
+	}
+}
+
+func envOrDefault(value, fallback string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// Validate checks the configuration without disclosing why a production
+// profile is unavailable. All provider endpoints must be HTTPS so a
+// configuration typo cannot downgrade the code or client credential exchange.
+func (c EntraConfig) Validate() error {
+	if !safeTenantID(c.TenantID) || c.ClientID == "" || c.ClientSecret == "" {
+		return fmt.Errorf("incomplete Entra configuration")
+	}
+	if !validHTTPSURL(c.RedirectURL) || !validHTTPSURL(c.Issuer) ||
+		!validHTTPSURL(c.AuthorizeURL) || !validHTTPSURL(c.TokenURL) || !validHTTPSURL(c.JWKSURL) {
+		return fmt.Errorf("invalid Entra endpoint configuration")
+	}
+	return nil
+}
+
+func validHTTPSURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.Fragment == ""
+}
+
+func safeTenantID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // LoadEnvFile parses a systemd EnvironmentFile-style file (KEY=value

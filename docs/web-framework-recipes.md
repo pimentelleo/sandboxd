@@ -71,9 +71,8 @@ guides, you adopt:
 6. **Adopt it explicitly** — Copy YAML, use the **Ask agent** prompt (paste into
    the task box; the agent writes the file), or edit `sandbox.yaml` by hand. There
    is no auto-apply and no hidden source edit. If you write it via the files API
-   (`PUT /v1/sandboxes/{id}/files`), note the path is relative to the **workspace
-   mount root**, so the app manifest is **`path=workspace/app/sandbox.yaml`** — a
-   bare `path=sandbox.yaml` lands in `/home/sandbox` and runtimed never reads it.
+   (`PUT /v1/sandboxes/{id}/files`), paths are relative to the **app directory**,
+   so the app manifest is **`path=sandbox.yaml`**.
 7. **Restart the sandbox.** **When `sandbox.yaml` changes, restart the sandbox so
    runtimed re-reads it** — the manifest is read at boot, not live. Then the
    preview should come up green.

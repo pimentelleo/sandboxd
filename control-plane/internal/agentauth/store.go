@@ -10,7 +10,8 @@ import (
 // provider under <DataDir>/agent-auth/<provider>. A0 only reads it (existence +
 // non-empty); provider dirs are created later by the Connect/import flow.
 type Store struct {
-	root string // <DataDir>/agent-auth
+	root   string // <DataDir>/agent-auth
+	source TrustedCredentialSource
 }
 
 // NewStore roots the auth store under the sandboxd data dir. It is deliberately
@@ -18,6 +19,16 @@ type Store struct {
 // workspace or a snapshot.
 func NewStore(dataDir string) *Store {
 	return &Store{root: filepath.Join(dataDir, "agent-auth")}
+}
+
+// NewStoreWithSource creates a store backed by a trusted source. Mounted sources
+// are read-only, so connect, disconnect, OAuth completion, and refresh return
+// ErrReadOnlySource rather than silently modifying a different local directory.
+func NewStoreWithSource(source TrustedCredentialSource) (*Store, error) {
+	if source == nil {
+		return nil, errors.New("agentauth: credential source is required")
+	}
+	return &Store{source: source}, nil
 }
 
 // Root is the auth-store directory.
@@ -28,15 +39,53 @@ func (s *Store) Dir(provider string) string {
 	return filepath.Join(s.root, provider)
 }
 
+// ReadOnly reports whether credential rotation and imports are disabled.
+func (s *Store) ReadOnly() bool { return s.source != nil && s.source.ReadOnly() }
+
+// ReadCredential obtains opaque credential material through the configured
+// trusted source. Local store paths are accepted only for known provider files.
+func (s *Store) ReadCredential(provider, rel string) ([]byte, error) {
+	if !allowedCredentialPath(provider, rel) {
+		return nil, errors.New("agentauth: credential path is not permitted")
+	}
+	if s.source != nil {
+		return s.source.ReadCredential(provider, rel)
+	}
+	return os.ReadFile(filepath.Join(s.Dir(provider), rel))
+}
+
+// CredentialMethod identifies the configured credential type.
+func (s *Store) CredentialMethod(provider string) (string, error) {
+	if s.source != nil {
+		return s.source.CredentialMethod(provider)
+	}
+	if s.HasFile(provider, APIKeyFile) {
+		return "api_key", nil
+	}
+	if rel, ok := CredentialFile(provider); ok && s.HasFile(provider, rel) {
+		return "oauth", nil
+	}
+	return "", nil
+}
+
+func (s *Store) trustedCredentialSource() {}
+
 // EnsureRoot creates the store root (0700). Best-effort; A0 does not create
 // per-provider dirs.
 func (s *Store) EnsureRoot() error {
+	if s.ReadOnly() {
+		return ErrReadOnlySource
+	}
 	return os.MkdirAll(s.root, 0o700)
 }
 
 // Connected reports whether a provider's auth dir exists AND is non-empty. It
 // treats the contents as opaque — it never opens or parses any file.
 func (s *Store) Connected(provider string) bool {
+	if s.source != nil {
+		method, err := s.CredentialMethod(provider)
+		return err == nil && method != ""
+	}
 	entries, err := os.ReadDir(s.Dir(provider))
 	if err != nil {
 		return false // absent (or unreadable) => not connected
@@ -46,6 +95,9 @@ func (s *Store) Connected(provider string) bool {
 
 // Delete removes a provider's auth dir (Disconnect). Opaque; no parsing.
 func (s *Store) Delete(provider string) error {
+	if s.ReadOnly() {
+		return ErrReadOnlySource
+	}
 	return os.RemoveAll(s.Dir(provider))
 }
 
@@ -53,6 +105,9 @@ func (s *Store) Delete(provider string) error {
 // in-progress login. It is chowned to the sandbox uid (best-effort) so the
 // ephemeral auth container (uid 1000) can write its credential files there.
 func (s *Store) NewStaging() (string, error) {
+	if s.ReadOnly() {
+		return "", ErrReadOnlySource
+	}
 	if err := s.EnsureRoot(); err != nil {
 		return "", err
 	}
@@ -68,6 +123,9 @@ func (s *Store) NewStaging() (string, error) {
 // Promote atomically replaces a provider's auth dir with the staging dir. Same
 // filesystem (both under the store root), so the rename is atomic.
 func (s *Store) Promote(staging, provider string) error {
+	if s.ReadOnly() {
+		return ErrReadOnlySource
+	}
 	final := s.Dir(provider)
 	_ = os.RemoveAll(final)
 	return os.Rename(staging, final)
@@ -77,20 +135,19 @@ func (s *Store) Promote(staging, provider string) error {
 // auth dir. Presence only — never opened or parsed. Used to report which auth
 // method a connected provider is using (credential file vs API-key file).
 func (s *Store) HasFile(provider, rel string) bool {
-	return s.CredentialPresent(s.Dir(provider), rel)
+	b, err := s.ReadCredential(provider, rel)
+	return err == nil && len(b) > 0
 }
 
 // Method reports how a provider is currently connected: "oauth" (a login
 // credential file is present), "api_key" (the API-key file is present), or ""
 // (not connected). Each connect fully replaces the dir, so at most one applies.
 func (s *Store) Method(provider string) string {
-	if s.HasFile(provider, APIKeyFile) {
-		return "api_key"
+	method, err := s.CredentialMethod(provider)
+	if err != nil {
+		return ""
 	}
-	if rel, ok := CredentialFile(provider); ok && s.HasFile(provider, rel) {
-		return "oauth"
-	}
-	return ""
+	return method
 }
 
 // CredentialPresent reports whether a non-empty file exists at rel within dir —
@@ -106,6 +163,12 @@ func (s *Store) CredentialPresent(dir, rel string) bool {
 // are written verbatim and NEVER parsed. Ownership is set to the sandbox uid so
 // the agent (uid 1000) can read it at task time.
 func (s *Store) ImportCredential(provider, relPath string, data []byte) error {
+	if s.ReadOnly() {
+		return ErrReadOnlySource
+	}
+	if !allowedCredentialPath(provider, relPath) {
+		return errors.New("agentauth: credential path is not permitted")
+	}
 	if len(data) == 0 {
 		return errors.New("empty credential")
 	}

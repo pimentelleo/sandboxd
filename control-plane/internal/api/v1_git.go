@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/docker"
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/sandboxname"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
@@ -118,7 +119,10 @@ func (s *Server) v1GitStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false, "reason": reason})
 		return
 	}
-	writeJSON(w, http.StatusOK, gitStatusInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String)))
+	if !s.ensureProviderGitAvailable(w) {
+		return
+	}
+	writeJSON(w, http.StatusOK, gitStatusInContainer(r.Context(), s.gitExecFor(sb), sandboxname.Reference(sb.ID, sb.ContainerID.String)))
 }
 
 // GET /v1/apps/{id}/git/diff?path=<optional relative path>
@@ -139,8 +143,11 @@ func (s *Server) v1GitDiff(w http.ResponseWriter, r *http.Request) {
 	if path != "" {
 		path = filepath.Clean(path)
 	}
+	if !s.ensureProviderGitAvailable(w) {
+		return
+	}
 	// NOTE: do not log the diff body — it can contain secrets.
-	writeJSON(w, http.StatusOK, gitDiffInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String), path))
+	writeJSON(w, http.StatusOK, gitDiffInContainer(r.Context(), s.gitExecFor(sb), sandboxname.Reference(sb.ID, sb.ContainerID.String), path))
 }
 
 // --- commit (B1) ------------------------------------------------------
@@ -201,6 +208,9 @@ func (s *Server) v1GitCommit(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "too many paths; select a subset")
 		return
 	}
+	if !s.ensureProviderGitAvailable(w) {
+		return
+	}
 	// Serialize git MUTATIONS (commit/push) per workspace so two concurrent
 	// commits can't race — the second re-evaluates under the lock and returns
 	// no_changes instead of a scary git_error, and a later push can't publish a
@@ -209,20 +219,41 @@ func (s *Server) v1GitCommit(w http.ResponseWriter, r *http.Request) {
 	s.Locks.Lock(gitLockKey(sb.ID))
 	defer s.Locks.Unlock(gitLockKey(sb.ID))
 	// NOTE: do not log the message or path contents — they can carry secrets.
-	writeJSON(w, http.StatusOK, gitCommitInContainer(r.Context(), s.gitExec(), sandboxname.Reference(sb.ID, sb.ContainerID.String), req))
+	writeJSON(w, http.StatusOK, gitCommitInContainer(r.Context(), s.gitExecFor(sb), sandboxname.Reference(sb.ID, sb.ContainerID.String), req))
 }
 
 // gitLockKey namespaces the per-workspace git mutation lock so it never collides
 // with the sandbox lifecycle locks (which key on the bare id).
 func gitLockKey(sandboxID string) string { return "git:" + sandboxID }
 
-// gitExec is the in-sandbox executor for status/diff/commit (s.Docker in prod;
-// an injected fake in tests).
-func (s *Server) gitExec() sandboxExecer {
+// gitExecFor is the in-sandbox executor for status/diff/commit. Provider
+// sandboxes use their private exec transport; local sandboxes retain Docker.
+func (s *Server) gitExecFor(sb *store.Sandbox) sandboxExecer {
+	if s.usesRuntimeProvider() {
+		return runtimeSandboxExecer{executor: s.RuntimeExec, ref: s.runtimeRef(sb)}
+	}
 	if s.GitExec != nil {
 		return s.GitExec
 	}
 	return s.Docker
+}
+
+func (s *Server) ensureProviderGitAvailable(w http.ResponseWriter) bool {
+	if s.usesRuntimeProvider() && s.RuntimeExec == nil {
+		writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable", "runtime provider command transport is unavailable")
+		return false
+	}
+	return true
+}
+
+type runtimeSandboxExecer struct {
+	executor runtimebackend.NonInteractiveExecutor
+	ref      runtimebackend.SandboxRef
+}
+
+func (e runtimeSandboxExecer) Exec(ctx context.Context, _ string, cmd []string) (docker.ExecResult, error) {
+	result, err := e.executor.Exec(ctx, e.ref, runtimebackend.Command{Args: cmd})
+	return docker.ExecResult{Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.ExitCode}, err
 }
 
 // gitCommit stages exactly the selected (and actually-changed) paths and makes a

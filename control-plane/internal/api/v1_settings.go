@@ -326,9 +326,6 @@ func (s *Server) agentDefaultModels() map[string]string {
 // host-facing port appended unless it's the scheme default (mirrors previewURL).
 func (s *Server) previewBase() string {
 	scheme, defaultPort := s.previewScheme()
-	if s.PreviewURLScheme != "" {
-		defaultPort = s.PublicHTTPPort // the terminator in front owns the public port
-	}
 	host := "*.preview." + s.PreviewDomain
 	if p := s.PublicHTTPPort; p != "" && p != defaultPort {
 		host += ":" + p

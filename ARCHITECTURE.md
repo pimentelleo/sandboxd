@@ -1,19 +1,20 @@
 # Architecture
 
 sandboxd is a small Go **control plane** (`sandboxd`) that drives the Docker
-daemon, fronted by Traefik, with an optional **web console** (a pure `/v1` API
-client) on top. It's a self-hosted engine for AI app-builder products: isolated
-sandboxes, live preview URLs, coding agents, app-scoped config/secrets,
-snapshots/fork/restore, runtime presets, and process logs/events. Everything
-runs as containers on one host.
+daemon in the default local profile, fronted by Traefik, with an optional **web
+console** (a pure `/v1` API client) on top. It's a self-hosted engine for AI
+app-builder products: isolated sandboxes, live preview URLs, coding agents,
+app-scoped config/secrets, snapshots/fork/restore, runtime presets, and process
+logs/events. The local profile runs as containers on one host; the production
+profile uses Kubernetes on AKS and managed Azure data services.
 
 High level:
 
 - **Control plane** (`sandboxd`, Go) — sandbox/app lifecycle, the `/v1` API.
-- **SQLite** (WAL) — the single source of truth for apps, sandboxes, config,
-  events, snapshots.
-- **Docker runtime provider** — the only backend today; sandboxd shells the
-  `docker` CLI. (A second provider is a future concern.)
+- **SQLite** (WAL) — the local profile's single source of truth for apps,
+  sandboxes, config, events, and snapshots.
+- **Docker runtime provider** — the local backend; sandboxd shells the `docker`
+  CLI. The production profile uses Kubernetes resources instead.
 - **Traefik** — edge router; publishes a preview URL per running sandbox.
 - **runtimed** — in-sandbox supervisor + task runner, baked into the base image.
 - **GitHub Copilot coordinator** — control-plane-owned durable conversations,
@@ -31,6 +32,7 @@ High level:
   are first-class app subsystems (below).
 
 ```
+                 Local Docker/SQLite profile
                          ┌── host (Docker daemon) ─────────────────────────┐
    browser  ──HTTP──▶ :80│  traefik ──┬─▶ s-<id>-3000  (running sandbox)   │
                          │            │      ▲  dev server :3000            │
@@ -41,6 +43,45 @@ High level:
                          │  workspaces/  <id>/ … (bind-mounted, persist)    │
                          └──────────────────────────────────────────────────┘
 ```
+
+The production topology replaces this host-local path with AKS, Kata Pod
+Sandboxing, PostgreSQL Flexible Server, Azure Disk PVCs/VolumeSnapshots, Key
+Vault workload identity, ACR, and Azure CNI Cilium. Its public ingress is
+HTTPS-only: `console.<domain>` for the console and
+`*.preview.<domain>` for previews. The deployment manifests and parameters are
+deployment artifacts under [`infra/`](infra/); they are not applied
+automatically.
+
+## Deployment profiles
+
+### Local Docker/SQLite
+
+Compose is the development and single-host deployment. Workspaces are
+directory-backed, state is SQLite, and the optional console can use local
+password sessions or bearer API tokens. Auth is disabled by default for the
+loopback install. Sandboxes use ordinary Linux containers and the portable
+build has open egress; this profile is not a hostile multi-tenant boundary.
+
+### Production AKS
+
+Production is multi-user within one Entra tenant. OIDC authorization-code PKCE
+creates server-side sessions; `sandboxd.user` and `sandboxd.admin` roles are
+enforced from the immutable Entra OID. Admins have full access. Production does
+not use the local password or API-key mechanisms.
+
+Workspace data is stored on Azure Disk PVCs and protected with Kubernetes
+VolumeSnapshots. PostgreSQL Flexible Server is the control-plane store. Key
+Vault and workload identity hold secrets, ACR supplies images, and Azure CNI
+Cilium applies default-deny policy. A preview is owner/admin-authorized through
+a secure one-time bootstrap ticket and host-only cookie. Sandboxes can use
+public HTTPS DNS egress only; Azure metadata and internal/private network
+access are denied. Provider credentials never enter sandboxes, and hosted
+GitHub Copilot remains a trusted control-plane integration.
+
+See [`infra/README.md`](infra/README.md) for prerequisites and parameters.
+Provisioning is separately gated; this repository does not claim that Azure
+resources have been deployed. There is no automatic migration from local
+directories/SQLite to production PostgreSQL/PVCs.
 
 ## Components
 
@@ -183,13 +224,20 @@ How an app actually runs, layered create-time → run-time:
 
 ## Isolation model
 
-Each sandbox runs under hardened `runc`: `--cap-drop=ALL`,
-`--security-opt=no-new-privileges`, `--read-only` rootfs with `tmpfs` for
-`/tmp`, a hard `--memory` ceiling, `--pids-limit`, and file-descriptor ulimits.
-The threat model is **authenticated, accountable users running their own code**
-— not anonymous hostile multi-tenancy. Kernel-CVE container escape is mitigated
-by patching, not by a VM boundary; if you need stronger isolation, run sandboxd
-on a dedicated VM per trust domain.
+In the local profile each sandbox runs under hardened `runc`:
+`--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--read-only` rootfs with
+`tmpfs` for `/tmp`, a hard `--memory` ceiling, `--pids-limit`, and
+file-descriptor ulimits. The threat model is **authenticated, accountable users
+running their own code**, not anonymous hostile multi-tenancy. A kernel-CVE or
+daemon escape can cross tenants because this is not a VM boundary; local egress
+is open by default.
+
+In the production profile AKS uses Kata Pod Sandboxing on supported Azure
+Linux/Gen2 nodes, with Kubernetes RBAC and Azure CNI Cilium default-deny
+network policy. Sandboxes get public HTTPS DNS egress only; Azure metadata and
+internal/private network access are blocked. Kata is a stronger VM-backed
+boundary, but node nested-virtualization support, Azure Disk performance, and
+Defender for Containers support must be validated for the selected platform.
 
 ## Storage & persistence
 
@@ -202,6 +250,11 @@ on a dedicated VM per trust domain.
 
 The only writable disk location inside a sandbox is `/home/sandbox`. Back up a
 workspace by copying its directory; back up state by copying the SQLite file.
+
+Production replaces these local stores with Azure Disk PVCs and
+VolumeSnapshots for workspaces and PostgreSQL Flexible Server for control-plane
+state. Back up PostgreSQL and retain tested PVC snapshots. There is no automatic
+local SQLite/directory-to-production migration.
 
 ## Optional workflows on top of core
 
@@ -234,15 +287,15 @@ or configure. Each is a conscious trade-off you can tighten later:
 
 | Area | v1 choice | Trade-off / how to harden |
 |---|---|---|
-| Workspace storage | plain **directory** per sandbox | no hard per-workspace disk quota (host fs is shared); add quotas at the fs/volume layer if needed |
+| Workspace storage | local: plain **directory** per sandbox; production: Azure Disk PVC | local has no hard per-workspace disk quota; production capacity/performance depends on the selected disk tier |
 | Memory | hard `--memory` ceiling per sandbox | the softer cgroup `memory.high` throttle is opt-in (`SANDBOXD_SET_MEMORY_HIGH`, needs host cgroup access) |
-| Egress | default-allow, no logging | add host firewall rules / a proxy if you need egress control |
+| Egress | local default-allow; production default-deny + public HTTPS DNS | local needs host firewall/proxy hardening; production policy must be tested and monitored |
 | Package installs | public npm/PyPI registries | run your own caching proxy and point the image at it for speed/airgap |
-| TLS / domain | HTTP on `*.localhost` out of the box | switch to a real wildcard domain + cert resolver (see README → Production / TLS) |
+| TLS / domain | local HTTP on `*.localhost`; production HTTPS on `console.<domain>` and `*.preview.<domain>` | production requires operator-managed DNS and certificates |
 | Snapshots/templates | API present, **experimental** on directory storage | use plain workspace copies, or contribute a directory-tar snapshot backend |
 | Preview ports | **one** public preview endpoint per sandbox | see *Single-port runtime model* below |
 | Base image | **one** image instance-wide (`SANDBOXD_IMAGE`) | no per-app image selection (roadmap); native langs need a custom image — see [`docs/base-image.md`](docs/base-image.md) |
-| Databases | **embedded SQLite** (app-bundled engine) | external Postgres/MySQL/Redis are out-of-sandbox/future — see *Embedded databases* below |
+| Databases | local control-plane SQLite; production PostgreSQL Flexible Server | app-bundled SQLite remains workspace data; no automatic local-data migration |
 
 ### Single-port runtime model
 
@@ -267,7 +320,8 @@ Prisma's bundled `libquery_engine` — ship
 with the app, so no system `sqlite3` CLI is needed). The DB file lives in the
 workspace, so **snapshots include it and can grow large**. Postgres/MySQL/Redis
 need a custom image or an external service — there's no in-sandbox service layer,
-DB provisioning, or Docker Compose (by design).
+DB provisioning, or Docker Compose (by design). Production's PostgreSQL Flexible
+Server is a control-plane dependency, not a database inside a sandbox.
 
 On **Node 24**, SQLite remains self-contained: packages such as `better-sqlite3` and
 `@libsql` supply platform builds where available, and app-bundled engines need no

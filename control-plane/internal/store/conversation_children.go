@@ -116,15 +116,15 @@ func (s *Store) CreateConversationChild(ctx context.Context, child *Conversation
 	if child.Status != ConversationChildQueued {
 		return errors.New("invalid conversation child status")
 	}
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
 
-		conversation, err := scanConversation(tx.QueryRowContext(ctx,
-			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`, child.ConversationID))
+		conversation, err := scanConversation(tx.QueryRowContext(ctx, tx.ForUpdate(
+			`SELECT `+conversationSelectCols+` FROM conversation WHERE id=?`), child.ConversationID))
 		if err != nil {
 			return err
 		}
@@ -174,7 +174,7 @@ func (s *Store) CreateConversationChild(ctx context.Context, child *Conversation
 // race is left terminally cancelling for the worker to clean up.
 func (s *Store) ClaimConversationChild(ctx context.Context, id string) (*ConversationChild, error) {
 	var claimed *ConversationChild
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -221,7 +221,7 @@ func (s *Store) StartConversationChild(ctx context.Context, id, workerContainer 
 		return nil, errors.New("invalid worker container")
 	}
 	var started *ConversationChild
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -289,7 +289,7 @@ func (s *Store) FinishConversationChild(ctx context.Context, id, status, resultT
 	}
 
 	var finished *ConversationChild
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -348,7 +348,7 @@ func (s *Store) FinishConversationChild(ctx context.Context, id, status, resultT
 // in-memory SDK cancellation is attempted.
 func (s *Store) RequestConversationChildCancellation(ctx context.Context, conversationID, id string) (*ConversationChild, error) {
 	var cancelled *ConversationChild
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -468,7 +468,7 @@ func (s *Store) InterruptAllActiveConversationChildren(ctx context.Context, mess
 
 func (s *Store) interruptConversationChildren(ctx context.Context, where string, args []any, message string) ([]*ConversationChild, error) {
 	var interrupted []*ConversationChild
-	err := s.submit(ctx, func(db *sql.DB) error {
+	err := s.submit(ctx, func(db *dialectDB) error {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -479,7 +479,7 @@ func (s *Store) interruptConversationChildren(ctx context.Context, where string,
 			  AND status IN (?, ?, ?, ?)`
 		queryArgs := append(append([]any(nil), args...), ConversationChildQueued,
 			ConversationChildPreparing, ConversationChildRunning, ConversationChildCancelling)
-		rows, err := tx.QueryContext(ctx, query, queryArgs...)
+		rows, err := tx.QueryContext(ctx, tx.ForUpdate(query), queryArgs...)
 		if err != nil {
 			return err
 		}
@@ -495,14 +495,25 @@ func (s *Store) interruptConversationChildren(ctx context.Context, where string,
 			return err
 		}
 		now := time.Now().Unix()
+		changed := interrupted[:0]
 		for _, child := range interrupted {
-			if _, err := tx.ExecContext(ctx, `
+			result, err := tx.ExecContext(ctx, `
 				UPDATE conversation_child
 				   SET status=?, error_message=?, patch_state=?, patch_json='', finished_at=?
-				 WHERE id=?`,
+				 WHERE id=? AND status IN (?, ?, ?, ?)`,
 				ConversationChildInterrupted, nullIfEmpty(message),
-				ConversationChildPatchNone, now, child.ID); err != nil {
+				ConversationChildPatchNone, now, child.ID,
+				ConversationChildQueued, ConversationChildPreparing, ConversationChildRunning,
+				ConversationChildCancelling)
+			if err != nil {
 				return err
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if count == 0 {
+				continue
 			}
 			child.Status = ConversationChildInterrupted
 			child.ErrorMessage = nullIfEmpty(message)
@@ -513,7 +524,9 @@ func (s *Store) interruptConversationChildren(ctx context.Context, where string,
 				"child.updated", publicConversationChildPayload(child)); err != nil {
 				return err
 			}
+			changed = append(changed, child)
 		}
+		interrupted = changed
 		return tx.Commit()
 	})
 	return interrupted, err

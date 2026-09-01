@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/agentauth"
@@ -70,6 +71,55 @@ func TestServeNoCredential(t *testing.T) {
 	p.ServeHTTP(w, httptest.NewRequest("POST", "/claude-code/anthropic/v1/messages", nil))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("got %d; want 401", w.Code)
+	}
+}
+
+func TestProxyStripsSandboxAuthAndCookies(t *testing.T) {
+	var gotCookie, gotProxyAuth, gotSandboxAuth, responseCookie string
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		gotProxyAuth = r.Header.Get("Proxy-Authorization")
+		gotSandboxAuth = r.Header.Get("Authorization")
+		w.Header().Set("Set-Cookie", "provider-session=secret")
+		w.WriteHeader(http.StatusOK)
+	})
+	st := agentauth.NewStore(t.TempDir())
+	writeAPIKey(t, st, "claude-code", "trusted-key")
+	req := httptest.NewRequest("POST", "/claude-code/anthropic/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer sandbox-supplied")
+	req.Header.Set("Proxy-Authorization", "Bearer proxy-supplied")
+	req.Header.Set("Cookie", "sandbox-session=secret")
+	w := httptest.NewRecorder()
+	New(st, nil).ServeHTTP(w, req)
+	responseCookie = w.Header().Get("Set-Cookie")
+
+	if gotCookie != "" || gotProxyAuth != "" {
+		t.Fatalf("sandbox credentials reached upstream (cookie=%q proxyAuth=%q)", gotCookie, gotProxyAuth)
+	}
+	if gotSandboxAuth != "" {
+		t.Fatalf("sandbox authorization reached Anthropic API-key upstream: %q", gotSandboxAuth)
+	}
+	if responseCookie != "" {
+		t.Fatalf("provider cookie reached sandbox: %q", responseCookie)
+	}
+}
+
+func TestProxyDoesNotEchoCredentialInProviderErrors(t *testing.T) {
+	const key = "trusted-provider-key"
+	stubUpstream(t, "anthropic", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"rejected ` + key + `"}}`))
+	})
+	st := agentauth.NewStore(t.TempDir())
+	writeAPIKey(t, st, "claude-code", key)
+	w := httptest.NewRecorder()
+	New(st, nil).ServeHTTP(w, httptest.NewRequest("POST", "/claude-code/anthropic/v1/messages", nil))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400", w.Code)
+	}
+	if strings.Contains(w.Body.String(), key) {
+		t.Fatal("proxy echoed credential material in error response")
 	}
 }
 

@@ -14,6 +14,11 @@ import (
 // listed in the auth middleware's exemptPaths so the external router
 // reaches it tokenless.
 func (s *Server) handleLLMTxt(w http.ResponseWriter, r *http.Request) {
+	if s.usesRuntimeProvider() {
+		// The Kubernetes profile has no control-plane host file volume.
+		http.NotFound(w, r)
+		return
+	}
 	if s.LLMTxtPath == "" {
 		http.NotFound(w, r)
 		return

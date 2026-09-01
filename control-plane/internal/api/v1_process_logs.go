@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/tastyeffectco/sandboxd/control-plane/internal/runtimebackend"
 	"github.com/tastyeffectco/sandboxd/control-plane/internal/store"
 )
 
@@ -37,7 +38,8 @@ func (s *Server) v1ProcessLogs(w http.ResponseWriter, r *http.Request) {
 		writeV1Err(w, http.StatusBadRequest, "invalid_request", "invalid sandbox id")
 		return
 	}
-	if _, err := s.Store.Get(r.Context(), id); errors.Is(err, store.ErrNotFound) {
+	sb, err := s.Store.Get(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
 		writeV1Err(w, http.StatusNotFound, "not_found", "no such sandbox")
 		return
 	} else if err != nil {
@@ -58,6 +60,27 @@ func (s *Server) v1ProcessLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if tail > procLogsMaxTail {
 		tail = procLogsMaxTail
+	}
+
+	if s.usesRuntimeProvider() {
+		if s.RuntimeProcessLogs == nil {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable",
+				"runtime provider process log access is unavailable")
+			return
+		}
+		lines, err := s.RuntimeProcessLogs.TailProcessLog(r.Context(), s.runtimeRef(sb),
+			runtimebackend.ProcessLogRequest{Process: name, Tail: tail, MaxBytes: procLogsReadCap})
+		if errors.Is(err, runtimebackend.ErrFileNotFound) {
+			writeV1Err(w, http.StatusNotFound, "not_found", "no logs for that process")
+			return
+		}
+		if err != nil {
+			writeV1Err(w, http.StatusServiceUnavailable, "runtime_unavailable",
+				"runtime provider process log access failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"process": name, "lines": lines})
+		return
 	}
 
 	_, mnt := s.Loopback.Paths(id)

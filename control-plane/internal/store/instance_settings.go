@@ -52,7 +52,7 @@ func (s *Store) GetInstanceSettings(ctx context.Context) (*InstanceSettings, err
 
 // SaveInstanceSettings upserts the singleton row (all fields).
 func (s *Store) SaveInstanceSettings(ctx context.Context, v InstanceSettings) error {
-	return s.submit(ctx, func(db *sql.DB) error {
+	return s.submit(ctx, func(db *dialectDB) error {
 		enabled := 0
 		if v.IdleReapEnabled {
 			enabled = 1
